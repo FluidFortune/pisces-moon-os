@@ -734,10 +734,15 @@ void run_mesh_messenger() {
         TrackballState tb = update_trackball();
         int16_t tx, ty;
 
-        // Header tap = exit
+        // Header tap — top 14px = exit, bottom half = channel switch
         if (get_touch(&tx, &ty) && ty < HDR_H) {
             while(get_touch(&tx,&ty)){delay(10);}
-            // Check if tapping a channel tab
+            // Top portion of header = exit
+            if (ty < HDR_H / 2) {
+                running = false;
+                continue;
+            }
+            // Bottom portion of header = channel tab switch
             int tappedCh = tx / 80;
             if (tappedCh >= 0 && tappedCh < MAX_CHANNELS && tappedCh != currentCh) {
                 currentCh = tappedCh;
