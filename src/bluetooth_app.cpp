@@ -127,13 +127,13 @@ void runBluetoothApp() {
     pScan->setActiveScan(true);
     pScan->setInterval(100);
     pScan->setWindow(99);
-    pScan->start(3, false);
+    pScan->start(0, false);  // 0 = continuous non-blocking scan
 
     unsigned long lastDraw = 0, lastRescan = 0;
 
     while (!exitApp) {
         if (millis() - lastRescan > 5000) {
-            if (!pScan->isScanning()) { pScan->clearResults(); pScan->start(3, false); }
+            if (!pScan->isScanning()) { pScan->clearResults(); pScan->start(0, false); }
             lastRescan = millis();
         }
         if (millis() - lastDraw > 1000) {
