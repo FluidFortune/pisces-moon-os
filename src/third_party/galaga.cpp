@@ -154,6 +154,11 @@ static int     beamTimer;
 static int     beamEnemy;     // Which boss is beaming
 static int     capturedSlot;  // Which formation slot was captured
 
+// HUD dirty tracking — only redraw when values change
+static int     lastHudScore = -1;
+static int     lastHudLives = -1;
+static int     lastHudStage = -1;
+
 // ─────────────────────────────────────────────
 //  FORMATION LAYOUT
 //  40 enemies: row0=4 Bosses, row1=8 Butterflies,
@@ -395,6 +400,10 @@ static void eraseShip() {
 }
 
 static void drawHUD() {
+    // Only redraw if something changed — eliminates per-frame 320×18 fillRect stutter
+    if (score == lastHudScore && lives == lastHudLives && stage == lastHudStage) return;
+    lastHudScore = score; lastHudLives = lives; lastHudStage = stage;
+
     gfx->fillRect(0, 0, SCREEN_W, HUD_H, COL_BG);
     gfx->setTextSize(1);
     gfx->setTextColor(COL_HUD);
@@ -590,6 +599,8 @@ static void initStage() {
     bossBeaming = false;
     beamTimer   = 0;
     enemyCount  = MAX_ENEMIES;
+    // Force HUD redraw at start of each stage
+    lastHudScore = -1; lastHudLives = -1; lastHudStage = -1;
 
     gfx->fillScreen(COL_BG);
     initStars();
