@@ -1,0 +1,33 @@
+# Pisces Moon OS — Custom Partition Table
+# Target hardware: LilyGO T-Deck Plus (ESP32-S3FN16R8, 16MB flash)
+#
+# Layout rationale:
+#   - No OTA partition: Pisces Moon is flashed via USB/PlatformIO.
+#   - otadata kept at 8KB: bootloader requirement, costs nothing.
+#   - app0 at 9.94MB: maximized — every byte not needed by gamedata
+#     or spiffs goes to firmware headroom. Current binary ~1.6MB (16%).
+#     Comfortably accommodates: full MicroPython interpreter, Doom engine,
+#     LibSSH-ESP32, Codec2, and many future applications without ever
+#     touching this file again.
+#   - gamedata (5MB FAT): internal flash for fast game asset reads.
+#     Doom shareware WAD (4.2MB) + SimCity terrain data live here.
+#     Internal flash reads at ~80MB/s vs SD SPI at ~4-8MB/s — instant
+#     level loads vs 1-2 second pause per map transition on SD.
+#     Full doom2.wad (14.4MB) exceeds this — load from SD if owned.
+#   - spiffs (1MB): minimal allocation. Nothing in Pisces Moon OS
+#     currently writes to SPIFFS — all user data goes to SD card.
+#     Kept at 1MB as emergency fallback if SD is absent.
+#
+# Total: 0x10000 + 0x9F0000 + 0x500000 + 0x100000 = 0x1000000 (16MB)
+#
+# Version history:
+#   v0.9.0-0.9.5: app0=3MB,    gamedata=6.25MB, spiffs=6.75MB
+#   v0.9.6:       app0=4MB,    gamedata=6MB,    spiffs=5.94MB  (interim)
+#   v0.9.6+:      app0=9.94MB, gamedata=5MB,    spiffs=1MB     (final)
+
+# Name,     Type,  SubType,  Offset,    Size
+nvs,        data,  nvs,      0x9000,    0x5000
+otadata,    data,  ota,      0xe000,    0x2000
+app0,       app,   factory,  0x10000,   0x9F0000
+gamedata,   data,  fat,      0xA00000,  0x500000
+spiffs,     data,  spiffs,   0xF00000,  0x100000
