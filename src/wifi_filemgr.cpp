@@ -9,6 +9,28 @@
 //
 // fluidfortune.com
 
+// Pisces Moon OS
+// Copyright (C) 2026 Eric Becker / Fluid Fortune
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// This program is free software: you can redistribute it
+// and/or modify it under the terms of the GNU Affero General
+// Public License as published by the Free Software Foundation,
+// either version 3 of the License, or any later version.
+//
+// fluidfortune.com
+
+// Pisces Moon OS
+// Copyright (C) 2026 Eric Becker / Fluid Fortune
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// This program is free software: you can redistribute it
+// and/or modify it under the terms of the GNU Affero General
+// Public License as published by the Free Software Foundation,
+// either version 3 of the License, or any later version.
+//
+// fluidfortune.com
+
 /**
  * PISCES MOON OS — WIFI FILE MANAGER v2.0
  * ==========================================
@@ -52,6 +74,7 @@
 extern SdFat             sd;
 extern Arduino_GFX      *gfx;
 extern volatile bool     wifi_in_use;
+extern volatile bool     sd_in_use;
 extern SemaphoreHandle_t spi_mutex;
 
 static WebServer _server(80);
@@ -563,7 +586,10 @@ static void _handleSelectPage() {
     }
     html += "</table>";
 
-    // JavaScript — select all + open each checked file in new tab
+    // JavaScript — select all + download each checked file
+    // Uses anchor.click() instead of window.open() — browsers allow
+    // programmatic anchor clicks triggered from a button press without
+    // blocking them as popups, unlike window.open() with setTimeout.
     html += "<script>"
             "function selAll(v){"
             "  document.querySelectorAll('.fchk').forEach(c=>c.checked=v);"
@@ -580,10 +606,14 @@ static void _handleSelectPage() {
             "function dlSelected(){"
             "  var chk=document.querySelectorAll('.fchk:checked');"
             "  if(chk.length===0){alert('No files selected.');return;}"
-            "  if(chk.length>20&&!confirm('Download '+chk.length+' files? Each opens in a new tab.'))return;"
             "  chk.forEach(function(c,i){"
-            "    setTimeout(function(){window.open(c.value,'_blank');},"
-            "    i*300);"  // stagger 300ms apart to avoid browser throttling
+            "    var a=document.createElement('a');"
+            "    a.href=c.value;"
+            "    a.download=c.value.split('/').pop();"
+            "    a.style.display='none';"
+            "    document.body.appendChild(a);"
+            "    a.click();"
+            "    document.body.removeChild(a);"
             "  });"
             "}"
             "</script>";
@@ -738,20 +768,41 @@ static FsFile _upFile;
 static bool   _upOk  = false;
 static String _upDir = "/";
 
+// Upload path captured from URL arg in _handleUploadDone (called first),
+// stored here so _handleUploadData can use it during streaming.
+// In Arduino WebServer multipart uploads, _handleUploadDone fires for the
+// initial request setup, then _handleUploadData fires for each chunk.
+static void _handleUploadDone() {
+    // Capture path from URL HERE — args are reliably available at this point.
+    // (During UPLOAD_FILE_START in the data callback, args may not be parsed yet.)
+    if (_server.hasArg("path")) _upDir = _server.arg("path");
+    else _upDir = "/";
+
+    if (_upOk) {
+        _server.sendHeader("Location", "/?path=" + _upDir);
+        _server.send(303);
+    } else {
+        _server.send(500,"text/plain","Upload failed");
+    }
+}
+
 static void _handleUploadData() {
     HTTPUpload& up = _server.upload();
     if (up.status == UPLOAD_FILE_START) {
-        _upOk  = false;
-        _upDir = _server.hasArg("path") ? _server.arg("path") : "/";
+        _upOk = false;
+        // Use _upDir already set by _handleUploadDone registration,
+        // or fall back to URL arg if available at this point.
+        if (_server.hasArg("path")) _upDir = _server.arg("path");
         String dest = (_upDir == "/") ? "/" + String(up.filename.c_str())
                                       : _upDir + "/" + String(up.filename.c_str());
-        Serial.printf("[FILEMGR] Upload: %s\n", dest.c_str());
+        Serial.printf("[FILEMGR] Upload start: %s\n", dest.c_str());
         if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
             if (!sd.exists(_upDir.c_str())) sd.mkdir(_upDir.c_str());
             _upFile = sd.open(dest.c_str(), O_WRITE | O_CREAT | O_TRUNC);
             xSemaphoreGive(spi_mutex);
             _upOk = (bool)_upFile;
         }
+        if (!_upOk) Serial.printf("[FILEMGR] Upload open FAILED: %s\n", dest.c_str());
     } else if (up.status == UPLOAD_FILE_WRITE && _upOk) {
         if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
             _upFile.write(up.buf, up.currentSize);
@@ -763,15 +814,6 @@ static void _handleUploadData() {
             xSemaphoreGive(spi_mutex);
         }
         Serial.printf("[FILEMGR] Upload done: %lu B\n", (unsigned long)up.totalSize);
-    }
-}
-
-static void _handleUploadDone() {
-    if (_upOk) {
-        _server.sendHeader("Location", "/?path=" + _upDir);
-        _server.send(303);
-    } else {
-        _server.send(500,"text/plain","Upload failed");
     }
 }
 
@@ -862,6 +904,7 @@ void run_wifi_filemgr() {
     }
 
     wifi_in_use = true;
+    sd_in_use   = true;   // Pause wardrive SD writes
     String ip = WiFi.localIP().toString();
 
     // Fully reset the server before registering handlers.
@@ -905,5 +948,6 @@ void run_wifi_filemgr() {
 
     _server.stop();
     wifi_in_use = false;
+    sd_in_use   = false;  // Release SD back to wardrive
     Serial.println("[FILEMGR] Stopped.");
 }
