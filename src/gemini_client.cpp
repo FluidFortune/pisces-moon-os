@@ -60,8 +60,9 @@
 
 extern Arduino_GFX *gfx;
 
-// 🚦 TRAFFIC LIGHT — prevents wardrive WiFi conflicts
+// 🚦 TRAFFIC LIGHTS — prevents wardrive WiFi/SD conflicts
 volatile bool wifi_in_use = false;
+volatile bool sd_in_use   = false;
 
 // 🧠 CONVERSATIONAL MEMORY BUFFER
 JsonDocument chatHistory;
