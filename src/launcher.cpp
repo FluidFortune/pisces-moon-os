@@ -274,7 +274,7 @@ static void drawCyberpunkHeader() {
     // Version tag far right
     gfx->setTextColor(C_TRACE);
     gfx->setCursor(262, 8);
-    gfx->print("v0.9.6");
+    gfx->print("v1.0.0");
 }
 
 // ─────────────────────────────────────────────
@@ -331,7 +331,7 @@ struct Category {
 #define APP_SSH          34   // SSH terminal client
 #define APP_MICROPYTHON  35   // MicroPython REPL
 
-// v0.9.6 — ELF On A Shelf
+// v1.0.0 — ELF On A Shelf
 #define APP_RETRO        36   // ROM browser + NES/GB/Atari launcher
 #define APP_ELF_BROWSER  37   // Generic ELF app loader
 #define APP_GAMEPAD      38   // BLE gamepad pairing + test

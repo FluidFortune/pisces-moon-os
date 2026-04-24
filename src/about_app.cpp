@@ -35,11 +35,12 @@ void run_about() {
     // Version and info
     gfx->setTextSize(1);
     gfx->setTextColor(C_WHITE);
-    gfx->setCursor(105, 95); gfx->print("Version 0.9 Alpha"); // Updated to match boot screen
+    gfx->setCursor(105, 95); gfx->print("Version 1.0.0");
+    gfx->setCursor(95, 110); gfx->print("\"The Arsenal\"");
     
     gfx->setTextColor(C_GREY);
-    gfx->setCursor(50, 130); gfx->print("Built for LilyGO T-Deck Plus");
-    gfx->setCursor(80, 150); gfx->print("March 20th, 2026");
+    gfx->setCursor(50, 145); gfx->print("Built for LilyGO T-Deck Plus");
+    gfx->setCursor(90, 165); gfx->print("April 2026");
 
     // Nostalgia Quote
     gfx->setTextColor(C_GREEN);
