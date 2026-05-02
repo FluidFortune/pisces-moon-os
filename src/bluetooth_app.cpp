@@ -144,11 +144,11 @@ void runBluetoothApp() {
         else if (tb.y == 1 && listOffset < devCount - MAX_ROWS)    { listOffset++; drawList(); }
 
         int16_t tx, ty;
-        if (get_touch(&tx, &ty) && ty < 26) {
+        if (get_touch(&tx, &ty) && ty < 40) {
             while (get_touch(&tx, &ty)) { delay(10); yield(); }
             exitApp = true;
         }
-        delay(50); yield();
+        delay(20); yield();
     }
 
     pScan->stop();

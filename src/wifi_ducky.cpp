@@ -446,7 +446,7 @@ static void wdRunReverse() {
 
         char k = get_keypress();
         int16_t tx, ty;
-        if (get_touch(&tx, &ty) && ty < 24) { while(get_touch(&tx,&ty)){delay(10);} break; }
+        if (get_touch(&tx, &ty) && ty < 40) { while(get_touch(&tx,&ty)){delay(10);} break; }
         if (k == 'q' || k == 'Q') break;
 
         if (k == 13 || k == 10) {
@@ -481,7 +481,7 @@ void run_wifi_ducky() {
         gfx->print("Tap header or Q to exit.");
         while (true) {
             int16_t tx, ty;
-            if (get_touch(&tx, &ty) && ty < 24) { while(get_touch(&tx,&ty)){delay(10);} return; }
+            if (get_touch(&tx, &ty) && ty < 40) { while(get_touch(&tx,&ty)){delay(10);} return; }
             if (get_keypress()) return;
             delay(50);
         }
@@ -510,7 +510,7 @@ void run_wifi_ducky() {
         TrackballState tb = update_trackball();
         int16_t tx, ty;
 
-        if (get_touch(&tx, &ty) && ty < 24) {
+        if (get_touch(&tx, &ty) && ty < 40) {
             while(get_touch(&tx,&ty)){delay(10);}
             if (state != ST_TARGETS) {
                 state = ST_TARGETS; activeTgt = nullptr;

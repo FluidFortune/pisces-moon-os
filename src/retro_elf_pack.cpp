@@ -499,7 +499,7 @@ void run_retro_pack() {
         int16_t tx, ty;
         if (get_touch(&tx, &ty)) {
             while (get_touch(&tx, &ty)) { delay(10); }
-            if (ty < 24) return; // header tap = exit
+            if (ty < 40) return; // header tap = exit
             if (ty >= RB_ROW_Y0 && ty < RB_ROW_MAX && _rom_count > 0) {
                 int slot = (ty - RB_ROW_Y0) / RB_ROW_H;
                 int tgt  = scroll + slot;

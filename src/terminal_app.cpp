@@ -9,31 +9,6 @@
 //
 // fluidfortune.com
 
-/**
- * PISCES MOON OS — GEMINI TERMINAL v2.0
- *
- * Changes from v1.x:
- *   - Long AI responses are now paginated — trackball up/down scrolls
- *     line-by-line, SPACE / trackball-right advances a full page,
- *     BACKSPACE / trackball-left goes back a page.
- *   - Word-wrap renders correctly at 53 chars per line (320px / 6px/char).
- *   - ENTER at the end of a response clears the screen for the next prompt.
- *   - Header tap always exits cleanly.
- *
- * Display layout (320×240):
- *   y  0-23  : header bar (fixed)
- *   y 24-209 : text content area — 30 lines × 6px = 180px usable
- *              at textSize(1): 8px/line → ~23 lines visible
- *   y 210-239: footer / scroll indicator (fixed)
- *
- * Controls (response pager):
- *   Trackball up/down  = scroll one line
- *   SPACE / PgDn       = next page
- *   BACKSPACE / PgUp   = previous page
- *   ENTER              = done, back to prompt
- *   Header tap         = exit app
- */
-
 #include <Arduino_GFX_Library.h>
 #include "touch.h"
 #include "trackball.h"
@@ -41,292 +16,112 @@
 #include "keyboard.h"
 #include "apps.h"
 #include "gemini_client.h"
+#include "text_buffer.h"
 
 extern Arduino_GFX *gfx;
 
-// ─────────────────────────────────────────────
-//  LAYOUT CONSTANTS
-// ─────────────────────────────────────────────
-#define TRM_HEADER_H    24
-#define TRM_FOOTER_H    18
-#define TRM_CONTENT_Y   (TRM_HEADER_H + 2)
-#define TRM_CONTENT_H   (240 - TRM_HEADER_H - TRM_FOOTER_H)
-#define TRM_LINE_H      9       // pixels per line at textSize(1) with 1px gap
-#define TRM_LINES_PER_PAGE  ((TRM_CONTENT_H) / TRM_LINE_H)   // ~21
-#define TRM_CHARS_PER_LINE  52  // (320 - 10px margin) / 6px per char
+#define TERM_HDR_H      24
+#define TERM_BODY_Y     26
+#define TERM_BODY_H     190
+#define TERM_INPUT_Y    218
+#define TERM_INPUT_H    22
 
-#define C_TRM_BG       0x0000
-#define C_TRM_HEADER   0x0821
-#define C_TRM_BORDER   0x07E0
-#define C_TRM_PROMPT   0x07E0   // Green for USER>
-#define C_TRM_RESPONSE 0xFFFF   // White for AI text
-#define C_TRM_DIM      0x4208
-#define C_TRM_AMBER    0xFD20
-#define C_TRM_RED      0xF800
-
-// ─────────────────────────────────────────────
-//  WORD-WRAP ENGINE
-//  Breaks a String into lines of at most
-//  TRM_CHARS_PER_LINE characters, respecting
-//  word boundaries. Returns line count.
-//  Lines are stored in a heap-allocated array
-//  — caller must free with delete[].
-// ─────────────────────────────────────────────
-static int wrapText(const String& text, String*& lines) {
-    // Conservative upper bound: every char could be a line break
-    int maxLines = (text.length() / 10) + 4;
-    lines = new String[maxLines];
-    int lineCount = 0;
-
-    int start = 0;
-    int len   = text.length();
-
-    while (start < len) {
-        // Skip leading spaces on new lines (except first)
-        if (lineCount > 0) {
-            while (start < len && text[start] == ' ') start++;
-        }
-        if (start >= len) break;
-
-        // Find a natural newline first
-        int nlPos = text.indexOf('\n', start);
-        int end;
-        bool forceBreak = false;
-
-        if (nlPos >= 0 && nlPos - start <= TRM_CHARS_PER_LINE) {
-            end = nlPos;
-            forceBreak = true;  // consume the newline
-        } else if (len - start <= TRM_CHARS_PER_LINE) {
-            end = len;
-        } else {
-            // Find last space within the limit
-            end = start + TRM_CHARS_PER_LINE;
-            int spacePos = -1;
-            for (int i = end; i > start; i--) {
-                if (text[i] == ' ') { spacePos = i; break; }
-            }
-            if (spacePos > start) end = spacePos;
-        }
-
-        if (lineCount < maxLines) {
-            lines[lineCount++] = text.substring(start, end);
-        }
-        start = end + (forceBreak ? 1 : 0);
-    }
-
-    return lineCount;
-}
-
-// ─────────────────────────────────────────────
-//  DRAW HELPERS
-// ─────────────────────────────────────────────
-static void drawHeader(const char* msg) {
-    gfx->fillRect(0, 0, 320, TRM_HEADER_H, C_TRM_HEADER);
-    gfx->drawFastHLine(0, TRM_HEADER_H, 320, C_TRM_BORDER);
-    gfx->setTextSize(1);
-    gfx->setTextColor(C_TRM_BORDER);
+static void drawHeader() {
+    gfx->fillRect(0, 0, 320, TERM_HDR_H, C_DARK);
+    gfx->drawFastHLine(0, TERM_HDR_H, 320, C_GREEN);
     gfx->setCursor(10, 7);
-    gfx->print(msg);
-}
-
-static void drawFooter(int firstLine, int totalLines) {
-    gfx->fillRect(0, 240 - TRM_FOOTER_H, 320, TRM_FOOTER_H, C_TRM_HEADER);
-    gfx->drawFastHLine(0, 240 - TRM_FOOTER_H, 320, C_TRM_DIM);
+    gfx->setTextColor(C_GREEN);
     gfx->setTextSize(1);
-
-    if (totalLines <= TRM_LINES_PER_PAGE) {
-        // Short response — no paging needed
-        gfx->setTextColor(C_TRM_DIM);
-        gfx->setCursor(60, 240 - TRM_FOOTER_H + 5);
-        gfx->print("ENTER:next prompt  HDR:exit");
-    } else {
-        int lastLine  = min(firstLine + TRM_LINES_PER_PAGE, totalLines);
-        int pctDone   = (lastLine * 100) / totalLines;
-
-        // Progress bar
-        int barW = 160;
-        int barX = (320 - barW) / 2;
-        int barY = 240 - TRM_FOOTER_H + 6;
-        gfx->drawRect(barX, barY, barW, 5, C_TRM_DIM);
-        gfx->fillRect(barX + 1, barY + 1, (barW - 2) * pctDone / 100, 3, C_TRM_BORDER);
-
-        gfx->setTextColor(C_TRM_DIM);
-        gfx->setCursor(4, 240 - TRM_FOOTER_H + 5);
-        gfx->printf("%d/%d", lastLine, totalLines);
-
-        if (lastLine < totalLines) {
-            gfx->setTextColor(C_TRM_AMBER);
-            gfx->setCursor(255, 240 - TRM_FOOTER_H + 5);
-            gfx->print("SPC:more");
-        } else {
-            gfx->setTextColor(C_TRM_BORDER);
-            gfx->setCursor(234, 240 - TRM_FOOTER_H + 5);
-            gfx->print("END  ENTER:next");
-        }
-    }
+    gfx->print("GEMINI TERM | TRACKBALL SCROLL | Q EXIT");
 }
 
-// ─────────────────────────────────────────────
-//  PAGE RENDERER
-//  Draws lines[firstLine .. firstLine+page_size)
-//  into the content area.
-// ─────────────────────────────────────────────
-static void renderPage(String* lines, int lineCount, int firstLine) {
-    gfx->fillRect(0, TRM_CONTENT_Y, 320, TRM_CONTENT_H, C_TRM_BG);
+static void drawInputPrompt() {
+    gfx->fillRect(0, TERM_INPUT_Y, 320, TERM_INPUT_H, 0x0841);
+    gfx->drawFastHLine(0, TERM_INPUT_Y, 320, C_GREEN);
+    gfx->setTextColor(C_GREEN);
     gfx->setTextSize(1);
-    gfx->setTextColor(C_TRM_RESPONSE);
-
-    int y = TRM_CONTENT_Y + 2;
-    for (int i = firstLine; i < lineCount && i < firstLine + TRM_LINES_PER_PAGE; i++) {
-        gfx->setCursor(5, y);
-        gfx->print(lines[i]);
-        y += TRM_LINE_H;
-    }
-
-    drawFooter(firstLine, lineCount);
+    gfx->setCursor(5, TERM_INPUT_Y + 7);
+    gfx->print("USER>");
 }
 
-// ─────────────────────────────────────────────
-//  RESPONSE PAGER
-//  Displays a (possibly long) response string
-//  with full scroll support. Returns true if
-//  the user wants to continue chatting, false
-//  if they tapped the header to exit.
-// ─────────────────────────────────────────────
-static bool showResponse(const String& response) {
-    String* lines = nullptr;
-    int lineCount = wrapText(response, lines);
-    int firstLine = 0;
-
-    drawHeader("GEMINI TERMINAL | TAP HEADER EXIT");
-    renderPage(lines, lineCount, firstLine);
-
-    bool keepGoing = true;
-
-    while (true) {
-        // Header tap = exit app
-        int16_t tx, ty;
-        if (get_touch(&tx, &ty)) {
-            while (get_touch(&tx, &ty)) { delay(10); yield(); }
-            if (ty < TRM_HEADER_H) { keepGoing = false; break; }
-        }
-
-        // Trackball
-        TrackballState tb = update_trackball();
-        if (tb.y == -1 && firstLine > 0) {
-            firstLine--;
-            renderPage(lines, lineCount, firstLine);
-        } else if (tb.y == 1 && firstLine + TRM_LINES_PER_PAGE < lineCount) {
-            firstLine++;
-            renderPage(lines, lineCount, firstLine);
-        } else if (tb.x == 1) {
-            // Right = page forward
-            int next = firstLine + TRM_LINES_PER_PAGE;
-            if (next < lineCount) { firstLine = next; renderPage(lines, lineCount, firstLine); }
-        } else if (tb.x == -1) {
-            // Left = page back
-            int prev = firstLine - TRM_LINES_PER_PAGE;
-            firstLine = max(0, prev);
-            renderPage(lines, lineCount, firstLine);
-        }
-
-        char c = get_keypress();
-        if (c == 13 || c == 10) {
-            // ENTER = done reading, back to prompt
-            break;
-        } else if (c == ' ') {
-            // SPACE = next page
-            int next = firstLine + TRM_LINES_PER_PAGE;
-            if (next < lineCount) { firstLine = next; renderPage(lines, lineCount, firstLine); }
-            else break;  // Already at end — treat as done
-        } else if (c == 8 || c == 127) {
-            // BACKSPACE = previous page
-            int prev = firstLine - TRM_LINES_PER_PAGE;
-            firstLine = max(0, prev);
-            renderPage(lines, lineCount, firstLine);
-        }
-
-        delay(30);
-        yield();
-    }
-
-    delete[] lines;
-    return keepGoing;
-}
-
-// ─────────────────────────────────────────────
-//  MAIN TERMINAL LOOP
-// ─────────────────────────────────────────────
 void run_terminal() {
-    gfx->fillScreen(C_TRM_BG);
-    drawHeader("GEMINI TERMINAL | TAP HEADER EXIT");
+    gfx->fillScreen(C_BLACK);
+    drawHeader();
+    drawInputPrompt();
 
-    // Prompt area
-    gfx->fillRect(0, TRM_CONTENT_Y, 320, TRM_CONTENT_H, C_TRM_BG);
-    gfx->fillRect(0, 240 - TRM_FOOTER_H, 320, TRM_FOOTER_H, C_TRM_HEADER);
-    gfx->drawFastHLine(0, 240 - TRM_FOOTER_H, 320, C_TRM_DIM);
-    gfx->setTextColor(C_TRM_DIM); gfx->setTextSize(1);
-    gfx->setCursor(60, 240 - TRM_FOOTER_H + 5);
-    gfx->print("Type prompt, press ENTER");
+    TextBuffer tb;
+    if (!tb.init()) {
+        gfx->setTextColor(0xF800);
+        gfx->setCursor(10, 50);
+        gfx->print("ERROR: Could not allocate text buffer.");
+        delay(3000);
+        return;
+    }
 
-    int promptY = TRM_CONTENT_Y + 4;
+    tb.visible_rows = TERM_BODY_H / 10;
+    tb.append("Gemini Terminal ready.", 0x07E0);
+    tb.append("Type your prompt below and press ENTER.", C_GREY);
+    tb.append("Roll trackball UP/DOWN to scroll history.", C_GREY);
+    tb.append("", C_WHITE);
+    tb.draw(0, TERM_BODY_Y, 320, TERM_BODY_H, 1);
 
     while (true) {
-        // Exit check
+        // ── Exit check ──
         int16_t tx, ty;
-        if (get_touch(&tx, &ty) && ty < TRM_HEADER_H) {
+        if (get_touch(&tx, &ty) && ty < TERM_HDR_H) {
             while (get_touch(&tx, &ty)) { delay(10); yield(); }
+            tb.free_mem();
             return;
         }
 
-        // Prompt label
-        gfx->setTextColor(C_TRM_PROMPT);
-        gfx->setTextSize(1);
-        gfx->setCursor(5, promptY);
-        gfx->print("USER> ");
+        // ── Scroll via trackball (only when not typing) ──
+        TrackballState tbs = update_trackball();
+        if (tbs.y == -1) {
+            tb.scroll_up(2);
+            tb.draw(0, TERM_BODY_Y, 320, TERM_BODY_H, 1);
+        } else if (tbs.y == 1) {
+            tb.scroll_down(2);
+            tb.draw(0, TERM_BODY_Y, 320, TERM_BODY_H, 1);
+        }
 
-        // Get input
-        String prompt = get_text_input(41, promptY);
-        if (prompt == "##EXIT##") return;
-        if (prompt.length() == 0) { yield(); continue; }
+        // ── Get input (blocks in keyboard loop) ──
+        drawInputPrompt();
+        gfx->setTextColor(C_WHITE);
+        String prompt = get_text_input(45, TERM_INPUT_Y + 7);
+        if (prompt == "##EXIT##") {
+            tb.free_mem();
+            return;
+        }
 
-        // Show "thinking" indicator
-        gfx->fillRect(0, TRM_CONTENT_Y, 320, TRM_CONTENT_H, C_TRM_BG);
-        gfx->setCursor(5, promptY);
-        gfx->setTextColor(C_TRM_PROMPT);
-        gfx->print("USER> ");
-        gfx->setTextColor(0xC618);
+        if (prompt.length() == 0) {
+            delay(50);
+            continue;
+        }
 
-        // Truncate display of long prompts
-        String displayPrompt = prompt;
-        if (displayPrompt.length() > 44) displayPrompt = displayPrompt.substring(0, 41) + "...";
-        gfx->print(displayPrompt);
+        // ── Show prompt in history ──
+        String userLine = "USER> " + prompt;
+        tb.append_wrapped(userLine.c_str(), 0x07E0);
+        tb.append("", C_WHITE);
+        tb.scroll_to_bottom();
+        tb.draw(0, TERM_BODY_Y, 320, TERM_BODY_H, 1);
 
-        gfx->setCursor(5, promptY + TRM_LINE_H + 2);
-        gfx->setTextColor(C_TRM_AMBER);
-        gfx->print("AI> Thinking...");
+        // ── Show "thinking" status ──
+        tb.append("AI> [thinking...]", 0xFD20);
+        tb.scroll_to_bottom();
+        tb.draw(0, TERM_BODY_Y, 320, TERM_BODY_H, 1);
 
-        // Call Gemini
+        // ── Call Gemini ──
         String response = ask_gemini(prompt);
 
-        // Show paged response — exit app if user tapped header
-        gfx->fillScreen(C_TRM_BG);
-        drawHeader("GEMINI TERMINAL | TAP HEADER EXIT");
+        // ── Replace the "thinking" line ──
+        if (tb.count > 0) tb.count--;  // Remove thinking placeholder
 
-        bool continueChat = showResponse(response);
-        if (!continueChat) return;
+        String aiLine = "AI> " + response;
+        tb.append_wrapped(aiLine.c_str(), 0xFFFF);
+        tb.append("", C_WHITE);
+        tb.scroll_to_bottom();
+        tb.draw(0, TERM_BODY_Y, 320, TERM_BODY_H, 1);
 
-        // Clear content area for next prompt
-        gfx->fillScreen(C_TRM_BG);
-        drawHeader("GEMINI TERMINAL | TAP HEADER EXIT");
-        gfx->fillRect(0, TRM_CONTENT_Y, 320, TRM_CONTENT_H, C_TRM_BG);
-        gfx->fillRect(0, 240 - TRM_FOOTER_H, 320, TRM_FOOTER_H, C_TRM_HEADER);
-        gfx->drawFastHLine(0, 240 - TRM_FOOTER_H, 320, C_TRM_DIM);
-        gfx->setTextColor(C_TRM_DIM); gfx->setTextSize(1);
-        gfx->setCursor(60, 240 - TRM_FOOTER_H + 5);
-        gfx->print("Type prompt, press ENTER");
-
-        promptY = TRM_CONTENT_Y + 4;
         yield();
     }
 }

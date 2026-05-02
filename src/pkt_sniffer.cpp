@@ -405,7 +405,7 @@ void run_pkt_sniffer() {
         int16_t tx, ty;
 
         // Exit
-        if (get_touch(&tx, &ty) && ty < 24) {
+        if (get_touch(&tx, &ty) && ty < 40) {
             while(get_touch(&tx,&ty)){delay(10);}
             break;
         }

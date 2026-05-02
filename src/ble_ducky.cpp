@@ -683,7 +683,7 @@ void run_ble_ducky() {
         TrackballState tb = update_trackball();
         int16_t tx, ty;
 
-        if (get_touch(&tx, &ty) && ty < 24) { while(get_touch(&tx,&ty)){delay(10);} break; }
+        if (get_touch(&tx, &ty) && ty < 40) { while(get_touch(&tx,&ty)){delay(10);} break; }
         if (k == 'q' || k == 'Q') break;
 
         // Update connection indicator

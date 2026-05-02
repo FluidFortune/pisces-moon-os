@@ -532,7 +532,7 @@ void run_elf_browser() {
         if (get_touch(&tx, &ty)) {
             while (get_touch(&tx, &ty)) { delay(10); }
 
-            if (ty < 24) return; // Header tap = exit
+            if (ty < 40) return; // Header tap = exit
 
             if (ty >= EB_ROW_Y0 && ty < EB_ROW_MAX) {
                 int slot = (ty - EB_ROW_Y0) / EB_ROW_H;
@@ -805,7 +805,7 @@ void run_gamepad_setup() {
         int16_t tx, ty;
         if (get_touch(&tx, &ty)) {
             while (get_touch(&tx, &ty)) { delay(10); }
-            if (ty < 24) return;  // Header tap = exit
+            if (ty < 40) return;  // Header tap = exit
         }
 
         // ── Button test — redraw only changed buttons ──

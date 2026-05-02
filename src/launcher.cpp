@@ -274,7 +274,7 @@ static void drawCyberpunkHeader() {
     // Version tag far right
     gfx->setTextColor(C_TRACE);
     gfx->setCursor(262, 8);
-    gfx->print("v1.0.0");
+    gfx->print("v1.0.1");
 }
 
 // ─────────────────────────────────────────────
@@ -818,7 +818,7 @@ static void handleTouch() {
 
     if (currentLevel == 0) {
         // Header area — nothing to do
-        if (ty < 24) return;
+        if (ty < 40) return;
         // Find tapped category
         for (int i = 0; i < NUM_CATEGORIES; i++) {
             int bx, by; getBoxPos(i, bx, by);
@@ -830,7 +830,7 @@ static void handleTouch() {
         }
     } else {
         // Back button
-        if (ty < 24) { closeFolder(); return; }
+        if (ty < 40) { closeFolder(); return; }
         // App tap
         const Category& cat = categories[openCategory];
         int startIdx = appPage * 6;

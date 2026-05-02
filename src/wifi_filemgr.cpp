@@ -939,7 +939,7 @@ void run_wifi_filemgr() {
         _server.handleClient();
         yield();
         int16_t tx, ty;
-        if (get_touch(&tx, &ty) && ty < 24) {
+        if (get_touch(&tx, &ty) && ty < 40) {
             while (get_touch(&tx, &ty)) { delay(10); yield(); }
             _serverRunning = false;
         }

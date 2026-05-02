@@ -62,6 +62,7 @@
 #include "mesh_messenger.h"
 
 extern Arduino_GFX *gfx;
+extern SemaphoreHandle_t spi_mutex;
 
 // ─────────────────────────────────────────────
 //  SX1262 HARDWARE PINS
@@ -353,6 +354,14 @@ static bool initRadio() {
                             SPI, lspSettings);
     radio = new SX1262(loraModule);
 
+    // SPI Bus Treaty: Take mutex during full radio initialization
+    if (!spi_mutex || xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        Serial.println("[MESH] initRadio: SPI mutex timeout");
+        delete radio; radio = nullptr;
+        delete loraModule; loraModule = nullptr;
+        return false;
+    }
+
     int state = radio->begin(
         LORA_FREQ,
         LORA_BW,
@@ -364,6 +373,7 @@ static bool initRadio() {
     );
 
     if (state != RADIOLIB_ERR_NONE) {
+        xSemaphoreGive(spi_mutex);
         Serial.printf("[MESH] Radio init failed: %d\n", state);
         return false;
     }
@@ -374,6 +384,8 @@ static bool initRadio() {
     radio->setCurrentLimit(140.0f);
     // Set RX boosted gain
     radio->setRxBoostedGainMode(true);
+
+    xSemaphoreGive(spi_mutex);
 
     Serial.printf("[MESH] Radio ready. NodeID: %08x  Freq: %.3f MHz\n",
                   (unsigned)myNodeId, LORA_FREQ);
@@ -415,12 +427,20 @@ static bool sendText(int ch, const char* text) {
     memcpy(pkt + sizeof(MeshHeader), payload, payloadLen);
     int totalLen = sizeof(MeshHeader) + payloadLen;
 
+    // SPI Bus Treaty: Take mutex before LoRa SPI access
+    if (!spi_mutex || xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        Serial.println("[MESH] TX: SPI mutex timeout");
+        return false;
+    }
+
     // Tune to channel frequency
     radio->setFrequency(channelFreq(ch));
 
     transmitting = true;
     int state = radio->transmit(pkt, totalLen);
     transmitting = false;
+
+    xSemaphoreGive(spi_mutex);
 
     if (state == RADIOLIB_ERR_NONE) {
         markSeen(hdr->id);
@@ -441,8 +461,13 @@ static bool sendText(int ch, const char* text) {
 static void pollReceive() {
     if (!radio || transmitting) return;
 
+    // SPI Bus Treaty: try mutex non-blocking. Skip if busy.
+    if (!spi_mutex || xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
+
     uint8_t buf[256];
     int state = radio->receive(buf, sizeof(buf));
+
+    xSemaphoreGive(spi_mutex);
 
     if (state == RADIOLIB_ERR_NONE) {
         int rxLen = radio->getPacketLength();
@@ -502,8 +527,7 @@ static void pollReceive() {
         Serial.printf("[MESH] RX state: %d\n", state);
     }
 
-    // Retune to current channel after receive
-    radio->setFrequency(channelFreq(currentCh));
+    // No retune needed — pollReceive doesn't change channel
 }
 
 // ─────────────────────────────────────────────
@@ -707,8 +731,11 @@ void run_mesh_messenger() {
 
     drawFull();
 
-    // Start async RX
-    radio->startReceive();
+    // Start async RX (with mutex)
+    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        radio->startReceive();
+        xSemaphoreGive(spi_mutex);
+    }
 
     bool running = true;
     uint32_t lastRx    = millis();
@@ -719,7 +746,10 @@ void run_mesh_messenger() {
         // ── Poll for received packets ──
         if (millis() - lastRx > 50) {
             pollReceive();
-            radio->startReceive();
+            if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                radio->startReceive();
+                xSemaphoreGive(spi_mutex);
+            }
             lastRx = millis();
         }
 
@@ -734,11 +764,12 @@ void run_mesh_messenger() {
         TrackballState tb = update_trackball();
         int16_t tx, ty;
 
-        // Header tap — top 14px = exit, bottom half = channel switch
-        if (get_touch(&tx, &ty) && ty < HDR_H) {
+        // Header tap — top half = exit, bottom half = channel switch
+        // Use ty < 40 for GT911 calibration tolerance
+        if (get_touch(&tx, &ty) && ty < 40) {
             while(get_touch(&tx,&ty)){delay(10);}
             // Top portion of header = exit
-            if (ty < HDR_H / 2) {
+            if (ty < 20) {
                 running = false;
                 continue;
             }
@@ -747,7 +778,11 @@ void run_mesh_messenger() {
             if (tappedCh >= 0 && tappedCh < MAX_CHANNELS && tappedCh != currentCh) {
                 currentCh = tappedCh;
                 inputLen = 0; inputBuf[0] = '\0';
-                radio->setFrequency(channelFreq(currentCh));
+                if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                    radio->setFrequency(channelFreq(currentCh));
+                    radio->startReceive();
+                    xSemaphoreGive(spi_mutex);
+                }
                 drawFull();
             }
             continue;
@@ -763,7 +798,11 @@ void run_mesh_messenger() {
         if (k == 9) {
             currentCh = (currentCh + 1) % MAX_CHANNELS;
             inputLen = 0; inputBuf[0] = '\0';
-            radio->setFrequency(channelFreq(currentCh));
+            if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                radio->setFrequency(channelFreq(currentCh));
+                radio->startReceive();
+                xSemaphoreGive(spi_mutex);
+            }
             drawFull();
             continue;
         }
@@ -800,7 +839,10 @@ void run_mesh_messenger() {
             inputLen = 0;
             inputBuf[0] = '\0';
             drawMessagesAndInput();
-            radio->startReceive();
+            if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                radio->startReceive();
+                xSemaphoreGive(spi_mutex);
+            }
             continue;
         }
 

@@ -474,7 +474,7 @@ void run_audio_recorder() {
         gfx->setCursor(10, 70); gfx->print("Tap header or Q to exit.");
         while (true) {
             int16_t tx, ty;
-            if (get_touch(&tx,&ty) && ty<24) { while(get_touch(&tx,&ty)){delay(10);} break; }
+            if (get_touch(&tx,&ty) && ty<40) { while(get_touch(&tx,&ty)){delay(10);} break; }
             if (get_keypress()) break;
             delay(50);
         }
@@ -497,7 +497,7 @@ void run_audio_recorder() {
         gfx->setCursor(10, 90);  gfx->print("Tap header to exit.");
         while (true) {
             int16_t tx, ty;
-            if (get_touch(&tx,&ty) && ty<24) { while(get_touch(&tx,&ty)){delay(10);} break; }
+            if (get_touch(&tx,&ty) && ty<40) { while(get_touch(&tx,&ty)){delay(10);} break; }
             char k = get_keypress();
             if (k=='q'||k=='Q') break;
             delay(50);
@@ -554,7 +554,7 @@ void run_audio_recorder() {
         int16_t tx, ty;
 
         // Header tap = exit
-        if (get_touch(&tx, &ty) && ty < 24) {
+        if (get_touch(&tx, &ty) && ty < 40) {
             while(get_touch(&tx,&ty)){delay(10);}
             if (recording) stopRecording();
             running = false;

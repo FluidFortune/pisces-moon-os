@@ -425,7 +425,7 @@ void run_baseball() {
         int16_t tx, ty;
 
         // Header tap
-        if (get_touch(&tx, &ty) && ty < 24) {
+        if (get_touch(&tx, &ty) && ty < 40) {
             while(get_touch(&tx,&ty)){delay(10);}
             if (inCard) {
                 // Any header tap exits card view

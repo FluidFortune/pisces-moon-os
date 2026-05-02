@@ -109,7 +109,7 @@ static void udShowWrongBuild() {
     while (true) {
         char k = get_keypress();
         int16_t tx, ty;
-        if (get_touch(&tx, &ty) && ty < 24) { while(get_touch(&tx,&ty)){delay(10);} return; }
+        if (get_touch(&tx, &ty) && ty < 40) { while(get_touch(&tx,&ty)){delay(10);} return; }
         if (k == 'q' || k == 'Q') return;
         delay(50);
     }
@@ -410,7 +410,7 @@ void run_usb_ducky() {
         TrackballState tb = update_trackball();
         int16_t tx, ty;
 
-        if (get_touch(&tx, &ty) && ty < 24) { while(get_touch(&tx,&ty)){delay(10);} break; }
+        if (get_touch(&tx, &ty) && ty < 40) { while(get_touch(&tx,&ty)){delay(10);} break; }
         if (k == 'q' || k == 'Q') break;
 
         if (tb.y == -1 && selected > 0)                { selected--; if(selected<scroll) scroll--; }

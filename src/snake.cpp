@@ -1,14 +1,3 @@
-// Pisces Moon OS
-// Copyright (C) 2026 Eric Becker / Fluid Fortune
-// SPDX-License-Identifier: AGPL-3.0-or-later
-//
-// This program is free software: you can redistribute it
-// and/or modify it under the terms of the GNU Affero General
-// Public License as published by the Free Software Foundation,
-// either version 3 of the License, or any later version.
-//
-// fluidfortune.com
-
 /**
  * PISCES MOON OS — snake.cpp
  * Full Snake: growing tail, score, high score saved to /snake_hs.txt on SD.
@@ -29,9 +18,9 @@ extern SdFat sd;
 //  GAME CONSTANTS
 // ─────────────────────────────────────────────
 #define GRID_X      0       // Grid left edge (pixels)
-#define GRID_Y      24      // Grid top edge (below header)
+#define GRID_Y      26      // Grid top edge (header + 2px gap below separator)
 #define GRID_W      320
-#define GRID_H      196     // Leaves room for header + score bar
+#define GRID_H      192     // Exact ROWS * CELL — no dead strip at bottom
 #define CELL        8       // Pixel size of each grid cell
 #define COLS        (GRID_W / CELL)   // 40
 #define ROWS        (GRID_H / CELL)   // 24
@@ -86,7 +75,12 @@ static void draw_header(int score, int hi) {
 }
 
 static void draw_border() {
-    gfx->drawRect(GRID_X, GRID_Y, GRID_W, GRID_H, BORDER_COLOR);
+    // Border removed — it overlapped cell positions at column 0 / row 0
+    // and caused visual artifacts as the snake passed near the edges.
+    // The header separator line above the grid provides sufficient
+    // visual bounding for gameplay.
+    gfx->drawFastHLine(0, GRID_Y - 1, 320, BORDER_COLOR);
+    gfx->drawFastHLine(0, GRID_Y + GRID_H, 320, BORDER_COLOR);
 }
 
 // ─────────────────────────────────────────────

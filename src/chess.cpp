@@ -952,11 +952,11 @@ void run_chess() {
                 while (!moved && !quit) {
                     // Input
                     char k = get_keypress();
-                    TrackballState tb = update_trackball();
+                    TrackballState tb = update_trackball_game();
 
                     // Header tap = quit
                     int16_t tx, ty;
-                    if (get_touch(&tx, &ty) && ty < 8) {
+                    if (get_touch(&tx, &ty) && ty < 40) {
                         while(get_touch(&tx,&ty)){delay(10);}
                         quit = true; break;
                     }
@@ -979,10 +979,23 @@ void run_chess() {
                     if (tb.x == -1 || gamepad_pressed(GP_LEFT))  { if (cursorCol > 0) cursorCol--; }
                     if (tb.x ==  1 || gamepad_pressed(GP_RIGHT)) { if (cursorCol < 7) cursorCol++; }
 
-                    // Select / move — trackball click or GP_A
-                    bool confirm = tb.clicked || gamepad_pressed(GP_A);
-                    // Deselect — GP_B
-                    if (gamepad_pressed(GP_B) && pieceSelected) {
+                    // Touch on board = move cursor to tapped square and confirm
+                    bool touchConfirm = false;
+                    if (get_touch(&tx, &ty) && tx >= BOARD_X && ty >= BOARD_Y &&
+                        tx < BOARD_X + SQ*8 && ty < BOARD_Y + SQ*8) {
+                        while(get_touch(&tx,&ty)){delay(5);}
+                        cursorCol = (tx - BOARD_X) / SQ;
+                        cursorRow = (ty - BOARD_Y) / SQ;
+                        touchConfirm = true;
+                    }
+
+                    // Select / move — trackball click, SPACE, ENTER, or touch on board
+                    bool confirm = tb.clicked || gamepad_pressed(GP_A) ||
+                                   k == ' ' || k == '\n' || k == '\r' ||
+                                   touchConfirm;
+
+                    // Deselect — GP_B or ESC
+                    if ((gamepad_pressed(GP_B) || k == 27) && pieceSelected) {
                         pieceSelected = false;
                         memset(validMoveTargets, 0, sizeof(validMoveTargets));
                         drawBoard(); drawPanel();
@@ -1085,7 +1098,7 @@ void run_chess() {
             char k = get_keypress();
             TrackballState tb = update_trackball();
             int16_t tx, ty;
-            if (k || tb.clicked || (get_touch(&tx,&ty) && ty < 8)) {
+            if (k || tb.clicked || (get_touch(&tx,&ty) && ty < 40)) {
                 newGame = true; break;
             }
             delay(50);

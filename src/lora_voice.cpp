@@ -345,7 +345,7 @@ void run_lora_voice() {
         gfx->setCursor(10, 96); gfx->print("Check LoRa module. Q/tap to exit.");
         while (true) {
             int16_t tx, ty;
-            if (get_touch(&tx, &ty) && ty < 24) return;
+            if (get_touch(&tx, &ty) && ty < 40) return;
             if (get_keypress() == 'q') return;
             delay(100);
         }
@@ -363,7 +363,7 @@ void run_lora_voice() {
         gfx->setCursor(10, 110); gfx->print("Mic init FAILED. Tap to exit.");
         while (true) {
             int16_t tx, ty;
-            if (get_touch(&tx, &ty) && ty < 24) return;
+            if (get_touch(&tx, &ty) && ty < 40) return;
             if (get_keypress() == 'q') return;
             delay(100);
         }
@@ -406,7 +406,7 @@ void run_lora_voice() {
 
     while (true) {
         int16_t tx, ty;
-        if (get_touch(&tx, &ty) && ty < 24) {
+        if (get_touch(&tx, &ty) && ty < 40) {
             while (get_touch(&tx, &ty)) delay(10);
             break;
         }

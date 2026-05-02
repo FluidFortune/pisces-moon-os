@@ -433,7 +433,7 @@ void run_ble_gatt_explorer() {
         TrackballState tb = update_trackball();
         int16_t tx, ty;
 
-        if (get_touch(&tx, &ty) && ty < 24) {
+        if (get_touch(&tx, &ty) && ty < 40) {
             while (get_touch(&tx, &ty)) delay(10);
             break;
         }
