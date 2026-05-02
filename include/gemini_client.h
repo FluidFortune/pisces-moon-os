@@ -13,7 +13,6 @@
 #define GEMINI_CLIENT_H
 
 #include <Arduino.h>
-#include "secrets.h"   // GEMINI_API_KEY, GOOGLE_CLOUD_API_KEY
 
 // ─────────────────────────────────────────────
 //  GEMINI CLIENT v4.0 — Direct API Key
@@ -29,20 +28,7 @@
 //  Free tier: 15 req/min, 1M tokens/day.
 //
 //  Model: gemini-2.0-flash (fast, capable, free tier friendly)
-//
-//  secrets.h must define:
-//    GEMINI_API_KEY        — required for all Gemini calls
-//    GOOGLE_CLOUD_API_KEY  — optional, Voice Terminal STT/TTS only
 // ─────────────────────────────────────────────
-
-// Fallback defines — prevent compile errors if secrets.h is missing keys.
-// Replace these with real values in secrets.h before use.
-#ifndef GEMINI_API_KEY
-  #define GEMINI_API_KEY ""
-#endif
-#ifndef GOOGLE_CLOUD_API_KEY
-  #define GOOGLE_CLOUD_API_KEY ""
-#endif
 
 // Initializes chat history. Call in setup() after SD mounts.
 void init_gemini();
