@@ -4,10 +4,17 @@
 #include <Arduino.h>
 
 // Shared variables — read by launcher status bar and other apps
-extern int  networks_found;
-extern volatile int  bt_found;
-extern int  esp_found;       // Espressif MAC hunter count
+extern int  networks_found;         // count from last WiFi scan
+extern volatile int  bt_found;      // count from current BLE window
+extern int  esp_found;              // Espressif MAC hunter count
 extern bool wardrive_active;
+
+// Session totals — accumulate across all scans, never reset until reboot.
+// These are the right values for Bridge mode to display — they stay
+// meaningful whether wardrive is currently running or idle.
+extern int      networks_total;     // cumulative networks seen this boot
+extern int      ble_total;          // cumulative BLE devices seen this boot
+extern uint32_t last_scan_ms;       // millis() of most recent WiFi scan
 
 // Traffic flags — set by apps that need exclusive radio or SD access.
 // Wardrive task checks these before touching the radio or SD card.
