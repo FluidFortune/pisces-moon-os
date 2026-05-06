@@ -35,12 +35,19 @@ extern volatile bool wifi_in_use;
 extern volatile bool sd_in_use;     // NEW — set by wifi_filemgr while serving
 extern SemaphoreHandle_t spi_mutex;
 
-int  networks_found  = 0;
-volatile int  bt_found        = 0;
-int  esp_found       = 0;
+int  networks_found  = 0;       // count from last WiFi scan
+volatile int  bt_found        = 0;       // count from current BLE window
+int  esp_found       = 0;               // ESP32 beacons found this session
 bool wardrive_active = false;
 volatile bool wardrive_bridge_streaming = false;  // v1.1 — set by bridge_app
 HardwareSerial SerialGPS(1);
+
+// ─── Session totals — accumulate across all scans, never reset ───
+// These persist as long as the device is on, giving Bridge mode something
+// meaningful to display even when wardrive is idle.
+int      networks_total = 0;    // cumulative networks seen this boot
+int      ble_total      = 0;    // cumulative BLE devices seen this boot
+uint32_t last_scan_ms   = 0;   // millis() of most recent completed WiFi scan
 
 static char _current_log_file[32] = "";
 
@@ -106,6 +113,7 @@ class WardriveCallbacks : public NimBLEAdvertisedDeviceCallbacks {
         const char* name = dev->haveName() ? dev->getName().c_str() : "Unknown";
         enqueueBLE(mac, name, dev->getRSSI());
         bt_found++;
+        ble_total++;  // accumulate session total — never resets
     }
 };
 
@@ -262,6 +270,8 @@ void wardrive_task(void *pvParameters) {
                 // Only write to SD if file manager isn't using it
                 if (n > 0 && !sd_in_use) {
                     networks_found = n;
+                    networks_total += n;   // accumulate session total
+                    last_scan_ms = millis(); // timestamp for Bridge display
                     if (gps.location.isValid()) {
                         if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                             FsFile file = sd.open(_current_log_file, O_WRITE | O_APPEND);
