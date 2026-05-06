@@ -392,7 +392,52 @@ static char     vis_last_json[80] = "";
 static uint32_t vis_last_json_ms = 0;
 static bool     vis_last_was_tx  = true;  // true = outgoing, false = incoming
 
-// Counter for total bridge events sent (TX direction)
+// Forward declaration — defined below with the oscilloscope primitives
+static void lora_trace_pulse(bool outgoing);
+
+// ─────────────────────────────────────────────
+//  BRIDGE RECEPTION COUNTERS (v1.1 fix)
+//
+//  The visualizer bars reflect what the bridge is TRANSMITTING
+//  to the host — i.e. what the host is sending us via streaming
+//  events (wifi_seen, ble_seen) — NOT the T-Deck's own wardrive
+//  scan counts. When the T-Deck is a passive bridge, networks_found
+//  and bt_found are zero on-device even though the host is actively
+//  wardriving and streaming results back.
+//
+//  These counters increment on each received event and decay slowly
+//  so the bars feel alive during a streaming session.
+// ─────────────────────────────────────────────
+static int vis_rx_wifi_count = 0;   // networks seen via streaming events
+static int vis_rx_ble_count  = 0;   // BLE devices seen via streaming events
+static uint32_t vis_last_wifi_event_ms = 0;
+static uint32_t vis_last_ble_event_ms  = 0;
+static uint32_t vis_last_stream_ms     = 0;  // any JSON event — drives LoRa trace pulse
+
+// Called from vis_record_tx() and the command handler when wifi_seen/ble_seen arrive
+static void vis_on_wifi_seen() {
+    vis_rx_wifi_count = min(vis_rx_wifi_count + 1, VIS_WIFI_MAX);
+    vis_last_wifi_event_ms = millis();
+    vis_last_stream_ms = millis();
+    lora_trace_pulse(true);   // each wifi event pulses the trace upward
+}
+
+static void vis_on_ble_seen() {
+    vis_rx_ble_count = min(vis_rx_ble_count + 1, VIS_BLE_MAX);
+    vis_last_ble_event_ms = millis();
+    vis_last_stream_ms = millis();
+    lora_trace_pulse(false);  // BLE events pulse the trace downward
+}
+
+// Decay the reception counters every 10 seconds so the bars don't
+// stay frozen at max after a wardrive session ends
+static void vis_decay_rx_counters() {
+    static uint32_t last_decay = 0;
+    if (millis() - last_decay < 10000) return;
+    last_decay = millis();
+    if (vis_rx_wifi_count > 0) vis_rx_wifi_count--;
+    if (vis_rx_ble_count  > 0) vis_rx_ble_count--;
+}
 static uint32_t bridge_tx_events = 0;
 static uint32_t bridge_rx_cmds   = 0;
 static char     last_cmd_label[16] = "--";
@@ -415,12 +460,19 @@ static void vis_record_tx(const char* jsonLine) {
     vis_last_json[sizeof(vis_last_json) - 1] = 0;
     vis_last_json_ms = millis();
     vis_last_was_tx  = true;
+    vis_last_stream_ms = millis();
+    // Pulse the LoRa trace upward on outgoing events
+    // so the oscilloscope shows activity even without real LoRa radio TX
+    lora_trace_pulse(true);
 }
 
 static void vis_record_rx(const char* cmdName) {
     bridge_rx_cmds++;
     strncpy(last_cmd_label, cmdName, sizeof(last_cmd_label) - 1);
     last_cmd_label[sizeof(last_cmd_label) - 1] = 0;
+    vis_last_stream_ms = millis();
+    // Pulse the LoRa trace downward on incoming commands
+    lora_trace_pulse(false);
 }
 
 // Capability probes — defensive checks so bridge doesn't crash
@@ -601,20 +653,39 @@ static void drawBridgeUpdate(bool connected) {
                            (unsigned long)bridge_rx_cmds);
 
     // ── WiFi bar ──
-    int wifi_count = 0;
-    if (wifi_subsystem_ready()) {
+    // Uses session totals — data that persists whether wardrive is
+    // running or idle. Bar shows what the device has seen this boot,
+    // not just what it found in the last scan window.
+    vis_decay_rx_counters();
+    extern int networks_total;
+    extern int ble_total;
+    extern uint32_t last_scan_ms;
+
+    // Best available count: session total if wardrive has ever run,
+    // otherwise streaming events from host, otherwise last scan count
+    int wifi_display = 0;
+    if (networks_total > 0) {
+        // Clamp to VIS_WIFI_MAX for bar display — totals can exceed 20
+        wifi_display = min(networks_total, VIS_WIFI_MAX);
+    } else if (vis_rx_wifi_count > 0) {
+        wifi_display = vis_rx_wifi_count;
+    } else if (wardrive_active) {
         extern int networks_found;
-        wifi_count = networks_found;
+        wifi_display = min(networks_found, VIS_WIFI_MAX);
     }
-    draw_bar(45, 50, 260, 12, wifi_count, VIS_WIFI_MAX, C_GREEN);
+    draw_bar(45, 50, 260, 12, wifi_display, VIS_WIFI_MAX, C_GREEN);
 
     // ── BLE bar ──
-    int ble_count = 0;
-    if (ble_subsystem_ready()) {
+    int ble_display = 0;
+    if (ble_total > 0) {
+        ble_display = min(ble_total, VIS_BLE_MAX);
+    } else if (vis_rx_ble_count > 0) {
+        ble_display = vis_rx_ble_count;
+    } else if (wardrive_active) {
         extern volatile int bt_found;
-        ble_count = bt_found;
+        ble_display = min((int)bt_found, VIS_BLE_MAX);
     }
-    draw_bar(45, 76, 260, 12, ble_count, VIS_BLE_MAX, 0x07FF);  // cyan
+    draw_bar(45, 76, 260, 12, ble_display, VIS_BLE_MAX, 0x07FF);
 
     // ── LoRa spike trace ──
     if (lora_subsystem_ready()) {
@@ -639,7 +710,7 @@ static void drawBridgeUpdate(bool connected) {
     gfx->print(pulse_glyph(rfid_subsystem_ready(), rfid_last_event_ms));
 
     // ── GPS ──
-    gfx->fillRect(45, 165, 275, 33, C_BLACK);
+    gfx->fillRect(45, 165, 275, 35, C_BLACK);
     gfx->setTextSize(1);
     if (gps_subsystem_ready() && gps.location.isValid()) {
         gfx->setTextColor(C_GREEN);
@@ -661,6 +732,31 @@ static void drawBridgeUpdate(bool connected) {
         gfx->setTextColor(0x4208);
         gfx->setCursor(45, 167);
         gfx->print("(not present)");
+    }
+
+    // Last scan age — shown below GPS so user knows how fresh bar data is
+    gfx->fillRect(45, 192, 275, 10, C_BLACK);
+    if (last_scan_ms > 0) {
+        uint32_t ago_s = (millis() - last_scan_ms) / 1000;
+        gfx->setTextColor(0x4208);
+        gfx->setCursor(45, 193);
+        if (wardrive_active) {
+            gfx->printf("WD: %d nets / %d BLE  scanning...",
+                        networks_total, ble_total);
+        } else if (ago_s < 60) {
+            gfx->printf("Last WD: %ds ago  %d nets / %d BLE",
+                        ago_s, networks_total, ble_total);
+        } else if (ago_s < 3600) {
+            gfx->printf("Last WD: %dm ago  %d nets / %d BLE",
+                        ago_s / 60, networks_total, ble_total);
+        } else {
+            gfx->printf("Last WD: >1hr ago  %d nets / %d BLE",
+                        networks_total, ble_total);
+        }
+    } else {
+        gfx->setTextColor(0x4208);
+        gfx->setCursor(45, 193);
+        gfx->print("No WD data this session");
     }
 
     // ── JSON visualizer line ──
