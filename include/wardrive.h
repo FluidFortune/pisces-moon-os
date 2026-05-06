@@ -5,7 +5,7 @@
 
 // Shared variables — read by launcher status bar and other apps
 extern int  networks_found;
-extern int  bt_found;
+extern volatile int  bt_found;
 extern int  esp_found;       // Espressif MAC hunter count
 extern bool wardrive_active;
 
@@ -27,5 +27,24 @@ void wardrive_ble_resume();
 // Returns the current session log filename (e.g. "/wardrive_0003.csv").
 // Empty string until the wardrive task has started and created the file.
 const char* wardrive_get_log_filename();
+
+// ─────────────────────────────────────────────
+//  v1.1 — Bridge streaming hook
+//
+//  When set true, the wardrive task emits JSON events on Serial
+//  for each detected network/BLE device. Bridge enables this
+//  during a connected session so the host receives live data
+//  without having to poll wardrive_status.
+//
+//  Event format:
+//    {"event":"wifi_seen","mac":"AA:BB:CC:DD:EE:FF","ssid":"...",
+//     "rssi":-52,"ch":6,"enc":"WPA","lat":34.067,"lng":-118.204}
+//    {"event":"ble_seen","mac":"...","name":"...","rssi":-68}
+//
+//  The flag is volatile because it's read on Core 0 (wardrive task)
+//  and written on Core 1 (bridge_app). No mutex needed — single
+//  bool, atomic read/write on ESP32-S3.
+// ─────────────────────────────────────────────
+extern volatile bool wardrive_bridge_streaming;
 
 #endif

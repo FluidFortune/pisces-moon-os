@@ -147,4 +147,14 @@ void run_usb_ducky();
 // USE ONLY ON SYSTEMS YOU OWN OR HAVE AUTHORIZATION TO TEST
 void run_wifi_ducky();
 
+// Bridge App — USB Serial JSON bridge for web emulator
+// Connect any ESP32 running Pisces Moon to piscesdemo.fluidfortune.com
+// Chrome/Edge only (Web Serial API). Launch from SYSTEM menu.
+void run_bridge();
+
+// Bridge App — USB Serial JSON bridge for web emulator
+// Connect any ESP32 running Pisces Moon to piscesdemo.fluidfortune.com
+// Chrome/Edge only (Web Serial API). Launch from SYSTEM menu.
+void run_bridge();
+
 #endif // APPS_H
