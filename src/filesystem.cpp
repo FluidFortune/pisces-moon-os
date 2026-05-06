@@ -20,6 +20,8 @@
  */
 
 #include <Arduino_GFX_Library.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "SdFat.h"
 #include "keyboard.h"
 #include "touch.h"
@@ -29,28 +31,69 @@
 
 extern Arduino_GFX *gfx;
 extern SdFat sd;
+extern SemaphoreHandle_t spi_mutex;
 
 // ─────────────────────────────────────────────
 //  UNIVERSAL TEXT PAGER
 // ─────────────────────────────────────────────
+// ─────────────────────────────────────────────
+//  TEXT FILE VIEWER
+//
+//  SPI Bus Treaty: rather than holding spi_mutex for
+//  the entire viewing session (which would block Ghost
+//  Engine for minutes), we load the whole file into
+//  a PSRAM buffer under mutex, close the file, release
+//  the mutex, then paginate from the buffer.
+//
+//  Hard limit of 256KB on viewable file size — enough
+//  for any text file, log, or note. Larger files are
+//  truncated with a notice.
+// ─────────────────────────────────────────────
+#define VIEW_MAX_BYTES   (256 * 1024)
+
 void view_text_file(String path) {
     gfx->fillScreen(C_BLACK);
     gfx->fillRect(0, 0, 320, 24, C_DARK);
     gfx->setCursor(10, 7); gfx->setTextColor(C_GREEN);
     gfx->print("READING: " + path.substring(0, 20));
 
-    FsFile file = sd.open(path.c_str(), O_READ);
-    if (!file) {
-        gfx->setCursor(10, 50); gfx->setTextColor(C_RED);
-        gfx->print("Error opening file.");
-        delay(2000); return;
+    // Load entire file into PSRAM under spi_mutex
+    char*    buffer  = nullptr;
+    uint32_t bufLen  = 0;
+    bool     truncated = false;
+
+    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        FsFile file = sd.open(path.c_str(), O_READ);
+        if (file) {
+            uint32_t size = file.size();
+            if (size > VIEW_MAX_BYTES) {
+                size = VIEW_MAX_BYTES;
+                truncated = true;
+            }
+            buffer = (char*)ps_malloc(size + 1);
+            if (buffer) {
+                bufLen = file.read(buffer, size);
+                buffer[bufLen] = 0;
+            }
+            file.close();
+        }
+        xSemaphoreGive(spi_mutex);
     }
 
+    if (!buffer) {
+        gfx->setCursor(10, 50); gfx->setTextColor(C_RED);
+        gfx->print("Error opening file.");
+        delay(2000);
+        return;
+    }
+
+    // Now paginate from buffer — no SD access needed
     int cx = 5, cy = 35;
+    uint32_t pos = 0;
     gfx->setTextColor(C_WHITE);
 
-    while (file.available()) {
-        char c = file.read();
+    while (pos < bufLen) {
+        char c = buffer[pos++];
 
         if (c == '\r') continue;
 
@@ -70,17 +113,17 @@ void view_text_file(String path) {
 
             while (true) {
                 char k = get_keypress();
-                if (k == 'b' || k == 'B') { file.close(); return; }
+                if (k == 'b' || k == 'B') { free(buffer); return; }
                 if (k == ' ') break;
 
                 TrackballState tb = update_trackball();
-                if (tb.clicked) break;      // Click = next page
-                if (tb.x == -1) { file.close(); return; } // Left = back
+                if (tb.clicked) break;
+                if (tb.x == -1) { free(buffer); return; }
 
                 int16_t tx, ty;
                 if (get_touch(&tx, &ty)) {
                     if (ty > 210) { while(get_touch(&tx,&ty)){delay(10);} break; }
-                    if (ty < 30)  { while(get_touch(&tx,&ty)){delay(10);} file.close(); return; }
+                    if (ty < 40)  { while(get_touch(&tx,&ty)){delay(10);} free(buffer); return; }
                 }
                 delay(20);
             }
@@ -94,7 +137,8 @@ void view_text_file(String path) {
     // End of file
     gfx->fillRect(0, 215, 320, 25, C_DARK);
     gfx->setCursor(10, 222); gfx->setTextColor(C_GREY);
-    gfx->print("[END] Tap Header, [B], or CLK to exit");
+    if (truncated) gfx->print("[TRUNCATED at 256KB]  CLK to exit");
+    else           gfx->print("[END] Tap Header, [B], or CLK to exit");
 
     while (true) {
         char k = get_keypress();
@@ -104,10 +148,10 @@ void view_text_file(String path) {
         if (tb.clicked) break;
 
         int16_t tx, ty;
-        if (get_touch(&tx, &ty) && ty < 30) { while(get_touch(&tx,&ty)){delay(10);} break; }
+        if (get_touch(&tx, &ty) && ty < 40) { while(get_touch(&tx,&ty)){delay(10);} break; }
         delay(20);
     }
-    file.close();
+    free(buffer);
 }
 
 // ─────────────────────────────────────────────
@@ -173,13 +217,6 @@ void run_filesystem() {
         gfx->setCursor(10, 7); gfx->setTextColor(C_GREEN);
         gfx->print("SYS: " + current_path.substring(0, 26));
 
-        FsFile dir = sd.open(current_path.c_str());
-        if (!dir) {
-            current_path = "/";
-            page_offset  = 0;
-            continue;
-        }
-
         String   items[9];
         bool     is_dir[9];
         uint32_t item_sizes[9];
@@ -191,32 +228,50 @@ void run_filesystem() {
             items[count] = ".."; is_dir[count] = true; item_sizes[count] = 0; count++;
         }
 
-        // Skip to page offset
-        FsFile entry;
-        dir.rewind();
-        int skipped = 0;
-        while (skipped < page_offset && entry.openNext(&dir, O_READ)) {
-            entry.close(); skipped++;
-        }
+        // Read directory entries under spi_mutex (SPI Bus Treaty)
+        // Quick batch read — release mutex before drawing
+        bool more_files = false;
+        bool dir_ok     = false;
+        if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            FsFile dir = sd.open(current_path.c_str());
+            if (dir) {
+                dir_ok = true;
 
-        // Read up to 8 items
-        while (count < 8 && entry.openNext(&dir, O_READ)) {
-            char name[64];
-            entry.getName(name, sizeof(name));
-            items[count]    = String(name);
-            is_dir[count]   = entry.isDir();
-            item_sizes[count] = 0;
-            if (!is_dir[count]) {
-                item_sizes[count] = entry.size() / 1024;
-                if (item_sizes[count] == 0 && entry.size() > 0) item_sizes[count] = 1;
+                // Skip to page offset
+                FsFile entry;
+                dir.rewind();
+                int skipped = 0;
+                while (skipped < page_offset && entry.openNext(&dir, O_READ)) {
+                    entry.close(); skipped++;
+                }
+
+                // Read up to 8 items
+                while (count < 8 && entry.openNext(&dir, O_READ)) {
+                    char name[64];
+                    entry.getName(name, sizeof(name));
+                    items[count]    = String(name);
+                    is_dir[count]   = entry.isDir();
+                    item_sizes[count] = 0;
+                    if (!is_dir[count]) {
+                        item_sizes[count] = entry.size() / 1024;
+                        if (item_sizes[count] == 0 && entry.size() > 0) item_sizes[count] = 1;
+                    }
+                    count++;
+                    entry.close();
+                }
+
+                more_files = entry.openNext(&dir, O_READ);
+                if (more_files) entry.close();
+                dir.close();
             }
-            count++;
-            entry.close();
+            xSemaphoreGive(spi_mutex);
         }
 
-        bool more_files = entry.openNext(&dir, O_READ);
-        if (more_files) entry.close();
-        dir.close();
+        if (!dir_ok) {
+            current_path = "/";
+            page_offset  = 0;
+            continue;
+        }
 
         // Clamp cursor to valid range after page change
         if (cursorIdx >= count) cursorIdx = max(0, count - 1);
@@ -306,7 +361,7 @@ void run_filesystem() {
             // ── Touch ──
             int16_t tx, ty;
             if (get_touch(&tx, &ty)) {
-                if (ty < 30) {
+                if (ty < 40) {
                     while(get_touch(&tx,&ty)){delay(10);}
                     return; // Header tap = exit to launcher
                 }

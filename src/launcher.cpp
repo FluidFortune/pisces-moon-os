@@ -74,6 +74,7 @@
 #include "ble_ducky.h"
 #include "usb_ducky.h"
 #include "wifi_ducky.h"
+#include "bridge_app.h"
 #include "apps.h"
 
 extern Arduino_GFX *gfx;
@@ -274,7 +275,7 @@ static void drawCyberpunkHeader() {
     // Version tag far right
     gfx->setTextColor(C_TRACE);
     gfx->setCursor(262, 8);
-    gfx->print("v1.0.1");
+    gfx->print("v1.1.0");
 }
 
 // ─────────────────────────────────────────────
@@ -348,6 +349,9 @@ struct Category {
 #define APP_BLE_DUCKY    45   // BLE HID keyboard injection (DuckyScript)
 #define APP_USB_DUCKY    46   // USB HID keyboard injection (requires HID build)
 #define APP_WIFI_DUCKY   47   // WiFi payload delivery / reverse C2
+
+// v1.1.0 — ELF Treaty Compliance
+#define APP_BRIDGE       48   // USB Serial JSON bridge for web emulator
 
 // ─────────────────────────────────────────────
 //  CATEGORY DEFINITIONS
@@ -428,8 +432,9 @@ static const Category categories[] = {
        {"SYSTEM",    APP_SYSTEM},
        {"uPY REPL",  APP_MICROPYTHON},
        {"ELF APPS",  APP_ELF_BROWSER},
-       {"GAMEPAD",   APP_GAMEPAD}},
-      7 },
+       {"GAMEPAD",   APP_GAMEPAD},
+       {"BRIDGE",    APP_BRIDGE}},
+      8 },
 
 };
 #define NUM_CATEGORIES 7
@@ -770,6 +775,9 @@ static void launchApp(int launchId) {
         case APP_BLE_DUCKY:    run_ble_ducky();                             break;
         case APP_USB_DUCKY:    run_usb_ducky();                             break;
         case APP_WIFI_DUCKY:   run_wifi_ducky();                            break;
+
+        // SYSTEM — Bridge App
+        case APP_BRIDGE:       run_bridge();                                break;
 
         default:
             gfx->setCursor(80, 110); gfx->setTextColor(C_APP_RED);

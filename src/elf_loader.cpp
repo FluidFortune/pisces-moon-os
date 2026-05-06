@@ -60,12 +60,20 @@ const char* elf_result_str(ElfLoadResult r) {
     }
 }
 
+// Forward declaration for v1.1 handle cleanup (defined below)
+static void elf_release_all_handles();
+
 // ============================================================
 //  elf_free_psram()
 //  Zero and release the PSRAM allocation from the last ELF run.
 //  Safe to call even if nothing is allocated (no-op).
+//  Also releases any SD handles the ELF left open (v1.1+).
 // ============================================================
 void elf_free_psram() {
+    // Release any SD handles the ELF held — buggy modules might
+    // forget to close, and we don't want to leak handle slots.
+    elf_release_all_handles();
+
     if (_elf_internal::psram_region) {
         // Zero the region before freeing — no stale game state or
         // sensitive data lingers in PSRAM between ELF sessions.
@@ -75,6 +83,179 @@ void elf_free_psram() {
         _elf_internal::psram_region_size = 0;
     }
     _elf_internal::elf_running = false;
+}
+
+// ============================================================
+//  ELF SD HANDLE TABLE — v1.1 SPI Bus Treaty helpers
+//
+//  ELF modules cannot safely call sd.open() directly because they
+//  do not share the firmware's spi_mutex. Instead we expose a
+//  small handle-based API (sd_open_read, sd_read, sd_close, etc.)
+//  via function pointers in ElfContext.
+//
+//  Each helper takes spi_mutex internally before any bus access.
+//  This makes treaty violations impossible by construction —
+//  ELF modules cannot collide with the Ghost Engine wardrive task,
+//  LoRa TX, or any other firmware-side SPI consumer.
+//
+//  Handles are integers 0..ELF_SD_MAX_HANDLES-1 indexing into a
+//  static array of FsFile objects. -1 means invalid.
+//
+//  Mutex timeout: 1000ms — generous because we cannot predict
+//  what the firmware side is doing (long wardrive write, etc).
+//  If the helper returns ELF_SD_HANDLE_INVALID or 0 bytes, the
+//  ELF should treat it as a transient failure and retry.
+// ============================================================
+namespace _elf_sd {
+    static FsFile handles[ELF_SD_MAX_HANDLES];
+    static bool   in_use[ELF_SD_MAX_HANDLES] = {0};
+
+    static int alloc_handle() {
+        for (int i = 0; i < ELF_SD_MAX_HANDLES; i++) {
+            if (!in_use[i]) {
+                in_use[i] = true;
+                return i;
+            }
+        }
+        return ELF_SD_HANDLE_INVALID;
+    }
+
+    static void free_handle(int h) {
+        if (h < 0 || h >= ELF_SD_MAX_HANDLES) return;
+        if (handles[h]) handles[h].close();
+        in_use[h] = false;
+    }
+}
+
+// ─────────────────────────────────────────────
+//  Helper bodies — installed into ElfContext
+// ─────────────────────────────────────────────
+static int elf_sd_open_read(const char* path) {
+    if (!path || !spi_mutex) return ELF_SD_HANDLE_INVALID;
+    int h = _elf_sd::alloc_handle();
+    if (h < 0) return ELF_SD_HANDLE_INVALID;
+
+    if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        _elf_sd::in_use[h] = false;
+        return ELF_SD_HANDLE_INVALID;
+    }
+    _elf_sd::handles[h] = sd.open(path, O_READ);
+    bool ok = (bool)_elf_sd::handles[h];
+    xSemaphoreGive(spi_mutex);
+
+    if (!ok) {
+        _elf_sd::in_use[h] = false;
+        return ELF_SD_HANDLE_INVALID;
+    }
+    return h;
+}
+
+static int elf_sd_open_write(const char* path, bool append) {
+    if (!path || !spi_mutex) return ELF_SD_HANDLE_INVALID;
+    int h = _elf_sd::alloc_handle();
+    if (h < 0) return ELF_SD_HANDLE_INVALID;
+
+    if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        _elf_sd::in_use[h] = false;
+        return ELF_SD_HANDLE_INVALID;
+    }
+    int flags = append ? (O_WRITE | O_CREAT | O_APPEND)
+                       : (O_WRITE | O_CREAT | O_TRUNC);
+    _elf_sd::handles[h] = sd.open(path, flags);
+    bool ok = (bool)_elf_sd::handles[h];
+    xSemaphoreGive(spi_mutex);
+
+    if (!ok) {
+        _elf_sd::in_use[h] = false;
+        return ELF_SD_HANDLE_INVALID;
+    }
+    return h;
+}
+
+static int elf_sd_read(int handle, void* buf, int len) {
+    if (handle < 0 || handle >= ELF_SD_MAX_HANDLES) return -1;
+    if (!_elf_sd::in_use[handle] || !buf || len <= 0) return -1;
+    if (!spi_mutex) return -1;
+
+    if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return -1;
+    int n = _elf_sd::handles[handle].read(buf, len);
+    xSemaphoreGive(spi_mutex);
+    return n;
+}
+
+static int elf_sd_write(int handle, const void* buf, int len) {
+    if (handle < 0 || handle >= ELF_SD_MAX_HANDLES) return -1;
+    if (!_elf_sd::in_use[handle] || !buf || len <= 0) return -1;
+    if (!spi_mutex) return -1;
+
+    if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return -1;
+    int n = _elf_sd::handles[handle].write((const uint8_t*)buf, len);
+    xSemaphoreGive(spi_mutex);
+    return n;
+}
+
+static void elf_sd_close(int handle) {
+    if (handle < 0 || handle >= ELF_SD_MAX_HANDLES) return;
+    if (!_elf_sd::in_use[handle]) return;
+
+    // close() flushes — needs the bus
+    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        if (_elf_sd::handles[handle]) _elf_sd::handles[handle].close();
+        xSemaphoreGive(spi_mutex);
+    }
+    _elf_sd::in_use[handle] = false;
+}
+
+static bool elf_sd_exists(const char* path) {
+    if (!path || !spi_mutex) return false;
+    if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
+    bool ok = sd.exists(path);
+    xSemaphoreGive(spi_mutex);
+    return ok;
+}
+
+static bool elf_sd_mkdir(const char* path) {
+    if (!path || !spi_mutex) return false;
+    if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
+    bool ok = sd.mkdir(path);
+    xSemaphoreGive(spi_mutex);
+    return ok;
+}
+
+static bool elf_sd_remove(const char* path) {
+    if (!path || !spi_mutex) return false;
+    if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
+    bool ok = sd.remove(path);
+    xSemaphoreGive(spi_mutex);
+    return ok;
+}
+
+static int elf_sd_size(const char* path) {
+    if (!path || !spi_mutex) return -1;
+    if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return -1;
+    int sz = -1;
+    if (sd.exists(path)) {
+        FsFile f = sd.open(path, O_READ);
+        if (f) {
+            sz = (int)f.size();
+            f.close();
+        }
+    }
+    xSemaphoreGive(spi_mutex);
+    return sz;
+}
+
+// ============================================================
+//  elf_release_all_handles()
+//  Called when an ELF exits — frees any handles it left open.
+//  Without this, a buggy ELF could leak handle slots permanently.
+// ============================================================
+static void elf_release_all_handles() {
+    for (int i = 0; i < ELF_SD_MAX_HANDLES; i++) {
+        if (_elf_sd::in_use[i]) {
+            _elf_sd::free_handle(i);
+        }
+    }
 }
 
 // ============================================================
@@ -101,8 +282,24 @@ void elf_build_context(ElfContext* ctx, const char* rom_path) {
 
     // Platform version
     ctx->api_major = ELF_API_MAJOR_SUPPORTED;
-    ctx->api_minor = 0;
+    ctx->api_minor = ELF_API_MINOR_SUPPORTED;
     strncpy(ctx->os_version, PISCES_OS_VERSION, sizeof(ctx->os_version) - 1);
+
+    // ─── v1.1 — SPI Bus Treaty helpers ───
+    // Direct mutex access for advanced ELF authors
+    ctx->spi_mutex_ptr = &spi_mutex;
+
+    // SPI-safe SD helpers — these internally take/release spi_mutex,
+    // making it impossible for ELF modules to violate the treaty.
+    ctx->sd_open_read  = elf_sd_open_read;
+    ctx->sd_open_write = elf_sd_open_write;
+    ctx->sd_read       = elf_sd_read;
+    ctx->sd_write      = elf_sd_write;
+    ctx->sd_close      = elf_sd_close;
+    ctx->sd_exists     = elf_sd_exists;
+    ctx->sd_mkdir      = elf_sd_mkdir;
+    ctx->sd_remove     = elf_sd_remove;
+    ctx->sd_size       = elf_sd_size;
 
     // ROM path (emulator ELFs only)
     if (rom_path && rom_path[0]) {

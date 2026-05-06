@@ -6,6 +6,8 @@
  */
 
 #include <Arduino_GFX_Library.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "keyboard.h"
 #include "trackball.h"
 #include "theme.h"
@@ -13,6 +15,7 @@
 
 extern Arduino_GFX *gfx;
 extern SdFat sd;
+extern SemaphoreHandle_t spi_mutex;
 
 // ─────────────────────────────────────────────
 //  GAME CONSTANTS
@@ -41,22 +44,35 @@ enum Dir { UP, DOWN, LEFT, RIGHT };
 
 // ─────────────────────────────────────────────
 //  HIGH SCORE HELPERS
+//  SPI Bus Treaty: HS load/save wrapped in spi_mutex
+//  to prevent collision with Ghost Engine on Core 0.
 // ─────────────────────────────────────────────
 static int load_high_score() {
-    if (!sd.exists(HS_FILE)) return 0;
-    FsFile f = sd.open(HS_FILE, O_READ);
-    if (!f) return 0;
-    char buf[16] = {0};
-    f.read(buf, sizeof(buf) - 1);
-    f.close();
-    return atoi(buf);
+    int score = 0;
+    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        if (sd.exists(HS_FILE)) {
+            FsFile f = sd.open(HS_FILE, O_READ);
+            if (f) {
+                char buf[16] = {0};
+                f.read(buf, sizeof(buf) - 1);
+                f.close();
+                score = atoi(buf);
+            }
+        }
+        xSemaphoreGive(spi_mutex);
+    }
+    return score;
 }
 
 static void save_high_score(int score) {
-    FsFile f = sd.open(HS_FILE, O_WRITE | O_CREAT | O_TRUNC);
-    if (!f) return;
-    f.printf("%d", score);
-    f.close();
+    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        FsFile f = sd.open(HS_FILE, O_WRITE | O_CREAT | O_TRUNC);
+        if (f) {
+            f.printf("%d", score);
+            f.close();
+        }
+        xSemaphoreGive(spi_mutex);
+    }
 }
 
 // ─────────────────────────────────────────────

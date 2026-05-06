@@ -22,12 +22,16 @@
 #include <Arduino.h>
 #include <Arduino_GFX_Library.h>
 #include <SdFat.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "touch.h"
 #include "trackball.h"
 #include "keyboard.h"
 #include "theme.h"
 #include "gamepad.h"
 #include "galaga.h"
+
+extern SemaphoreHandle_t spi_mutex;
 
 extern Arduino_GFX *gfx;
 extern SdFat sd;
@@ -492,18 +496,34 @@ static void drawExplosion(int x, int y) {
 
 // ─────────────────────────────────────────────
 //  HIGH SCORE
+//  SPI Bus Treaty: wraps SD access in spi_mutex
+//  to prevent collision with Ghost Engine on Core 0.
 // ─────────────────────────────────────────────
 static int loadHS() {
-    if (!sd.exists(HS_PATH)) return 0;
-    FsFile f = sd.open(HS_PATH, O_READ);
-    if (!f) return 0;
-    char buf[16] = {0}; f.read(buf, 15); f.close();
-    return atoi(buf);
+    int score = 0;
+    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        if (sd.exists(HS_PATH)) {
+            FsFile f = sd.open(HS_PATH, O_READ);
+            if (f) {
+                char buf[16] = {0};
+                f.read(buf, 15);
+                f.close();
+                score = atoi(buf);
+            }
+        }
+        xSemaphoreGive(spi_mutex);
+    }
+    return score;
 }
 static void saveHS(int hs) {
-    FsFile f = sd.open(HS_PATH, O_WRITE | O_CREAT | O_TRUNC);
-    if (!f) return;
-    f.printf("%d", hs); f.close();
+    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        FsFile f = sd.open(HS_PATH, O_WRITE | O_CREAT | O_TRUNC);
+        if (f) {
+            f.printf("%d", hs);
+            f.close();
+        }
+        xSemaphoreGive(spi_mutex);
+    }
 }
 
 // ─────────────────────────────────────────────

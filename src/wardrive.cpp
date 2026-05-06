@@ -36,9 +36,10 @@ extern volatile bool sd_in_use;     // NEW — set by wifi_filemgr while serving
 extern SemaphoreHandle_t spi_mutex;
 
 int  networks_found  = 0;
-int  bt_found        = 0;
+volatile int  bt_found        = 0;
 int  esp_found       = 0;
 bool wardrive_active = false;
+volatile bool wardrive_bridge_streaming = false;  // v1.1 — set by bridge_app
 HardwareSerial SerialGPS(1);
 
 static char _current_log_file[32] = "";
@@ -153,6 +154,25 @@ static void flushBLEQueue(const char* log_file) {
             }
             xSemaphoreGive(spi_mutex);
         }
+
+        // ── v1.1 — Bridge streaming hook ──
+        // Emit BLE event after SD write — Serial doesn't share SPI bus,
+        // so we don't need the mutex held during the emit.
+        if (wardrive_bridge_streaming) {
+            // Sanitize name for JSON (replace " and \ with _)
+            char nameBuf[32];
+            strncpy(nameBuf, r.name, sizeof(nameBuf) - 1);
+            nameBuf[sizeof(nameBuf) - 1] = 0;
+            for (int j = 0; nameBuf[j]; j++) {
+                if (nameBuf[j] == '"' || nameBuf[j] == '\\') nameBuf[j] = '_';
+            }
+            Serial.printf(
+              "{\"event\":\"ble_seen\",\"mac\":\"%s\",\"name\":\"%s\","
+              "\"rssi\":%d,\"lat\":%.6f,\"lng\":%.6f}\n",
+              r.mac, nameBuf, r.rssi,
+              gps.location.isValid() ? gps.location.lat() : 0.0,
+              gps.location.isValid() ? gps.location.lng() : 0.0);
+        }
     }
 }
 
@@ -246,14 +266,32 @@ void wardrive_task(void *pvParameters) {
                         if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                             FsFile file = sd.open(_current_log_file, O_WRITE | O_APPEND);
                             if (file) {
+                                // Use stack-allocated char buffers instead of String
+                                // to avoid PSRAM allocation failure during long sessions
+                                char macBuf[20];
+                                char ssidBuf[64];
                                 for (int i = 0; i < n; ++i) {
-                                    String wMac = WiFi.BSSIDstr(i);
-                                    bool   wEsp = isEspressifMAC(wMac.c_str());
+                                    // Copy BSSID safely — never construct String inside mutex
+                                    String tmpMac  = WiFi.BSSIDstr(i);
+                                    String tmpSsid = WiFi.SSID(i);
+                                    if (tmpMac.length() == 0 || tmpMac.length() > 19) continue;
+                                    strncpy(macBuf, tmpMac.c_str(), sizeof(macBuf)-1);
+                                    macBuf[sizeof(macBuf)-1] = 0;
+
+                                    bool wEsp = isEspressifMAC(macBuf);
                                     if (wEsp) esp_found++;
-                                    String ssid = wEsp ? "[ESP32] " + WiFi.SSID(i)
-                                                       : WiFi.SSID(i);
+
+                                    // Build SSID with optional ESP32 prefix safely
+                                    if (wEsp) {
+                                        snprintf(ssidBuf, sizeof(ssidBuf), "[ESP32] %.50s",
+                                                 tmpSsid.c_str());
+                                    } else {
+                                        strncpy(ssidBuf, tmpSsid.c_str(), sizeof(ssidBuf)-1);
+                                        ssidBuf[sizeof(ssidBuf)-1] = 0;
+                                    }
+
                                     file.printf("%s,%s,%s,%s,%d,%d,%.6f,%.6f,%.1f,%d,%s\n",
-                                        wMac.c_str(), ssid.c_str(),
+                                        macBuf, ssidBuf,
                                         WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "OPEN" : "WPA",
                                         gps_timestamp().c_str(),
                                         WiFi.channel(i), WiFi.RSSI(i),
@@ -263,6 +301,38 @@ void wardrive_task(void *pvParameters) {
                                 file.close();
                             }
                             xSemaphoreGive(spi_mutex);
+                        }
+
+                        // ── v1.1 — Bridge streaming hook ──
+                        // Emit per-network JSON events after releasing the
+                        // mutex (Serial doesn't share SPI). This lets the
+                        // host receive live data without polling.
+                        if (wardrive_bridge_streaming) {
+                            char macBuf[20];
+                            char ssidBuf[64];
+                            for (int i = 0; i < n; ++i) {
+                                String tmpMac  = WiFi.BSSIDstr(i);
+                                String tmpSsid = WiFi.SSID(i);
+                                if (tmpMac.length() == 0 || tmpMac.length() > 19) continue;
+                                strncpy(macBuf, tmpMac.c_str(), sizeof(macBuf)-1);
+                                macBuf[sizeof(macBuf)-1] = 0;
+                                strncpy(ssidBuf, tmpSsid.c_str(), sizeof(ssidBuf)-1);
+                                ssidBuf[sizeof(ssidBuf)-1] = 0;
+                                // Escape any double-quotes in SSID for safe JSON
+                                for (int j = 0; ssidBuf[j]; j++) {
+                                    if (ssidBuf[j] == '"' || ssidBuf[j] == '\\') ssidBuf[j] = '_';
+                                }
+
+                                Serial.printf(
+                                  "{\"event\":\"wifi_seen\",\"mac\":\"%s\",\"ssid\":\"%s\","
+                                  "\"rssi\":%d,\"ch\":%d,\"enc\":\"%s\","
+                                  "\"lat\":%.6f,\"lng\":%.6f}\n",
+                                  macBuf, ssidBuf,
+                                  WiFi.RSSI(i), WiFi.channel(i),
+                                  WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "OPEN" : "WPA",
+                                  gps.location.isValid() ? gps.location.lat() : 0.0,
+                                  gps.location.isValid() ? gps.location.lng() : 0.0);
+                            }
                         }
                     }
                 } else if (n > 0) {
@@ -287,7 +357,11 @@ void wardrive_task(void *pvParameters) {
 }
 
 void init_wardrive_core() {
-    xTaskCreatePinnedToCore(wardrive_task, "WarDriveCore", 8192, NULL, 1, NULL, 0);
+    // Stack increased from 8192 → 12288 to prevent overflow during
+    // concurrent WiFi.scanNetworks + BLE callbacks + GPS parsing.
+    // Symptoms of insufficient stack: random reboots during scan
+    // windows, especially when USB plug/unplug perturbs power.
+    xTaskCreatePinnedToCore(wardrive_task, "WarDriveCore", 12288, NULL, 1, NULL, 0);
 }
 
 void wardrive_ble_stop() {
@@ -358,7 +432,8 @@ void run_wardrive() {
 
         int16_t tx, ty;
         if (get_touch(&tx, &ty)) {
-            if (ty < 30) {
+            // Use ty < 40 global header tap convention (v1.0.1)
+            if (ty < 40) {
                 while (get_touch(&tx, &ty)) { delay(10); yield(); }
                 break;
             } else if (ty > 190) {

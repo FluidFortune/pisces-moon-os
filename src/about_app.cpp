@@ -35,7 +35,7 @@ void run_about() {
     // Version and info
     gfx->setTextSize(1);
     gfx->setTextColor(C_WHITE);
-    gfx->setCursor(105, 95); gfx->print("Version 1.0.1");
+    gfx->setCursor(105, 95); gfx->print("Version 1.1.0");
     gfx->setCursor(95, 110); gfx->print("\"The Arsenal\"");
     
     gfx->setTextColor(C_GREY);

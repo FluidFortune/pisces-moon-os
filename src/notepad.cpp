@@ -10,6 +10,8 @@
 // fluidfortune.com
 
 #include <Arduino_GFX_Library.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "SdFat.h"
 #include "keyboard.h"
 #include "touch.h" // Needed for Header Tap
@@ -18,6 +20,7 @@
 
 extern Arduino_GFX *gfx;
 extern SdFat sd;
+extern SemaphoreHandle_t spi_mutex;
 
 void draw_journal_ui(String &text) {
     gfx->fillScreen(C_BLACK);
@@ -34,9 +37,13 @@ void draw_journal_ui(String &text) {
 
 void run_notepad() {
     String buffer = "";
-    
-    if (!sd.exists("/logs")) {
-        sd.mkdir("/logs");
+
+    // Ensure /logs/ exists — wrap in spi_mutex (SPI Bus Treaty)
+    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        if (!sd.exists("/logs")) {
+            sd.mkdir("/logs");
+        }
+        xSemaphoreGive(spi_mutex);
     }
     
     draw_journal_ui(buffer);
@@ -62,10 +69,10 @@ void run_notepad() {
             }
         }
 
-        // --- THE HEADER TAP FIX ---
+        // --- HEADER TAP — uses v1.0.1 ty < 40 global convention ---
         int16_t tx, ty;
         if (get_touch(&tx, &ty)) {
-            if (ty < 30) {
+            if (ty < 40) {
                 // Wait for lift
                 while(get_touch(&tx, &ty)) { delay(10); yield(); }
 
@@ -79,15 +86,23 @@ void run_notepad() {
                 gfx->setTextColor(C_WHITE);
                 gfx->print("Enter filename (no spaces):");
                 
-                String filename = get_text_input(10, 70); // Uses our new global function!
+                String filename = get_text_input(10, 70);
                 if(filename == "") filename = "journal.txt";
                 
                 String fullPath = "/logs/" + filename;
-                
-                FsFile file = sd.open(fullPath.c_str(), O_WRITE | O_CREAT | O_TRUNC);
-                if (file) {
-                    file.print(buffer);
-                    file.close();
+
+                // Wrap SD save in spi_mutex (SPI Bus Treaty)
+                bool saved = false;
+                if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                    FsFile file = sd.open(fullPath.c_str(), O_WRITE | O_CREAT | O_TRUNC);
+                    if (file) {
+                        file.print(buffer);
+                        file.close();
+                        saved = true;
+                    }
+                    xSemaphoreGive(spi_mutex);
+                }
+                if (saved) {
                     gfx->setCursor(10, 110);
                     gfx->setTextColor(C_GREEN);
                     gfx->print("Saved to ");

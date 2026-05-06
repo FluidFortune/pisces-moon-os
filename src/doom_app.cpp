@@ -91,6 +91,8 @@
 #include <Arduino_GFX_Library.h>
 #include <FFat.h>
 #include <FS.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "SdFat.h"
 #include "touch.h"
 #include "trackball.h"
@@ -100,6 +102,7 @@
 
 extern Arduino_GFX *gfx;
 extern SdFat sd;
+extern SemaphoreHandle_t spi_mutex;
 
 // ─────────────────────────────────────────────
 //  COLORS
@@ -244,6 +247,9 @@ uint16_t* DG_ScreenBuffer = nullptr; // Set to doomFrameBuffer in DG_Init
 
 // ─────────────────────────────────────────────
 //  WAD LOCATOR
+//  SPI Bus Treaty: SD existence checks wrapped in
+//  spi_mutex. FFat lives on internal flash and does
+//  not share the SPI bus, so no mutex needed there.
 // ─────────────────────────────────────────────
 static bool findWAD(char* wadPath, int pathLen) {
     // Priority: internal FAT partition first (faster), then SD
@@ -263,22 +269,23 @@ static bool findWAD(char* wadPath, int pathLen) {
         }
     }
 
-    // Try SD card
-    if (sd.exists("/doom1.wad")) {
-        strncpy(wadPath, "/doom1.wad", pathLen);
-        Serial.println("[DOOM] WAD found on SD card");
-        return true;
+    // Try SD card — wrap in spi_mutex (SPI Bus Treaty)
+    bool found = false;
+    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        if (sd.exists("/doom1.wad")) {
+            strncpy(wadPath, "/doom1.wad", pathLen);
+            Serial.println("[DOOM] WAD found on SD card");
+            found = true;
+        } else if (sd.exists("/doom.wad")) {
+            strncpy(wadPath, "/doom.wad", pathLen);
+            found = true;
+        } else if (sd.exists("/doom2.wad")) {
+            strncpy(wadPath, "/doom2.wad", pathLen);
+            found = true;
+        }
+        xSemaphoreGive(spi_mutex);
     }
-    if (sd.exists("/doom.wad")) {
-        strncpy(wadPath, "/doom.wad", pathLen);
-        return true;
-    }
-    if (sd.exists("/doom2.wad")) {
-        strncpy(wadPath, "/doom2.wad", pathLen);
-        return true;
-    }
-
-    return false;
+    return found;
 }
 
 // ─────────────────────────────────────────────
@@ -315,7 +322,7 @@ static void showNoWAD() {
         int16_t tx, ty;
         TrackballState tb = update_trackball();
         if (k == 'q' || k == 'Q' || tb.clicked ||
-            (get_touch(&tx, &ty) && ty < 30)) {
+            (get_touch(&tx, &ty) && ty < 40)) {
             while(get_touch(&tx,&ty)){delay(10);}
             break;
         }
@@ -360,7 +367,7 @@ static void showEngineNotInstalled() {
         int16_t tx, ty;
         TrackballState tb = update_trackball();
         if (k == 'q' || k == 'Q' || tb.clicked ||
-            (get_touch(&tx, &ty) && ty < 30)) {
+            (get_touch(&tx, &ty) && ty < 40)) {
             while(get_touch(&tx,&ty)){delay(10);}
             break;
         }
