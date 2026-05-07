@@ -50,10 +50,12 @@
 #include <esp_mac.h>
 #include <TinyGPSPlus.h>
 #include "touch.h"
+#include "trackball.h"
 #include "theme.h"
 #include "keyboard.h"
 #include "gemini_client.h"
 #include "wardrive.h"
+#include "pm_promiscuous.h"
 #include "SdFat.h"
 #include "time.h"
 #include <TinyGPSPlus.h>
@@ -65,7 +67,8 @@ extern volatile bool   wifi_in_use;
 extern volatile bool   sd_in_use;
 extern SemaphoreHandle_t spi_mutex;
 
-#define BRIDGE_BAUD   115200
+#define BRIDGE_BAUD   921600   // 921600 for promiscuous mode bandwidth headroom
+                               // (115200 would saturate at ~58 frames/sec)
 #define CMD_BUF_LEN   2048
 
 // ─────────────────────────────────────────────
@@ -578,7 +581,100 @@ static const char* pulse_glyph(bool present, uint32_t last_event_ms) {
 }
 
 // ─────────────────────────────────────────────
-//  FULL REDRAW (called once at app start, then partial updates)
+//  TOGGLE PANEL STATE
+//  4 toggles: Wardrive, BLE, GPS, Promiscuous
+//  Trackball up/down to move cursor, click to toggle.
+//  Touch directly on a row also toggles it.
+// ─────────────────────────────────────────────
+static int  tog_cursor = 0;   // 0=WD 1=BLE 2=GPS 3=PROMISC
+
+// BLE-specific active flag (separate from wardrive BLE)
+// When BLE toggle is OFF, wardrive skips BLE scan phase.
+// Exposed via extern in wardrive.h v1.1.1
+static bool bridge_ble_enabled = true;
+static bool bridge_gps_enabled = true;
+
+// Layout constants
+#define TOG_X       0
+#define TOG_W       130
+#define TOG_H       20
+#define TOG_Y0      44    // first row y
+#define TOG_GAP     22    // row pitch
+#define VIS_X       135   // visualizer column x
+#define VIS_W       185   // visualizer column width
+
+static const char* tog_labels[] = { "WARDRIVE", "BLE", "GPS", "PROMISC" };
+
+// Returns current ON/OFF state for each toggle
+static bool tog_state(int i) {
+    switch (i) {
+        case 0: return wardrive_active;
+        case 1: return bridge_ble_enabled;
+        case 2: return bridge_gps_enabled;
+        case 3: return (wardrive_mode == WARDRIVE_MODE_PROMISCUOUS);
+        default: return false;
+    }
+}
+
+// Apply a toggle action
+static void tog_apply(int i) {
+    switch (i) {
+        case 0: // Wardrive
+            wardrive_active = !wardrive_active;
+            if (!wardrive_active) wardrive_bridge_streaming = false;
+            break;
+        case 1: // BLE
+            bridge_ble_enabled = !bridge_ble_enabled;
+            break;
+        case 2: // GPS
+            bridge_gps_enabled = !bridge_gps_enabled;
+            break;
+        case 3: // Promiscuous
+            if (wardrive_mode == WARDRIVE_MODE_PROMISCUOUS) {
+                wardrive_set_mode(WARDRIVE_MODE_SCAN);
+            } else {
+                wardrive_set_mode(WARDRIVE_MODE_PROMISCUOUS);
+                wardrive_active = true;   // promisc implies wardrive on
+            }
+            break;
+    }
+}
+
+// Draw one toggle row
+static void draw_toggle_row(int i, bool force_full) {
+    int y    = TOG_Y0 + i * TOG_GAP;
+    bool on  = tog_state(i);
+    bool sel = (i == tog_cursor);
+
+    // Background
+    gfx->fillRect(TOG_X, y, TOG_W, TOG_H - 1, sel ? C_DARK : C_BLACK);
+
+    // Selection indicator
+    if (sel) {
+        gfx->drawRect(TOG_X, y, TOG_W, TOG_H - 1, C_CYAN);
+    }
+
+    // Label
+    gfx->setCursor(TOG_X + 6, y + 6);
+    gfx->setTextColor(sel ? C_CYAN : C_WHITE);
+    gfx->setTextSize(1);
+    gfx->print(tog_labels[i]);
+
+    // ON/OFF badge — flush right
+    uint16_t badge_col = on ? C_GREEN : 0x4208;
+    gfx->fillRect(TOG_X + TOG_W - 32, y + 3, 28, 14, on ? 0x0200 : 0x0841);
+    gfx->drawRect(TOG_X + TOG_W - 32, y + 3, 28, 14, badge_col);
+    gfx->setCursor(TOG_X + TOG_W - 28, y + 6);
+    gfx->setTextColor(badge_col);
+    gfx->print(on ? " ON" : "OFF");
+}
+
+static void draw_all_toggles() {
+    for (int i = 0; i < 4; i++) draw_toggle_row(i, true);
+}
+
+// ─────────────────────────────────────────────
+//  FULL REDRAW
 // ─────────────────────────────────────────────
 static void drawBridgeShell(bool connected) {
     gfx->fillScreen(C_BLACK);
@@ -589,212 +685,193 @@ static void drawBridgeShell(bool connected) {
     gfx->setCursor(10, 7);
     gfx->setTextColor(0x07FF);
     gfx->setTextSize(1);
-    gfx->print("BRIDGE MODE | TAP HEADER TO EXIT");
+    gfx->print("BRIDGE | TAP HEADER TO EXIT");
 
-    // Status strip background
-    gfx->fillRect(0, 25, 320, 18, 0x0841);
-    gfx->drawFastHLine(0, 43, 320, 0x4208);
+    // Divider between toggle panel and visualizer
+    gfx->drawFastVLine(TOG_W + 2, 30, 185, 0x4208);
 
-    // Static labels for the visualizer rows
-    gfx->setTextSize(1);
+    // Section labels above visualizer column
     gfx->setTextColor(0x4208);
+    gfx->setTextSize(1);
+    gfx->setCursor(VIS_X, 33);  gfx->print("WIFI");
+    gfx->setCursor(VIS_X + 50, 33); gfx->print("BLE");
+    gfx->setCursor(VIS_X + 95, 33); gfx->print("GPS");
 
-    gfx->setCursor(8, 51);   gfx->print("WIFI");
-    gfx->setCursor(8, 77);   gfx->print("BLE");
-    gfx->setCursor(8, 103);  gfx->print("LoRa");
-    gfx->setCursor(8, 130);  gfx->print("NFC");
-    gfx->setCursor(8, 145);  gfx->print("RFID");
-
-    // GPS section divider
-    gfx->drawFastHLine(0, 162, 320, 0x4208);
-    gfx->setCursor(8, 167);  gfx->print("GPS");
-
-    // JSON visualizer divider
-    gfx->drawFastHLine(0, 200, 320, 0x4208);
-    gfx->setCursor(8, 205);
+    // JSON stream divider
+    gfx->drawFastHLine(0, 132, 320, 0x4208);
+    gfx->setCursor(8, 135);
     gfx->setTextColor(0x4208);
     gfx->print("STREAM");
+
+    draw_all_toggles();
 }
 
 // ─────────────────────────────────────────────
-//  PARTIAL UPDATE — called every 100ms
-//  Wipes only the value regions, never the labels
+//  PARTIAL UPDATE — 10Hz
 // ─────────────────────────────────────────────
 static void drawBridgeUpdate(bool connected) {
-    // ── Status strip ──
-    gfx->fillRect(0, 25, 320, 18, 0x0841);
+    // ── Status strip (top, replaces old) ──────
+    gfx->fillRect(0, 26, 320, 14, C_DARK);
     gfx->setTextSize(1);
-    gfx->setTextColor(C_WHITE);
-    gfx->setCursor(8, 31);
+
+    gfx->setTextColor(C_GREY);
+    gfx->setCursor(8, 28);
     gfx->printf("ID:%s", device_id);
 
     gfx->setTextColor(connected ? C_GREEN : 0xFD20);
-    gfx->setCursor(105, 31);
-    gfx->print(connected ? "* HOST" : "o HOST");
+    gfx->setCursor(90, 28);
+    gfx->print(connected ? "HOST:CONN" : "HOST:----");
 
-    // WARDRIVE indicator with streaming marker — pulses red when active
-    extern bool wardrive_active;
-    extern volatile bool wardrive_bridge_streaming;
-    bool wd_on   = wardrive_active;
     bool wd_strm = wardrive_bridge_streaming;
-    // Blink the active dot every ~500ms for visual liveness
-    bool blink = ((millis() / 500) & 1);
-    gfx->setTextColor(wd_on ? (blink ? C_RED : 0xFD20) : 0x4208);
-    gfx->setCursor(165, 31);
-    if (wd_on) {
-        gfx->print(wd_strm ? "WD>STREAM" : "WD ACTIVE");
-    } else {
-        gfx->print("WD IDLE");
-    }
+    bool blink   = ((millis() / 500) & 1);
+    gfx->setTextColor(wd_strm ? (blink ? C_RED : 0xFD20) : 0x4208);
+    gfx->setCursor(185, 28);
+    gfx->print(wd_strm ? "STREAMING" : "LOCAL    ");
 
     gfx->setTextColor(C_GREY);
-    gfx->setCursor(245, 31);
+    gfx->setCursor(258, 28);
     gfx->printf("%lu/%lu", (unsigned long)bridge_tx_events,
                            (unsigned long)bridge_rx_cmds);
 
-    // ── WiFi bar ──
-    // Uses session totals — data that persists whether wardrive is
-    // running or idle. Bar shows what the device has seen this boot,
-    // not just what it found in the last scan window.
-    vis_decay_rx_counters();
+    // ── Toggle rows (left panel) ───────────────
+    draw_all_toggles();
+
+    // ── Visualizer (right panel) ───────────────
     extern int networks_total;
     extern int ble_total;
+    extern int networks_found;
+    extern volatile int bt_found;
     extern uint32_t last_scan_ms;
 
-    // Best available count: session total if wardrive has ever run,
-    // otherwise streaming events from host, otherwise last scan count
-    int wifi_display = 0;
-    if (networks_total > 0) {
-        // Clamp to VIS_WIFI_MAX for bar display — totals can exceed 20
-        wifi_display = min(networks_total, VIS_WIFI_MAX);
-    } else if (vis_rx_wifi_count > 0) {
-        wifi_display = vis_rx_wifi_count;
-    } else if (wardrive_active) {
-        extern int networks_found;
-        wifi_display = min(networks_found, VIS_WIFI_MAX);
-    }
-    draw_bar(45, 50, 260, 12, wifi_display, VIS_WIFI_MAX, C_GREEN);
+    // WiFi bar
+    gfx->fillRect(VIS_X, 42, VIS_W, 14, C_BLACK);
+    int wd = wardrive_active ? min(max(networks_total, networks_found), VIS_WIFI_MAX) : 0;
+    draw_bar(VIS_X, 42, 55, 12, wd, VIS_WIFI_MAX, C_GREEN);
+    gfx->setCursor(VIS_X + 58, 44);
+    gfx->setTextColor(C_GREEN);
+    gfx->printf("%d", networks_total);
 
-    // ── BLE bar ──
-    int ble_display = 0;
-    if (ble_total > 0) {
-        ble_display = min(ble_total, VIS_BLE_MAX);
-    } else if (vis_rx_ble_count > 0) {
-        ble_display = vis_rx_ble_count;
-    } else if (wardrive_active) {
-        extern volatile int bt_found;
-        ble_display = min((int)bt_found, VIS_BLE_MAX);
-    }
-    draw_bar(45, 76, 260, 12, ble_display, VIS_BLE_MAX, 0x07FF);
+    // BLE bar
+    gfx->fillRect(VIS_X + 50, 42, 55, 14, C_BLACK);
+    int bd = (wardrive_active && bridge_ble_enabled) ? min((int)bt_found, VIS_BLE_MAX) : 0;
+    draw_bar(VIS_X + 50, 42, 55, 12, bd, VIS_BLE_MAX, 0x07FF);
+    gfx->setCursor(VIS_X + 108, 44);
+    gfx->setTextColor(0x07FF);
+    gfx->printf("%d", ble_total);
 
-    // ── LoRa spike trace ──
-    if (lora_subsystem_ready()) {
-        lora_trace_decay();
-        draw_lora_trace(45, 100, 260, 18);
-    } else {
-        gfx->fillRect(45, 100, 260, 18, C_BLACK);
+    // GPS status
+    gfx->fillRect(VIS_X + 95, 40, 88, 18, C_BLACK);
+    gfx->setCursor(VIS_X + 97, 44);
+    if (!bridge_gps_enabled) {
         gfx->setTextColor(0x4208);
-        gfx->setCursor(50, 105);
-        gfx->print("(not present)");
-    }
-
-    // ── NFC/RFID pulse ──
-    gfx->fillRect(45, 128, 260, 16, C_BLACK);
-    gfx->setTextColor(nfc_subsystem_ready() ? C_GREEN : 0x4208);
-    gfx->setCursor(45, 130);
-    gfx->print(pulse_glyph(nfc_subsystem_ready(), nfc_last_event_ms));
-
-    gfx->fillRect(45, 143, 260, 16, C_BLACK);
-    gfx->setTextColor(rfid_subsystem_ready() ? C_GREEN : 0x4208);
-    gfx->setCursor(45, 145);
-    gfx->print(pulse_glyph(rfid_subsystem_ready(), rfid_last_event_ms));
-
-    // ── GPS ──
-    gfx->fillRect(45, 165, 275, 35, C_BLACK);
-    gfx->setTextSize(1);
-    if (gps_subsystem_ready() && gps.location.isValid()) {
+        gfx->print("OFF");
+    } else if (gps_subsystem_ready() && gps.location.isValid()) {
         gfx->setTextColor(C_GREEN);
-        gfx->setCursor(45, 167);
-        gfx->printf("%.6f, %.6f", gps.location.lat(), gps.location.lng());
-        gfx->setTextColor(C_GREY);
-        gfx->setCursor(45, 180);
-        gfx->printf("Alt: %.1fm  Sats: %d  LOCK",
-                    gps.altitude.meters(), gps.satellites.value());
+        gfx->print("LOCK");
     } else if (gps_subsystem_ready()) {
         gfx->setTextColor(0xFD20);
-        gfx->setCursor(45, 167);
-        gfx->print("NO FIX");
-        gfx->setTextColor(C_GREY);
-        gfx->setCursor(45, 180);
-        gfx->printf("Sats: %d  searching...",
-                    gps.satellites.isValid() ? gps.satellites.value() : 0);
+        gfx->print("SRCH");
     } else {
         gfx->setTextColor(0x4208);
-        gfx->setCursor(45, 167);
-        gfx->print("(not present)");
+        gfx->print("N/A");
     }
 
-    // Last scan age — shown below GPS so user knows how fresh bar data is
-    gfx->fillRect(45, 192, 275, 10, C_BLACK);
-    if (last_scan_ms > 0) {
-        uint32_t ago_s = (millis() - last_scan_ms) / 1000;
-        gfx->setTextColor(0x4208);
-        gfx->setCursor(45, 193);
-        if (wardrive_active) {
-            gfx->printf("WD: %d nets / %d BLE  scanning...",
-                        networks_total, ble_total);
-        } else if (ago_s < 60) {
-            gfx->printf("Last WD: %ds ago  %d nets / %d BLE",
-                        ago_s, networks_total, ble_total);
-        } else if (ago_s < 3600) {
-            gfx->printf("Last WD: %dm ago  %d nets / %d BLE",
-                        ago_s / 60, networks_total, ble_total);
-        } else {
-            gfx->printf("Last WD: >1hr ago  %d nets / %d BLE",
-                        networks_total, ble_total);
+    // Promiscuous stats (if active) or last scan age
+    gfx->fillRect(VIS_X, 58, VIS_W, 70, C_BLACK);
+    gfx->setTextSize(1);
+    if (wardrive_mode == WARDRIVE_MODE_PROMISCUOUS && wardrive_active) {
+        pm_stats_t ps;
+        pm_promiscuous_get_stats(&ps);
+        gfx->setTextColor(C_GREEN);
+        gfx->setCursor(VIS_X, 58);
+        gfx->printf("BCN:%lu", ps.beacon_count);
+        gfx->setTextColor(0x07FF);
+        gfx->setCursor(VIS_X, 70);
+        gfx->printf("PRB:%lu", ps.probe_req_count);
+        gfx->setTextColor(ps.deauth_count ? C_RED : C_GREY);
+        gfx->setCursor(VIS_X, 82);
+        gfx->printf("DTH:%lu", ps.deauth_count);
+        gfx->setTextColor(C_GREY);
+        gfx->setCursor(VIS_X, 94);
+        gfx->printf("ch%-2d %lu/s", pm_promiscuous_channel(), ps.frames_per_sec);
+        if (ps.deauth_count > 0 && ((millis()/400)&1)) {
+            gfx->setTextColor(C_RED);
+            gfx->setCursor(VIS_X, 108);
+            gfx->print("! DEAUTH");
         }
     } else {
-        gfx->setTextColor(0x4208);
-        gfx->setCursor(45, 193);
-        gfx->print("No WD data this session");
+        // Scan mode — GPS coords + scan age
+        if (gps_subsystem_ready() && gps.location.isValid()) {
+            gfx->setTextColor(C_GREEN);
+            gfx->setCursor(VIS_X, 58);
+            gfx->printf("%.4f", gps.location.lat());
+            gfx->setCursor(VIS_X, 70);
+            gfx->printf("%.4f", gps.location.lng());
+            gfx->setTextColor(C_GREY);
+            gfx->setCursor(VIS_X, 82);
+            gfx->printf("%.0fm %dsat", gps.altitude.meters(), gps.satellites.value());
+        } else {
+            gfx->setTextColor(0x4208);
+            gfx->setCursor(VIS_X, 58);
+            gfx->print(bridge_gps_enabled ? "NO FIX" : "GPS OFF");
+        }
+        if (last_scan_ms > 0) {
+            uint32_t ago = (millis() - last_scan_ms) / 1000;
+            gfx->setTextColor(0x4208);
+            gfx->setCursor(VIS_X, 96);
+            if (wardrive_active) {
+                gfx->print("scanning...");
+            } else {
+                gfx->printf("%ds ago", (int)ago);
+            }
+        }
     }
 
-    // ── JSON visualizer line ──
-    gfx->fillRect(45, 203, 275, 30, C_BLACK);
+    // LoRa trace — narrow strip
+    gfx->fillRect(VIS_X, 110, VIS_W, 18, C_BLACK);
+    if (lora_subsystem_ready()) {
+        lora_trace_decay();
+        draw_lora_trace(VIS_X, 110, VIS_W, 18);
+    } else {
+        gfx->setTextColor(0x4208);
+        gfx->setCursor(VIS_X, 114);
+        gfx->print("LoRa N/A");
+    }
+
+    // ── Stream line ───────────────────────────
+    gfx->fillRect(0, 136, 320, 30, C_BLACK);
     if (vis_last_json[0]) {
         uint32_t age = millis() - vis_last_json_ms;
-        uint16_t color;
-        if (age < 150) {
-            color = vis_last_was_tx ? C_GREEN : 0x07FF;
-        } else if (age < VIS_JSON_FADE_MS) {
-            // Fade green→cyan→grey
-            color = vis_last_was_tx ? 0x05E0 : 0x05FF;
-        } else {
-            color = 0x4208;
-        }
-        gfx->setTextColor(color);
-        gfx->setCursor(45, 205);
+        uint16_t col = (age < 150) ? (vis_last_was_tx ? C_GREEN : 0x07FF)
+                     : (age < VIS_JSON_FADE_MS) ? (vis_last_was_tx ? 0x05E0 : 0x05FF)
+                     : 0x4208;
+        gfx->setTextColor(col);
+        gfx->setCursor(8, 138);
         gfx->print(vis_last_was_tx ? "<= " : "=> ");
-
-        // Truncate to fit (~42 chars max in this region)
         char buf[44];
         int len = strlen(vis_last_json);
-        if (len > 42) {
-            strncpy(buf, vis_last_json, 39);
-            strcpy(buf + 39, "...");
-        } else {
-            strcpy(buf, vis_last_json);
-        }
+        if (len > 41) { strncpy(buf, vis_last_json, 38); strcpy(buf+38,"..."); }
+        else           strcpy(buf, vis_last_json);
         gfx->print(buf);
-
         gfx->setTextColor(0x4208);
-        gfx->setCursor(45, 220);
-        gfx->printf("Last cmd: %s", last_cmd_label);
+        gfx->setCursor(8, 150);
+        gfx->printf("cmd:%s  tx:%lu rx:%lu",
+            last_cmd_label,
+            (unsigned long)bridge_tx_events,
+            (unsigned long)bridge_rx_cmds);
     } else {
         gfx->setTextColor(0x4208);
-        gfx->setCursor(45, 205);
-        gfx->print("(idle - no events yet)");
+        gfx->setCursor(8, 138);
+        gfx->print("(idle)");
     }
+
+    // ── Uptime ────────────────────────────────
+    gfx->fillRect(0, 163, 320, 12, C_BLACK);
+    uint32_t up = millis() / 1000;
+    gfx->setTextColor(0x4208);
+    gfx->setCursor(8, 165);
+    gfx->printf("Up: %02d:%02d:%02d  [W]ard [B]le [G]ps [P]romisc",
+        (int)(up/3600), (int)((up/60)%60), (int)(up%60));
 }
 
 // ─────────────────────────────────────────────
@@ -833,7 +910,7 @@ void run_bridge() {
     unsigned long lastVisUpdate = 0;
 
     // Announce readiness
-    const char* readyMsg = "{\"event\":\"ready\",\"os\":\"Pisces Moon OS\",\"version\":\"1.1.0\"}";
+    const char* readyMsg = "{\"event\":\"ready\",\"os\":\"Pisces Moon OS\",\"version\":\"1.1.1\"}";
     vis_record_tx(readyMsg);
     Serial.println(readyMsg);
 
@@ -850,11 +927,32 @@ void run_bridge() {
         }
         char k = get_keypress();
         if (k == 'q' || k == 'Q') {
-            wardrive_bridge_streaming = false;  // v1.1 — stop emitting
+            wardrive_bridge_streaming = false;
             const char* msg = "{\"event\":\"disconnect\",\"reason\":\"user_exit\"}";
             vis_record_tx(msg);
             Serial.println(msg);
             break;
+        }
+        // Direct toggle hotkeys
+        if (k == 'w' || k == 'W') { tog_cursor = 0; tog_apply(0); }
+        if (k == 'b' || k == 'B') { tog_cursor = 1; tog_apply(1); }
+        if (k == 'g' || k == 'G') { tog_cursor = 2; tog_apply(2); }
+        if (k == 'p' || k == 'P') { tog_cursor = 3; tog_apply(3); }
+
+        // Trackball navigation + click to toggle
+        TrackballState tb = update_trackball();
+        if (tb.y == -1 && tog_cursor > 0) tog_cursor--;
+        if (tb.y ==  1 && tog_cursor < 3)  tog_cursor++;
+        if (tb.clicked) tog_apply(tog_cursor);
+
+        // Touch — tap a toggle row directly
+        if (get_touch(&tx, &ty) && tx < TOG_W && ty >= TOG_Y0) {
+            int row = (ty - TOG_Y0) / TOG_GAP;
+            if (row >= 0 && row < 4) {
+                tog_cursor = row;
+                tog_apply(row);
+                while (get_touch(&tx, &ty)) { delay(10); yield(); }
+            }
         }
 
         // ── Read Serial ───────────────────────
@@ -891,14 +989,41 @@ void run_bridge() {
                     else if (strcmp(cmd,"status")==0)           cmdStatus();
                     else if (strcmp(cmd,"wardrive_status")==0)  cmdWardriveStatus();
                     else if (strcmp(cmd,"wardrive_start")==0) {
+                        wardrive_set_mode(WARDRIVE_MODE_SCAN);
                         wardrive_active = true;
-                        wardrive_bridge_streaming = true;   // v1.1 — host wants live events
+                        wardrive_bridge_streaming = true;
                         cmdWardriveStatus();
                     }
                     else if (strcmp(cmd,"wardrive_stop")==0) {
                         wardrive_active = false;
-                        wardrive_bridge_streaming = false;  // stop emitting
+                        wardrive_bridge_streaming = false;
                         cmdWardriveStatus();
+                    }
+                    else if (strcmp(cmd,"promiscuous_start")==0) {
+                        wardrive_set_mode(WARDRIVE_MODE_PROMISCUOUS);
+                        wardrive_active = true;
+                        wardrive_bridge_streaming = true;
+                        Serial.println("{\"ok\":true,\"msg\":\"promiscuous mode starting\"}");
+                    }
+                    else if (strcmp(cmd,"promiscuous_stop")==0) {
+                        wardrive_active = false;
+                        wardrive_bridge_streaming = false;
+                        wardrive_set_mode(WARDRIVE_MODE_SCAN);
+                        Serial.println("{\"ok\":true,\"msg\":\"promiscuous mode stopped\"}");
+                    }
+                    else if (strcmp(cmd,"promiscuous_lock")==0) {
+                        int ch = doc["channel"] | 1;
+                        pm_promiscuous_lock_channel((uint8_t)ch);
+                        Serial.printf("{\"ok\":true,\"msg\":\"locked ch %d\"}\n", ch);
+                    }
+                    else if (strcmp(cmd,"promiscuous_unlock")==0) {
+                        pm_promiscuous_unlock_channel();
+                        Serial.println("{\"ok\":true,\"msg\":\"channel hopping resumed\"}");
+                    }
+                    else if (strcmp(cmd,"promiscuous_filter")==0) {
+                        uint32_t mask = doc["mask"] | 0xFFFF;
+                        pm_promiscuous_set_subtype_mask(mask);
+                        Serial.printf("{\"ok\":true,\"msg\":\"filter mask 0x%04X\"}\n", mask);
                     }
                     else if (strcmp(cmd,"wifi_scan")==0)        cmdWifiScan();
                     else if (strcmp(cmd,"gps")==0)              cmdGPS();
@@ -920,6 +1045,12 @@ void run_bridge() {
         // ── Visualizer update (10Hz) ──────────
         if (millis() - lastVisUpdate >= 100) {
             lastVisUpdate = millis();
+            // Redraw the shell if mode changed (labels are different per mode)
+            static wardrive_mode_t last_drawn_mode = WARDRIVE_MODE_SCAN;
+            if (wardrive_mode != last_drawn_mode) {
+                last_drawn_mode = wardrive_mode;
+                drawBridgeShell(connected);  // repaint labels for new mode
+            }
             drawBridgeUpdate(connected);
         }
 
