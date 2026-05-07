@@ -3,55 +3,61 @@
 
 #include <Arduino.h>
 
+// ─────────────────────────────────────────────
+//  WARDRIVE MODE
+//
+//  SCAN mode    — active WiFi probe/response cycles + BLE scanning.
+//                 Good for wardrive mapping. Used in standalone T-Deck.
+//                 Writes GPS-tagged CSV to SD card.
+//
+//  PROMISCUOUS  — true 802.11 monitor mode. Captures all management
+//                 frames (beacons, probe-req, deauth, etc) at 10-100/sec.
+//                 Good for security research / edge node use.
+//                 No SD writes — streams to bridge host.
+//
+//  Modes are mutually exclusive. wardrive_set_mode() handles the
+//  transition cleanly (stops the radio, switches state, restarts).
+// ─────────────────────────────────────────────
+typedef enum {
+    WARDRIVE_MODE_SCAN        = 0,  // default — active scan cycles
+    WARDRIVE_MODE_PROMISCUOUS = 1,  // monitor mode — all management frames
+} wardrive_mode_t;
+
 // Shared variables — read by launcher status bar and other apps
 extern int  networks_found;         // count from last WiFi scan
 extern volatile int  bt_found;      // count from current BLE window
 extern int  esp_found;              // Espressif MAC hunter count
 extern bool wardrive_active;
+extern wardrive_mode_t wardrive_mode;           // current mode
+extern volatile bool wardrive_promiscuous_active; // true when promisc running
 
 // Session totals — accumulate across all scans, never reset until reboot.
-// These are the right values for Bridge mode to display — they stay
-// meaningful whether wardrive is currently running or idle.
-extern int      networks_total;     // cumulative networks seen this boot
-extern int      ble_total;          // cumulative BLE devices seen this boot
-extern uint32_t last_scan_ms;       // millis() of most recent WiFi scan
+extern int      networks_total;
+extern int      ble_total;
+extern uint32_t last_scan_ms;
 
-// Traffic flags — set by apps that need exclusive radio or SD access.
-// Wardrive task checks these before touching the radio or SD card.
-extern volatile bool wifi_in_use; // Set by any app making WiFi/HTTP calls
-extern volatile bool sd_in_use;   // Set by WiFi File Manager — pauses SD writes
+// Traffic flags
+extern volatile bool wifi_in_use;
+extern volatile bool sd_in_use;
 
 // Core functions
 void init_wardrive_core();
 void run_wardrive();
 void wardrive_task(void* pvParameters);
 
-// Gamepad BLE handoff — call before/after gamepad pairing
-// to give the gamepad client exclusive NimBLE stack access.
+// Mode selection — call from app task (Core 1), not from wardrive task.
+// If wardrive is currently running, it will pick up the new mode on
+// its next cycle. Safe to call while wardrive_active is true.
+void wardrive_set_mode(wardrive_mode_t mode);
+
+// Gamepad BLE handoff
 void wardrive_ble_stop();
 void wardrive_ble_resume();
 
-// Returns the current session log filename (e.g. "/wardrive_0003.csv").
-// Empty string until the wardrive task has started and created the file.
+// Session log filename
 const char* wardrive_get_log_filename();
 
-// ─────────────────────────────────────────────
-//  v1.1 — Bridge streaming hook
-//
-//  When set true, the wardrive task emits JSON events on Serial
-//  for each detected network/BLE device. Bridge enables this
-//  during a connected session so the host receives live data
-//  without having to poll wardrive_status.
-//
-//  Event format:
-//    {"event":"wifi_seen","mac":"AA:BB:CC:DD:EE:FF","ssid":"...",
-//     "rssi":-52,"ch":6,"enc":"WPA","lat":34.067,"lng":-118.204}
-//    {"event":"ble_seen","mac":"...","name":"...","rssi":-68}
-//
-//  The flag is volatile because it's read on Core 0 (wardrive task)
-//  and written on Core 1 (bridge_app). No mutex needed — single
-//  bool, atomic read/write on ESP32-S3.
-// ─────────────────────────────────────────────
+// ─── v1.1 — Bridge streaming ───────────────────────────────────────
 extern volatile bool wardrive_bridge_streaming;
 
 #endif
