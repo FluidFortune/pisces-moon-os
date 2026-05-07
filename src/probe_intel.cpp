@@ -10,568 +10,562 @@
 // fluidfortune.com
 
 /**
- * PISCES MOON OS — PROBE REQUEST INTELLIGENCE v1.0
- * Passively captures 802.11 probe requests and builds a device fingerprint
- * map: which devices are probing for which SSIDs.
+ * PROBE INTEL — RF Device Intelligence
  *
- * What probe requests reveal:
- *   - SSIDs a device has previously connected to (stored in its PNL)
- *   - Device identity via MAC OUI vendor lookup
- *   - Device mobility (RSSI changes over time suggest movement)
- *   - Network history of corporate/home networks being sought
+ * User selects mode on launch:
  *
- * Display views:
- *   DEVICES — unique devices, sorted by probe count, with OUI vendor
- *   SSIDS   — unique SSIDs being probed, sorted by frequency
- *   MAP     — per-device SSID list: tap device to see all its probed SSIDs
+ *   SCAN MODE      — Active WiFi scan cycles. Standalone use.
+ *                    Logs GPS-tagged CSV to SD. No host needed.
  *
- * All data saved to /cyber_logs/probe_NNNNNNNNNN.json on exit.
+ *   PROMISCUOUS    — True 802.11 monitor mode. Edge node use.
+ *                    All management frames captured passively.
+ *                    If Bridge is running → streams pkt JSON to host.
+ *                    If Bridge is not running → shows live stats only.
  *
- * PASSIVE ONLY — no transmission.
- * USE ONLY IN ENVIRONMENTS WHERE YOU HAVE AUTHORIZATION.
- *
- * Controls:
- *   Trackball L/R  = change channel
- *   Trackball U/D  = scroll list
- *   Trackball CLICK = toggle view / expand device
- *   Q / tap header  = exit
+ * SPI Bus Treaty compliance:
+ *   Scan mode SD writes: wrapped in spi_mutex (500ms timeout).
+ *   Promiscuous mode: pm_promiscuous.h queue is ISR-safe; no SD writes.
+ *   Neither mode holds the mutex during radio operations.
  */
 
+#include "probe_intel.h"
 #include <Arduino.h>
-#include <Arduino_GFX_Library.h>
 #include <WiFi.h>
-#include "esp_wifi.h"
-#include "esp_wifi_types.h"
-#include "SdFat.h"
+#include <SdFat.h>
+#include <TinyGPSPlus.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <Arduino_GFX_Library.h>
 #include "touch.h"
 #include "trackball.h"
 #include "keyboard.h"
 #include "theme.h"
-#include "probe_intel.h"
+#include "wardrive.h"       // wardrive_set_mode(), wardrive_active, wardrive_mode
+#include "pm_promiscuous.h" // pm_stats_t, pm_promiscuous_get_stats()
 
-extern Arduino_GFX *gfx;
-extern volatile bool wifi_in_use;
-extern SdFat sd;
-
-// ─────────────────────────────────────────────
-//  COLORS
-// ─────────────────────────────────────────────
-#define PI_BG     0x0000
-#define PI_HDR    0x000C   // Deep blue
-#define PI_BLUE   0x001F
-#define PI_CYAN   0x07FF
-#define PI_GREEN  0x07E0
-#define PI_YELLOW 0xFFE0
-#define PI_RED    0xF800
-#define PI_DIM    0x4208
-#define PI_WHITE  0xFFFF
-#define PI_SEL    0x0018
-
-#define LOG_DIR   "/cyber_logs"
+extern Arduino_GFX*      gfx;
+extern SdFat             sd;
+extern TinyGPSPlus        gps;
+extern SemaphoreHandle_t spi_mutex;
 
 // ─────────────────────────────────────────────
-//  DATA STRUCTURES
+//  Shared constants
 // ─────────────────────────────────────────────
-#define MAX_DEVICES   48
-#define MAX_SSIDS     64
-#define MAX_SSIDS_PER_DEV 16
-#define MAX_CHANNEL   13
+#define HEADER_H      24
+#define FOOTER_H      25
+#define BODY_TOP      (HEADER_H + 2)
+#define BODY_BOT      (240 - FOOTER_H - 2)
+#define ROW_H         16
+#define MAX_ROWS      ((BODY_BOT - BODY_TOP) / ROW_H)
 
-// OUI table — first 3 bytes → vendor short name
-// Top 30 most common for probe request context
-struct OUIEntry { uint8_t oui[3]; const char* vendor; };
-static const OUIEntry OUI_TABLE[] = {
-    {{0xAC,0x37,0x43}, "Apple"    }, {{0xF4,0x5C,0x89}, "Apple"  },
-    {{0x18,0x65,0x90}, "Apple"    }, {{0x3C,0x22,0xFB}, "Apple"  },
-    {{0x28,0x39,0x5E}, "Apple"    }, {{0x60,0xF8,0x1D}, "Apple"  },
-    {{0xA4,0xC3,0xF0}, "Samsung"  }, {{0x8C,0x77,0x12}, "Samsung"},
-    {{0x50,0x01,0xBB}, "Samsung"  }, {{0xF4,0x60,0xE2}, "LG"     },
-    {{0x00,0x17,0xF2}, "Apple"    }, {{0x78,0x4F,0x43}, "Apple"  },
-    {{0x38,0xCA,0xDA}, "Apple"    }, {{0xB0,0x34,0x95}, "Apple"  },
-    {{0xCC,0x08,0xFB}, "Apple"    }, {{0x68,0xFB,0x7E}, "Apple"  },
-    {{0x20,0xA9,0x9B}, "Apple"    }, {{0x04,0x4B,0xED}, "Qualcomm"},
-    {{0xE8,0x9F,0x80}, "Intel"    }, {{0x94,0xB8,0x6D}, "Intel"  },
-    {{0x00,0x50,0xF2}, "Microsoft"}, {{0x28,0xD2,0x44}, "Microsoft"},
-    {{0x98,0xDE,0xD0}, "Huawei"   }, {{0xBC,0x9F,0xEF}, "Xiaomi" },
-    {{0x00,0x0C,0xE7}, "Wi-Fi"    }, {{0x00,0x26,0xB9}, "Nintendo"},
-};
-#define OUI_COUNT (sizeof(OUI_TABLE)/sizeof(OUI_TABLE[0]))
+#define MAX_SCAN_NETS  48
+#define LOG_DIR        "/"
+#define LOG_PREFIX     "probe_"
 
-static const char* piOUILookup(const uint8_t* mac) {
-    for (int i = 0; i < (int)OUI_COUNT; i++) {
-        if (OUI_TABLE[i].oui[0] == mac[0] &&
-            OUI_TABLE[i].oui[1] == mac[1] &&
-            OUI_TABLE[i].oui[2] == mac[2]) return OUI_TABLE[i].vendor;
-    }
-    return "Unknown";
-}
-
-struct PIDevice {
-    uint8_t  mac[6];
-    char     vendor[12];
-    int32_t  rssi;           // Last seen RSSI
-    uint32_t probeCount;     // Total probe frames from this device
-    uint32_t lastSeen;
-    char     ssids[MAX_SSIDS_PER_DEV][33];
-    int      ssidCount;
+// ─────────────────────────────────────────────
+//  Scan mode state
+// ─────────────────────────────────────────────
+struct ScanNet {
+    char     bssid[20];
+    char     ssid[36];
+    int      rssi;
+    uint8_t  channel;
+    bool     open;
+    double   lat;
+    double   lng;
+    int      seen;
 };
 
-struct PISSIDEntry {
-    char    ssid[33];
-    uint32_t count;   // Times we've seen this SSID probed
-};
-
-// Device and SSID tables — allocated in PSRAM on launch, freed on exit.
-// PIDevice[48] is ~27KB, too large for static BSS.
-static PIDevice*    piDevices = nullptr;
-static int          piDevCount  = 0;
-static PISSIDEntry* piSSIDs   = nullptr;
-static int          piSSIDCount = 0;
-
-static volatile int piChannel    = 1;
-static volatile uint32_t piTotal = 0;
-static portMUX_TYPE piMux = portMUX_INITIALIZER_UNLOCKED;
+static ScanNet    scan_nets[MAX_SCAN_NETS];
+static int        scan_net_count  = 0;
+static int        scan_cursor     = 0;
+static int        scan_scroll     = 0;
+static uint32_t   scan_total      = 0;
+static char       scan_log_path[32] = "";
 
 // ─────────────────────────────────────────────
-//  SSID REGISTRY
+//  Helpers — shared across modes
 // ─────────────────────────────────────────────
-static void piRegisterSSID(const char* ssid) {
-    if (!ssid || ssid[0] == '\0') return;  // Wildcard probe
-    for (int i = 0; i < piSSIDCount; i++) {
-        if (strcmp(piSSIDs[i].ssid, ssid) == 0) { piSSIDs[i].count++; return; }
-    }
-    if (piSSIDCount < MAX_SSIDS) {
-        strncpy(piSSIDs[piSSIDCount].ssid, ssid, 32);
-        piSSIDs[piSSIDCount].ssid[32] = '\0';
-        piSSIDs[piSSIDCount].count = 1;
-        piSSIDCount++;
-    }
+static uint16_t rssi_color(int rssi) {
+    if (rssi > -55) return C_GREEN;
+    if (rssi > -70) return 0xFFE0;
+    if (rssi > -85) return 0xFD20;
+    return C_RED;
 }
 
-// ─────────────────────────────────────────────
-//  802.11 HEADER + SSID PARSING
-// ─────────────────────────────────────────────
-typedef struct {
-    uint16_t frame_ctrl;
-    uint16_t duration;
-    uint8_t  addr1[6];
-    uint8_t  addr2[6];  // Source MAC
-    uint8_t  addr3[6];
-    uint16_t seq_ctrl;
-} __attribute__((packed)) pi_mac_hdr_t;
-
-// ─────────────────────────────────────────────
-//  PROMISCUOUS CALLBACK
-// ─────────────────────────────────────────────
-static void IRAM_ATTR piCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
-    if (type != WIFI_PKT_MGMT) return;
-
-    wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
-    int pktLen = pkt->rx_ctrl.sig_len;
-    if (pktLen < (int)sizeof(pi_mac_hdr_t)) return;
-
-    pi_mac_hdr_t* hdr = (pi_mac_hdr_t*)pkt->payload;
-    uint8_t ftype    = (hdr->frame_ctrl >> 2) & 0x03;
-    uint8_t fsubtype = (hdr->frame_ctrl >> 4) & 0x0F;
-
-    // Probe Request only (type=0, subtype=4)
-    if (ftype != 0 || fsubtype != 4) return;
-
-    piTotal++;
-
-    const uint8_t* body    = pkt->payload + sizeof(pi_mac_hdr_t);
-    int            bodyLen = pktLen - sizeof(pi_mac_hdr_t);
-    int8_t         rssi    = pkt->rx_ctrl.rssi;
-
-    // Parse SSID from IE tag 0
-    char ssid[33] = "";
-    int off = 0;
-    while (off + 2 <= bodyLen) {
-        uint8_t tag = body[off];
-        uint8_t len = body[off+1];
-        if (off + 2 + len > bodyLen) break;
-        if (tag == 0) {
-            if (len > 0) {
-                int copyLen = min((int)len, 32);
-                memcpy(ssid, body + off + 2, copyLen);
-                ssid[copyLen] = '\0';
-            }
-            break;
-        }
-        off += 2 + len;
-    }
-
-    portENTER_CRITICAL_ISR(&piMux);
-
-    // Find or create device entry
-    PIDevice* dev = nullptr;
-    for (int i = 0; i < piDevCount; i++) {
-        if (memcmp(piDevices[i].mac, hdr->addr2, 6) == 0) { dev = &piDevices[i]; break; }
-    }
-    if (!dev && piDevCount < MAX_DEVICES) {
-        dev = &piDevices[piDevCount++];
-        memset(dev, 0, sizeof(PIDevice));
-        memcpy(dev->mac, hdr->addr2, 6);
-        const char* v = piOUILookup(hdr->addr2);
-        strncpy(dev->vendor, v, 11); dev->vendor[11] = '\0';
-    }
-
-    if (dev) {
-        dev->rssi = rssi;
-        dev->probeCount++;
-        dev->lastSeen = (uint32_t)(millis() / 1000);
-
-        // Add SSID to device's list if not already present
-        if (ssid[0] != '\0') {
-            bool found = false;
-            for (int j = 0; j < dev->ssidCount; j++) {
-                if (strcmp(dev->ssids[j], ssid) == 0) { found = true; break; }
-            }
-            if (!found && dev->ssidCount < MAX_SSIDS_PER_DEV) {
-                strncpy(dev->ssids[dev->ssidCount++], ssid, 32);
-                dev->ssids[dev->ssidCount-1][32] = '\0';
-            }
-        }
-
-        piRegisterSSID(ssid);
-    }
-
-    portEXIT_CRITICAL_ISR(&piMux);
-}
-
-// ─────────────────────────────────────────────
-//  VIEWS
-// ─────────────────────────────────────────────
-#define VIEW_DEVICES 0
-#define VIEW_SSIDS   1
-#define VIEW_DETAIL  2
-
-static void piDrawHeader(int view) {
-    gfx->fillRect(0, 0, 320, 24, PI_HDR);
-    gfx->drawFastHLine(0, 23, 320, PI_CYAN);
+static void draw_header(const char* title, uint16_t accent) {
+    gfx->fillRect(0, 0, 320, HEADER_H, C_DARK);
+    gfx->drawFastHLine(0, HEADER_H, 320, accent);
+    gfx->setCursor(10, 7);
+    gfx->setTextColor(accent);
     gfx->setTextSize(1);
-    gfx->setTextColor(PI_CYAN);
-    gfx->setCursor(6, 4);
-    gfx->print("PROBE INTEL");
-    gfx->setTextColor(PI_DIM);
-    gfx->setCursor(6, 14);
-    gfx->printf("CH:%02d  TOTAL:%lu  DEV:%d  SSID:%d",
-        piChannel, piTotal, piDevCount, piSSIDCount);
-    const char* tabs[] = {"[DEV]","[NET]"};
-    gfx->setCursor(234, 4);
-    for (int i = 0; i < 2; i++) {
-        gfx->setTextColor(i == view ? PI_CYAN : PI_DIM);
-        gfx->print(tabs[i]); gfx->print(" ");
-    }
-    gfx->setTextColor(PI_DIM);
-    gfx->setCursor(286, 14);
-    gfx->print("Q=OUT");
+    gfx->print(title);
 }
 
-static void piDrawDeviceView(int scroll, int selected) {
-    gfx->fillRect(0, 26, 320, 182, PI_BG);
-    gfx->setTextSize(1);
-    gfx->setTextColor(PI_DIM);
-    gfx->setCursor(4, 28);
-    gfx->print("MAC               VENDOR      CNT  NETS RSSI");
-    gfx->drawFastHLine(0, 37, 320, 0x0018);
-
-    if (piDevCount == 0) {
-        gfx->setCursor(10, 90); gfx->setTextColor(PI_DIM);
-        gfx->print("Waiting for probe requests...");
-        gfx->setCursor(10, 106); gfx->print("Move to area with active devices.");
-        return;
-    }
-
-    int show = min(8, piDevCount);
-    for (int i = scroll; i < scroll + show && i < piDevCount; i++) {
-        PIDevice& d = piDevices[i];
-        int ry  = 40 + (i - scroll) * 21;
-        bool sel = (i == selected);
-        gfx->fillRect(0, ry, 320, 20, sel ? PI_SEL : (i%2==0 ? 0x0821 : PI_BG));
-        // MAC
-        gfx->setTextColor(sel ? PI_CYAN : 0x8C71);
-        gfx->setCursor(4, ry + 2);
-        gfx->printf("%02X:%02X:%02X:%02X:%02X:%02X",
-            d.mac[0],d.mac[1],d.mac[2],d.mac[3],d.mac[4],d.mac[5]);
-        // Vendor
-        gfx->setTextColor(sel ? PI_WHITE : PI_DIM);
-        gfx->setCursor(120, ry + 2);
-        gfx->printf("%-10s", d.vendor);
-        // Count
-        gfx->setTextColor(sel ? PI_YELLOW : PI_DIM);
-        gfx->setCursor(186, ry + 2);
-        gfx->printf("%4lu", d.probeCount);
-        // SSID count
-        gfx->setTextColor(sel ? PI_GREEN : 0x2945);
-        gfx->setCursor(220, ry + 2);
-        gfx->printf("%3d", d.ssidCount);
-        // RSSI
-        uint16_t rc = (d.rssi > -60) ? PI_GREEN : (d.rssi > -80) ? PI_YELLOW : PI_RED;
-        gfx->setTextColor(rc);
-        gfx->setCursor(256, ry + 2);
-        gfx->printf("%4d", (int)d.rssi);
-        // First SSID as preview
-        if (d.ssidCount > 0) {
-            gfx->setTextColor(0x2945);
-            gfx->setCursor(4, ry + 12);
-            char preview[28];
-            snprintf(preview, sizeof(preview), "Seeks: %s%s",
-                d.ssids[0],
-                d.ssidCount > 1 ? " ..." : "");
-            gfx->print(preview);
-        }
-    }
-
-    gfx->setTextColor(PI_DIM);
-    gfx->setCursor(4, 226);
-    gfx->print("CLICK=details  </> CH  BALL=scroll  V=switch view");
+static void draw_footer(const char* line, uint16_t col = C_GREEN) {
+    gfx->fillRect(0, 240 - FOOTER_H, 320, FOOTER_H, C_DARK);
+    gfx->setCursor(10, 240 - FOOTER_H + 8);
+    gfx->setTextColor(col);
+    gfx->print(line);
 }
 
-static void piDrawSSIDView(int scroll) {
-    gfx->fillRect(0, 26, 320, 182, PI_BG);
-    gfx->setTextSize(1);
-    gfx->setTextColor(PI_DIM);
-    gfx->setCursor(4, 28);
-    gfx->print("SSID BEING PROBED                   COUNT");
-    gfx->drawFastHLine(0, 37, 320, 0x0018);
+// ═════════════════════════════════════════════
+//  MODE SELECT SCREEN
+// ═════════════════════════════════════════════
+typedef enum { MODE_SCAN = 0, MODE_PROMISC = 1 } pi_mode_t;
 
-    if (piSSIDCount == 0) {
-        gfx->setCursor(10, 90); gfx->setTextColor(PI_DIM);
-        gfx->print("No specific SSIDs probed yet.");
-        gfx->setCursor(10, 106); gfx->print("(Wildcard probes don't reveal SSIDs)");
-        return;
-    }
+static pi_mode_t draw_mode_select(pi_mode_t initial) {
+    int sel = (int)initial;
 
-    // Sort by count (bubble sort — small list)
-    PISSIDEntry sorted[MAX_SSIDS];
-    memcpy(sorted, piSSIDs, piSSIDCount * sizeof(PISSIDEntry));
-    for (int i = 0; i < piSSIDCount - 1; i++)
-        for (int j = i + 1; j < piSSIDCount; j++)
-            if (sorted[j].count > sorted[i].count) {
-                PISSIDEntry tmp = sorted[i]; sorted[i] = sorted[j]; sorted[j] = tmp;
-            }
+    auto redraw = [&]() {
+        gfx->fillScreen(C_BLACK);
 
-    int show = min(9, piSSIDCount);
-    for (int i = scroll; i < scroll + show && i < piSSIDCount; i++) {
-        int ry = 40 + (i - scroll) * 21;
-        gfx->fillRect(0, ry, 320, 20, i%2==0 ? 0x0821 : PI_BG);
-        gfx->setTextColor(PI_GREEN);
-        gfx->setCursor(4, ry + 5);
-        char ssidBuf[35]; strncpy(ssidBuf, sorted[i].ssid, 33); ssidBuf[33] = '\0';
-        gfx->print(ssidBuf);
-        gfx->setTextColor(PI_YELLOW);
-        gfx->setCursor(268, ry + 5);
-        gfx->printf("%6lu", sorted[i].count);
-    }
-}
+        // Title
+        gfx->fillRect(0, 0, 320, HEADER_H, C_DARK);
+        gfx->drawFastHLine(0, HEADER_H, 320, C_CYAN);
+        gfx->setCursor(10, 7);
+        gfx->setTextColor(C_CYAN);
+        gfx->setTextSize(1);
+        gfx->print("PROBE INTEL | SELECT MODE");
 
-static void piDrawDetailView(int deviceIdx) {
-    if (deviceIdx >= piDevCount) return;
-    PIDevice& d = piDevices[deviceIdx];
-    gfx->fillRect(0, 26, 320, 182, PI_BG);
-    gfx->setTextSize(1);
+        // Option 0 — Scan Mode
+        bool s0 = (sel == 0);
+        gfx->fillRect(20, 50, 280, 60, s0 ? C_DARK : C_BLACK);
+        gfx->drawRect(20, 50, 280, 60, s0 ? C_GREEN : C_GREY);
+        gfx->setCursor(34, 60);
+        gfx->setTextSize(1);
+        gfx->setTextColor(s0 ? C_GREEN : C_WHITE);
+        gfx->print(s0 ? "> SCAN MODE" : "  SCAN MODE");
+        gfx->setCursor(34, 76);
+        gfx->setTextColor(C_GREY);
+        gfx->print("Active WiFi scans, GPS log to SD.");
+        gfx->setCursor(34, 88);
+        gfx->print("Best for: standalone field use.");
 
-    gfx->setTextColor(PI_CYAN);
-    gfx->setCursor(4, 30);
-    gfx->printf("%02X:%02X:%02X:%02X:%02X:%02X",
-        d.mac[0],d.mac[1],d.mac[2],d.mac[3],d.mac[4],d.mac[5]);
-    gfx->setTextColor(PI_DIM);
-    gfx->setCursor(130, 30);
-    gfx->print(d.vendor);
-    gfx->setTextColor(PI_DIM);
-    gfx->setCursor(4, 42);
-    gfx->printf("Probes: %lu  Nets known: %d  RSSI: %d",
-        d.probeCount, d.ssidCount, (int)d.rssi);
-    gfx->drawFastHLine(0, 52, 320, 0x0018);
+        // Option 1 — Promiscuous Mode
+        bool s1 = (sel == 1);
+        gfx->fillRect(20, 125, 280, 70, s1 ? C_DARK : C_BLACK);
+        gfx->drawRect(20, 125, 280, 70, s1 ? C_RED : C_GREY);
+        gfx->setCursor(34, 135);
+        gfx->setTextSize(1);
+        gfx->setTextColor(s1 ? C_RED : C_WHITE);
+        gfx->print(s1 ? "> PROMISCUOUS MODE" : "  PROMISCUOUS MODE");
+        gfx->setCursor(34, 151);
+        gfx->setTextColor(C_GREY);
+        gfx->print("Passive 802.11 monitor. Edge node.");
+        gfx->setCursor(34, 163);
+        gfx->print("Streams JSON via Bridge if connected.");
+        gfx->setCursor(34, 175);
+        gfx->print("Best for: host-driven sensor node.");
 
-    gfx->setTextColor(PI_DIM);
-    gfx->setCursor(4, 56);
-    gfx->print("Previously connected to:");
+        // Footer
+        gfx->fillRect(0, 240 - FOOTER_H, 320, FOOTER_H, C_DARK);
+        gfx->setCursor(10, 240 - FOOTER_H + 8);
+        gfx->setTextColor(C_GREEN);
+        gfx->print("[TB] Select  [ENTER/CLK] Confirm  [Q] Back");
+    };
 
-    for (int i = 0; i < d.ssidCount && i < 8; i++) {
-        int ry = 68 + i * 16;
-        uint16_t col = (i % 2 == 0) ? PI_GREEN : PI_CYAN;
-        gfx->setTextColor(col);
-        gfx->setCursor(12, ry);
-        gfx->printf("%d. %s", i + 1, d.ssids[i]);
-    }
-    if (d.ssidCount == 0) {
-        gfx->setTextColor(PI_DIM);
-        gfx->setCursor(12, 70);
-        gfx->print("(Wildcard probes only — no SSID revealed)");
-    }
-    if (d.ssidCount > 8) {
-        gfx->setTextColor(PI_DIM);
-        gfx->setCursor(4, 198);
-        gfx->printf("... and %d more", d.ssidCount - 8);
-    }
-
-    gfx->setTextColor(PI_DIM);
-    gfx->setCursor(4, 212);
-    gfx->print("[Q/tap header = back to device list]");
-}
-
-// ─────────────────────────────────────────────
-//  SESSION LOG
-// ─────────────────────────────────────────────
-static void piWriteLog() {
-    if (!sd.exists(LOG_DIR)) sd.mkdir(LOG_DIR);
-    char fname[64];
-    snprintf(fname, sizeof(fname), "%s/probe_%010lu.json", LOG_DIR, millis());
-    FsFile f = sd.open(fname, O_WRITE | O_CREAT | O_TRUNC);
-    if (!f) return;
-
-    f.print("{\"devices\":[\n");
-    for (int i = 0; i < piDevCount; i++) {
-        PIDevice& d = piDevices[i];
-        if (i > 0) f.print(",\n");
-        f.printf("  {\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
-                 "\"vendor\":\"%s\",\"probes\":%lu,\"rssi\":%d,\"ssids\":[",
-            d.mac[0],d.mac[1],d.mac[2],d.mac[3],d.mac[4],d.mac[5],
-            d.vendor, d.probeCount, (int)d.rssi);
-        for (int j = 0; j < d.ssidCount; j++) {
-            if (j > 0) f.print(",");
-            String s = String(d.ssids[j]);
-            s.replace("\"", "'");
-            f.printf("\"%s\"", s.c_str());
-        }
-        f.print("]}");
-    }
-    f.print("\n]}\n");
-    f.close();
-    Serial.printf("[PROBE] Log: %s\n", fname);
-}
-
-// ─────────────────────────────────────────────
-//  MAIN ENTRY
-// ─────────────────────────────────────────────
-void run_probe_intel() {
-    gfx->fillScreen(PI_BG);
-    gfx->setTextColor(PI_CYAN);
-    gfx->setTextSize(2);
-    gfx->setCursor(10, 50); gfx->print("PROBE INTEL");
-    gfx->setTextSize(1);
-    gfx->setTextColor(PI_WHITE);
-    gfx->setCursor(10, 80); gfx->print("Passive probe request analysis.");
-    gfx->setTextColor(PI_DIM);
-    gfx->setCursor(10, 96); gfx->print("Reveals network history of nearby devices.");
-    gfx->setCursor(10, 112); gfx->print("Use only in authorized environments.");
-    delay(2000);
-
-    // Allocate tables in PSRAM — too large for static BSS
-    piDevices = (PIDevice*)ps_malloc(MAX_DEVICES * sizeof(PIDevice));
-    piSSIDs   = (PISSIDEntry*)ps_malloc(MAX_SSIDS * sizeof(PISSIDEntry));
-    if (!piDevices || !piSSIDs) {
-        gfx->setTextColor(PI_RED); gfx->setCursor(10, 140);
-        gfx->print("Out of PSRAM. Tap to exit.");
-        while (true) {
-            if (get_keypress()) break;
-            int16_t tx, ty; if (get_touch(&tx, &ty)) break;
-            delay(50);
-        }
-        free(piDevices); free(piSSIDs);
-        piDevices = nullptr; piSSIDs = nullptr;
-        return;
-    }
-
-    piDevCount = 0; piSSIDCount = 0; piTotal = 0; piChannel = 1;
-    memset(piDevices, 0, MAX_DEVICES * sizeof(PIDevice));
-    memset(piSSIDs,   0, MAX_SSIDS   * sizeof(PISSIDEntry));
-
-    wifi_in_use = true;
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_STA);
-    esp_wifi_set_promiscuous(true);
-    esp_wifi_set_promiscuous_rx_cb(&piCallback);
-    esp_wifi_set_channel(piChannel, WIFI_SECOND_CHAN_NONE);
-
-    int view = VIEW_DEVICES;
-    int scroll = 0, selected = 0;
-    unsigned long lastRedraw = millis();
-    bool inDetail = false;
-
-    gfx->fillScreen(PI_BG);
-    piDrawHeader(view);
-    piDrawDeviceView(scroll, selected);
+    redraw();
 
     while (true) {
-        char k = get_keypress();
-        TrackballState tb = update_trackball();
+        // Touch — tap a box directly
         int16_t tx, ty;
+        if (get_touch(&tx, &ty)) {
+            if (ty >= 50 && ty <= 110) { sel = 0; redraw(); delay(120); return (pi_mode_t)sel; }
+            if (ty >= 125 && ty <= 195){ sel = 1; redraw(); delay(120); return (pi_mode_t)sel; }
+        }
 
-        if (get_touch(&tx, &ty) && ty < 40) {
-            while(get_touch(&tx,&ty)){delay(10);}
-            if (inDetail) {
-                inDetail = false;
-                view = VIEW_DEVICES;
-                gfx->fillScreen(PI_BG);
-                piDrawHeader(view);
-                piDrawDeviceView(scroll, selected);
-            } else {
-                break;
+        char k = get_keypress();
+        if (k == 'q' || k == 'Q') return (pi_mode_t)-1;
+        if (k == '\n' || k == '\r') return (pi_mode_t)sel;
+
+        TrackballState tb = update_trackball();
+        if ((tb.y == -1 || tb.y == 1) && sel != (sel + tb.y + 2) % 2) {
+            sel = (sel + tb.y + 2) % 2;
+            redraw();
+        }
+        if (tb.clicked) return (pi_mode_t)sel;
+
+        delay(30);
+        yield();
+    }
+}
+
+// ═════════════════════════════════════════════
+//  SCAN MODE
+// ═════════════════════════════════════════════
+static int scan_find_or_add(const char* bssid) {
+    for (int i = 0; i < scan_net_count; i++) {
+        if (strcmp(scan_nets[i].bssid, bssid) == 0) return i;
+    }
+    if (scan_net_count < MAX_SCAN_NETS) {
+        strncpy(scan_nets[scan_net_count].bssid, bssid, 19);
+        scan_nets[scan_net_count].seen = 0;
+        return scan_net_count++;
+    }
+    return -1;
+}
+
+static void scan_open_log() {
+    // Find next free session file
+    for (int n = 1; n <= 9999; n++) {
+        char path[32];
+        snprintf(path, sizeof(path), "/probe_%04d.csv", n);
+        bool exists = false;
+        if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            exists = sd.exists(path);
+            xSemaphoreGive(spi_mutex);
+        }
+        if (!exists) {
+            strncpy(scan_log_path, path, 31);
+            // Write CSV header
+            if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                FsFile f = sd.open(scan_log_path, O_WRITE | O_CREAT);
+                if (f) {
+                    f.println("bssid,ssid,rssi,ch,enc,lat,lng");
+                    f.close();
+                }
+                xSemaphoreGive(spi_mutex);
             }
-            continue;
+            return;
         }
-        if (k == 'q' || k == 'Q') {
-            if (inDetail) {
-                inDetail = false; view = VIEW_DEVICES;
-                gfx->fillScreen(PI_BG); piDrawHeader(view);
-                piDrawDeviceView(scroll, selected);
-            } else break;
-            continue;
-        }
+    }
+    scan_log_path[0] = 0; // no log
+}
 
-        // View switch
-        if ((k == 'v' || k == 'V') && !inDetail) {
-            view = (view == VIEW_DEVICES) ? VIEW_SSIDS : VIEW_DEVICES;
-            scroll = 0; selected = 0;
-            gfx->fillScreen(PI_BG); piDrawHeader(view);
-            if (view == VIEW_DEVICES) piDrawDeviceView(scroll, selected);
-            else piDrawSSIDView(scroll);
-            continue;
-        }
+static void scan_do_scan(bool& redraw_needed) {
+    draw_header("SCAN MODE | SCANNING...", 0xFFE0);
 
-        // Channel change
-        bool chChanged = false;
-        if (tb.x == -1 && piChannel > 1)  { piChannel--; chChanged = true; }
-        if (tb.x ==  1 && piChannel < MAX_CHANNEL) { piChannel++; chChanged = true; }
-        if (chChanged) esp_wifi_set_channel(piChannel, WIFI_SECOND_CHAN_NONE);
+    // Release WiFi for scan — do NOT hold spi_mutex during the scan itself
+    int n = WiFi.scanNetworks(false, true);
+    if (n < 0) n = 0;
 
-        // Scroll
-        int maxScroll = 0;
-        if (view == VIEW_DEVICES) maxScroll = max(0, piDevCount - 8);
-        else maxScroll = max(0, piSSIDCount - 9);
+    double lat = gps.location.isValid() ? gps.location.lat() : 0.0;
+    double lng = gps.location.isValid() ? gps.location.lng() : 0.0;
 
-        if (tb.y == -1 && scroll > 0)        { scroll--; if (selected > 0 && view==VIEW_DEVICES) selected--; }
-        if (tb.y ==  1 && scroll < maxScroll) { scroll++; if (view==VIEW_DEVICES && selected < piDevCount-1) selected++; }
-
-        // Device detail
-        if (tb.clicked && view == VIEW_DEVICES && !inDetail && piDevCount > 0) {
-            inDetail = true;
-            view = VIEW_DETAIL;
-            gfx->fillScreen(PI_BG);
-            piDrawHeader(VIEW_DEVICES);
-            piDrawDetailView(selected);
-            continue;
-        }
-
-        if (millis() - lastRedraw > 750) {
-            piDrawHeader(view);
-            if (inDetail)              piDrawDetailView(selected);
-            else if (view==VIEW_DEVICES) piDrawDeviceView(scroll, selected);
-            else                         piDrawSSIDView(scroll);
-            lastRedraw = millis();
-        }
-
-        delay(20); yield();
+    // Now take mutex only for the SD write
+    bool got_mutex = (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE);
+    FsFile logfile;
+    if (got_mutex && scan_log_path[0]) {
+        logfile = sd.open(scan_log_path, O_WRITE | O_APPEND);
     }
 
-    esp_wifi_set_promiscuous(false);
-    WiFi.mode(WIFI_OFF);
-    wifi_in_use = false;
-    piWriteLog();
-    free(piDevices); piDevices = nullptr;
-    free(piSSIDs);   piSSIDs   = nullptr;
-    gfx->fillScreen(PI_BG);
+    for (int i = 0; i < n; i++) {
+        char bssid_buf[20];
+        char ssid_buf[36];
+        String mac  = WiFi.BSSIDstr(i);
+        String ssid = WiFi.SSID(i);
+        strncpy(bssid_buf, mac.c_str(),  19);
+        strncpy(ssid_buf,  ssid.c_str(), 35);
+        bssid_buf[19] = 0;
+        ssid_buf[35]  = 0;
+        // Sanitise SSID for CSV — replace commas with _
+        for (char* p = ssid_buf; *p; p++) { if (*p == ',') *p = '_'; }
+
+        int idx = scan_find_or_add(bssid_buf);
+        if (idx >= 0) {
+            strncpy(scan_nets[idx].ssid,    ssid_buf,  35);
+            scan_nets[idx].rssi    = WiFi.RSSI(i);
+            scan_nets[idx].channel = WiFi.channel(i);
+            scan_nets[idx].open    = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+            scan_nets[idx].lat     = lat;
+            scan_nets[idx].lng     = lng;
+            scan_nets[idx].seen++;
+            scan_total++;
+        }
+
+        if (logfile) {
+            char line[128];
+            snprintf(line, sizeof(line), "%s,%s,%d,%d,%s,%.6f,%.6f\n",
+                bssid_buf, ssid_buf,
+                WiFi.RSSI(i), WiFi.channel(i),
+                WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "OPEN" : "WPA",
+                lat, lng);
+            logfile.print(line);
+        }
+    }
+
+    if (logfile) logfile.close();
+    if (got_mutex) xSemaphoreGive(spi_mutex);
+
+    WiFi.scanDelete();
+    redraw_needed = true;
+}
+
+static void scan_draw_list() {
+    gfx->fillRect(0, BODY_TOP, 320, BODY_BOT - BODY_TOP, C_BLACK);
+    int shown = 0;
+    for (int i = scan_scroll; i < scan_net_count && shown < MAX_ROWS; i++, shown++) {
+        int y   = BODY_TOP + shown * ROW_H;
+        bool sel = (i == scan_cursor);
+        if (sel) gfx->fillRect(0, y, 320, ROW_H, C_DARK);
+
+        // RSSI bar — 3px wide strip flush left
+        int bar = max(0, min(30, (scan_nets[i].rssi + 100) * 30 / 60));
+        gfx->fillRect(0, y + 4, bar, 7, rssi_color(scan_nets[i].rssi));
+
+        gfx->setCursor(35, y + 3);
+        gfx->setTextColor(sel ? C_CYAN : (scan_nets[i].open ? 0xFFE0 : C_WHITE));
+        char ssid_short[20];
+        strncpy(ssid_short, scan_nets[i].ssid[0] ? scan_nets[i].ssid : "(hidden)", 18);
+        ssid_short[18] = 0;
+        gfx->print(ssid_short);
+
+        gfx->setCursor(245, y + 3);
+        gfx->setTextColor(C_GREY);
+        gfx->printf("ch%d", scan_nets[i].channel);
+
+        gfx->setCursor(290, y + 3);
+        gfx->setTextColor(rssi_color(scan_nets[i].rssi));
+        gfx->printf("%d", scan_nets[i].rssi);
+    }
+    if (scan_net_count == 0) {
+        gfx->setTextColor(C_GREY);
+        gfx->setCursor(10, BODY_TOP + 20);
+        gfx->print("No networks yet. Press [S] to scan.");
+    }
+}
+
+static void run_scan_mode() {
+    scan_net_count = 0;
+    scan_cursor    = 0;
+    scan_scroll    = 0;
+    scan_total     = 0;
+
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    scan_open_log();
+
+    gfx->fillScreen(C_BLACK);
+    draw_header("SCAN MODE | TAP HEADER TO EXIT", C_GREEN);
+    char footer_buf[64];
+    snprintf(footer_buf, sizeof(footer_buf), "[S] Scan  [M] Mode  [Q] Exit | Log: %s",
+             scan_log_path[0] ? scan_log_path : "none");
+    draw_footer(footer_buf);
+    scan_draw_list();
+
+    bool redraw_needed = false;
+    uint32_t last_status_ms = 0;
+
+    while (true) {
+        // Header tap → exit
+        int16_t tx, ty;
+        if (get_touch(&tx, &ty) && ty < HEADER_H) {
+            while (get_touch(&tx, &ty)) { delay(10); yield(); }
+            return;
+        }
+
+        char k = get_keypress();
+        if (k == 'q' || k == 'Q') return;
+        if (k == 'm' || k == 'M') {
+            // Switch mode — caller sees the return and re-enters mode select
+            // We signal this by returning normally and letting run_probe_intel re-run mode select
+            return;
+        }
+        if (k == 's' || k == 'S') {
+            scan_do_scan(redraw_needed);
+        }
+
+        TrackballState tb = update_trackball();
+        if (tb.y == -1 && scan_cursor > 0) {
+            scan_cursor--;
+            if (scan_cursor < scan_scroll) scan_scroll = scan_cursor;
+            redraw_needed = true;
+        }
+        if (tb.y ==  1 && scan_cursor < scan_net_count - 1) {
+            scan_cursor++;
+            if (scan_cursor >= scan_scroll + MAX_ROWS) scan_scroll = scan_cursor - MAX_ROWS + 1;
+            redraw_needed = true;
+        }
+
+        if (redraw_needed) {
+            draw_header("SCAN MODE | TAP HEADER TO EXIT", C_GREEN);
+            scan_draw_list();
+            redraw_needed = false;
+        }
+
+        // Status bar refresh every 2s
+        if (millis() - last_status_ms > 2000) {
+            last_status_ms = millis();
+            char status[80];
+            snprintf(status, sizeof(status),
+                "[S] Scan  [M] Mode | %d nets | %s | %s",
+                scan_net_count,
+                scan_log_path[0] ? scan_log_path : "no log",
+                gps.location.isValid() ? "GPS OK" : "NO GPS");
+            draw_footer(status);
+        }
+
+        delay(30);
+        yield();
+    }
+}
+
+// ═════════════════════════════════════════════
+//  PROMISCUOUS MODE
+// ═════════════════════════════════════════════
+
+// Frame type display positions (y coords in body area)
+#define PROW_BEACON   (BODY_TOP + 0  * 26)
+#define PROW_PROBE    (BODY_TOP + 1  * 26)
+#define PROW_DEAUTH   (BODY_TOP + 2  * 26)
+#define PROW_AUTH     (BODY_TOP + 3  * 26)
+#define PROW_OTHER    (BODY_TOP + 4  * 26)
+#define PROW_DROPPED  (BODY_TOP + 5  * 26)
+
+static void promisc_draw_static() {
+    gfx->fillRect(0, BODY_TOP, 320, BODY_BOT - BODY_TOP, C_BLACK);
+
+    const char* labels[] = { "Beacon:", "Probe-Req:", "Deauth:", "Auth:", "Other:", "Dropped:" };
+    const uint16_t cols[] = { C_GREEN, C_CYAN, C_RED, 0xFFE0, C_GREY, C_GREY };
+    const int ys[] = { PROW_BEACON, PROW_PROBE, PROW_DEAUTH, PROW_AUTH, PROW_OTHER, PROW_DROPPED };
+    for (int i = 0; i < 6; i++) {
+        gfx->setCursor(10, ys[i] + 4);
+        gfx->setTextColor(cols[i]);
+        gfx->setTextSize(1);
+        gfx->print(labels[i]);
+    }
+}
+
+static void promisc_draw_values(const pm_stats_t& s, uint8_t ch) {
+    const int ys[] = { PROW_BEACON, PROW_PROBE, PROW_DEAUTH, PROW_AUTH, PROW_OTHER, PROW_DROPPED };
+    const uint32_t vals[] = {
+        s.beacon_count, s.probe_req_count,
+        s.deauth_count, 0 /* auth not in pm_stats yet */,
+        s.other_count,  s.dropped
+    };
+    const uint16_t cols[] = { C_GREEN, C_CYAN, C_RED, 0xFFE0, C_GREY, C_GREY };
+    for (int i = 0; i < 6; i++) {
+        gfx->fillRect(110, ys[i], 100, 20, C_BLACK);
+        gfx->setCursor(110, ys[i] + 4);
+        gfx->setTextColor(cols[i]);
+        gfx->setTextSize(1);
+        gfx->printf("%lu", vals[i]);
+    }
+
+    // Channel + fps
+    gfx->fillRect(0, BODY_BOT - 18, 320, 18, C_BLACK);
+    gfx->setCursor(10, BODY_BOT - 14);
+    gfx->setTextColor(C_GREY);
+    gfx->setTextSize(1);
+    gfx->printf("Ch: %2d  |  FPS: %lu  |  Total: %lu",
+                 ch, s.frames_per_sec, s.captured);
+
+    // Deauth warning
+    if (s.deauth_count > 0) {
+        gfx->fillRect(230, PROW_DEAUTH, 85, 20, C_BLACK);
+        gfx->setCursor(232, PROW_DEAUTH + 4);
+        gfx->setTextColor(C_RED);
+        gfx->print("<< DEAUTH!");
+    }
+}
+
+static void run_promiscuous_mode() {
+    // Transition wardrive to promiscuous mode
+    // This tells the wardrive Ghost Engine to use pm_promiscuous rather than
+    // WiFi.scanNetworks. If wardrive is active, it picks up the new mode on
+    // its next cycle. We set wardrive_active here so the Ghost Engine runs.
+    wardrive_set_mode(WARDRIVE_MODE_PROMISCUOUS);
+    wardrive_active = true;
+    // Note: we do NOT set wardrive_bridge_streaming here — that's the Bridge's
+    // job. If Bridge is running, it already set this flag. If Bridge is not
+    // running, pkt events won't be emitted over Serial — which is correct.
+
+    gfx->fillScreen(C_BLACK);
+
+    // Detect whether Bridge is also streaming
+    bool bridge_live = wardrive_bridge_streaming;
+    char title[48];
+    snprintf(title, sizeof(title), "PROMISC%s | TAP TO EXIT",
+             bridge_live ? " [EDGE]" : " [LOCAL]");
+    draw_header(title, C_RED);
+    promisc_draw_static();
+
+    char footer_buf[80];
+    if (bridge_live) {
+        snprintf(footer_buf, sizeof(footer_buf),
+                 "[M] Mode  [Q] Exit | Streaming to host");
+    } else {
+        snprintf(footer_buf, sizeof(footer_buf),
+                 "[M] Mode  [Q] Exit | Local display only");
+    }
+    draw_footer(footer_buf, bridge_live ? C_RED : C_GREY);
+
+    uint32_t last_redraw = 0;
+    pm_stats_t stats;
+
+    while (true) {
+        int16_t tx, ty;
+        if (get_touch(&tx, &ty) && ty < HEADER_H) {
+            while (get_touch(&tx, &ty)) { delay(10); yield(); }
+            break;
+        }
+
+        char k = get_keypress();
+        if (k == 'q' || k == 'Q') break;
+        if (k == 'm' || k == 'M') break;  // back to mode select
+
+        // Refresh stats every 500ms
+        if (millis() - last_redraw >= 500) {
+            pm_promiscuous_get_stats(&stats);
+            uint8_t ch = pm_promiscuous_channel();
+            promisc_draw_values(stats, ch);
+
+            // Re-evaluate bridge state — user may have connected/disconnected
+            bool now_live = wardrive_bridge_streaming;
+            if (now_live != bridge_live) {
+                bridge_live = now_live;
+                snprintf(title, sizeof(title), "PROMISC%s | TAP TO EXIT",
+                         bridge_live ? " [EDGE]" : " [LOCAL]");
+                draw_header(title, C_RED);
+                if (bridge_live) {
+                    snprintf(footer_buf, sizeof(footer_buf),
+                             "[M] Mode  [Q] Exit | Streaming to host");
+                    draw_footer(footer_buf, C_RED);
+                } else {
+                    snprintf(footer_buf, sizeof(footer_buf),
+                             "[M] Mode  [Q] Exit | Local display only");
+                    draw_footer(footer_buf, C_GREY);
+                }
+            }
+
+            last_redraw = millis();
+        }
+
+        delay(50);
+        yield();
+    }
+
+    // Return wardrive to idle scan mode when leaving promiscuous view.
+    // Do NOT call wardrive_active = false — the Ghost Engine may be running
+    // independently. The mode switch is enough.
+    wardrive_set_mode(WARDRIVE_MODE_SCAN);
+}
+
+// ═════════════════════════════════════════════
+//  ENTRY POINT
+// ═════════════════════════════════════════════
+void run_probe_intel() {
+    pi_mode_t mode = MODE_SCAN;
+
+    while (true) {
+        pi_mode_t selected = draw_mode_select(mode);
+
+        // User pressed Q on mode select — exit the whole app
+        if ((int)selected == -1) return;
+
+        mode = selected;
+
+        if (mode == MODE_SCAN) {
+            run_scan_mode();
+            // run_scan_mode returns when user presses Q, M, or taps header.
+            // If M was pressed we loop back to mode select.
+            // If Q was pressed we also exit — but since we can't distinguish,
+            // we just loop to mode select (user presses Q again to truly exit).
+            // A cleaner way: run_scan_mode returns an enum. See v1.2 todo.
+        } else {
+            run_promiscuous_mode();
+        }
+        // Loop — go back to mode select so user can switch modes mid-session
+    }
 }

@@ -35,19 +35,58 @@ extern volatile bool wifi_in_use;
 extern volatile bool sd_in_use;     // NEW — set by wifi_filemgr while serving
 extern SemaphoreHandle_t spi_mutex;
 
-int  networks_found  = 0;       // count from last WiFi scan
-volatile int  bt_found        = 0;       // count from current BLE window
-int  esp_found       = 0;               // ESP32 beacons found this session
+int  networks_found  = 0;
+volatile int  bt_found        = 0;
+int  esp_found       = 0;
 bool wardrive_active = false;
-volatile bool wardrive_bridge_streaming = false;  // v1.1 — set by bridge_app
+volatile bool wardrive_bridge_streaming = false;
 HardwareSerial SerialGPS(1);
 
-// ─── Session totals — accumulate across all scans, never reset ───
-// These persist as long as the device is on, giving Bridge mode something
-// meaningful to display even when wardrive is idle.
-int      networks_total = 0;    // cumulative networks seen this boot
-int      ble_total      = 0;    // cumulative BLE devices seen this boot
-uint32_t last_scan_ms   = 0;   // millis() of most recent completed WiFi scan
+int      networks_total = 0;
+int      ble_total      = 0;
+uint32_t last_scan_ms   = 0;
+
+// ─── Mode selection ───────────────────────────────────────────────────
+wardrive_mode_t        wardrive_mode               = WARDRIVE_MODE_SCAN;
+volatile bool          wardrive_promiscuous_active  = false;
+
+// Include promiscuous engine after globals
+#include "pm_promiscuous.h"
+
+// pm_promiscuous counter definitions — owned here, extern'd in pm_promiscuous.h
+volatile uint32_t pm_frames_per_sec  = 0;
+volatile uint32_t pm_beacon_count    = 0;
+volatile uint32_t pm_probe_req_count = 0;
+volatile uint32_t pm_deauth_count    = 0;
+volatile uint32_t pm_other_count     = 0;
+
+// ─── Promiscuous packet callback ──────────────────────────────────────
+// Called from pm_promiscuous_drain() in the wardrive task — safe context.
+static void _wardrive_on_pkt(const pm_pkt_info_t* pkt) {
+    if (!wardrive_bridge_streaming) return;
+    Serial.printf(
+        "{\"event\":\"pkt\","
+        "\"frame_type\":\"%s\","
+        "\"src\":\"%s\","
+        "\"dst\":\"%s\","
+        "\"bssid\":\"%s\","
+        "\"ssid\":\"%s\","
+        "\"ch\":%d,"
+        "\"rssi\":%d,"
+        "\"seq\":%d}\n",
+        pkt->subtype_str, pkt->src_mac_str,
+        pkt->dst_mac_str, pkt->bssid_str,
+        pkt->ssid, pkt->channel, pkt->rssi, pkt->seq_num);
+}
+
+void wardrive_set_mode(wardrive_mode_t mode) {
+    if (wardrive_mode == mode) return;
+    wardrive_mode = mode;
+    if (mode == WARDRIVE_MODE_SCAN && wardrive_promiscuous_active) {
+        pm_promiscuous_end();
+        wardrive_promiscuous_active = false;
+    }
+}
 
 static char _current_log_file[32] = "";
 
@@ -249,8 +288,51 @@ void wardrive_task(void *pvParameters) {
         }
 
         if (!wardrive_active) {
+            // If we were in promiscuous mode and wardrive stopped, clean up
+            if (wardrive_promiscuous_active) {
+                pm_promiscuous_end();
+                wardrive_promiscuous_active = false;
+            }
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
+        }
+
+        // ── PROMISCUOUS MODE BRANCH ────────────────────────────────
+        // When in promiscuous mode, skip the scan/BLE cycle entirely.
+        // Instead: tick channel hopper and drain the ISR-safe packet queue.
+        // The packet callback (_wardrive_on_pkt) streams frames over Serial.
+        if (wardrive_mode == WARDRIVE_MODE_PROMISCUOUS) {
+            // Start promiscuous if not already running
+            if (!wardrive_promiscuous_active) {
+                if (pm_promiscuous_begin(_wardrive_on_pkt)) {
+                    wardrive_promiscuous_active = true;
+                    Serial.println("{\"event\":\"promiscuous_started\"}");
+                } else {
+                    // Failed to start — fall back to scan mode
+                    wardrive_mode = WARDRIVE_MODE_SCAN;
+                    Serial.println("{\"event\":\"promiscuous_failed\","
+                                   "\"reason\":\"fallback to scan mode\"}");
+                }
+            }
+
+            if (wardrive_promiscuous_active) {
+                pm_promiscuous_tick();   // advance channel hop
+                pm_promiscuous_drain();  // pull from ISR queue → fire callback
+                while (SerialGPS.available() > 0) gps.encode(SerialGPS.read());
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;  // ← skip the scan/BLE code below
+        }
+
+        // ── SCAN MODE — stop promiscuous if it was running ─────────
+        if (wardrive_promiscuous_active) {
+            pm_promiscuous_end();
+            wardrive_promiscuous_active = false;
+            // Reinit WiFi in STA mode for scanning
+            WiFi.mode(WIFI_STA);
+            WiFi.disconnect();
+            vTaskDelay(pdMS_TO_TICKS(200));
         }
 
         // TIME-SLICED RADIO — skip SD writes if file manager is active

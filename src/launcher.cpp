@@ -275,7 +275,7 @@ static void drawCyberpunkHeader() {
     // Version tag far right
     gfx->setTextColor(C_TRACE);
     gfx->setCursor(262, 8);
-    gfx->print("v1.1.0");
+    gfx->print("v1.0.1");
 }
 
 // ─────────────────────────────────────────────
@@ -350,7 +350,7 @@ struct Category {
 #define APP_USB_DUCKY    46   // USB HID keyboard injection (requires HID build)
 #define APP_WIFI_DUCKY   47   // WiFi payload delivery / reverse C2
 
-// v1.1.0 — ELF Treaty Compliance
+// v1.0.1 — Bridge App
 #define APP_BRIDGE       48   // USB Serial JSON bridge for web emulator
 
 // ─────────────────────────────────────────────

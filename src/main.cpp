@@ -127,7 +127,7 @@ static void drawBootHeader() {
     gfx->print("PISCES MOON OS");
     gfx->setTextColor(BOOT_SECTION);
     gfx->setCursor(192, 4);
-    gfx->print("BIOS v1.1.0 / ESP32-S3");
+    gfx->print("BIOS v1.1.1 / ESP32-S3");
     bootY = 18;
 }
 
@@ -337,7 +337,7 @@ void showRainbowSplash() {
 
     gfx->setTextColor(0x0480);
     gfx->setCursor(248, 220);
-    gfx->print("v1.1.0 ELF TREATY");
+    gfx->print("v1.1.1 ELF TREATY");
 
     esp_task_wdt_reset();
     delay(2500);
