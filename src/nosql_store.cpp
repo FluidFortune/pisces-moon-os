@@ -12,8 +12,21 @@
 #include "nosql_store.h"
 #include "SdFat.h"
 #include <ArduinoJson.h>
+#include <freertos/semphr.h>
 
 extern SdFat sd;
+extern SemaphoreHandle_t spi_mutex;
+
+// ─── SPI Bus Treaty ───────────────────────────────────────────
+// All public nosql_* functions acquire spi_mutex before SD access.
+// Internal helpers (nosql_category_path) do not touch SD directly.
+static inline bool _nm_take() {
+    if (!spi_mutex) return true;
+    return xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE;
+}
+static inline void _nm_give() {
+    if (spi_mutex) xSemaphoreGive(spi_mutex);
+}
 
 // ─────────────────────────────────────────────
 //  INTERNAL HELPERS
@@ -46,10 +59,12 @@ static String entry_path(const char* category, int id) {
 //  if they don't already exist.
 // ─────────────────────────────────────────────
 bool nosql_init(const char* category) {
+    if (!_nm_take()) return false;
     // Ensure /data/ root exists
     if (!sd.exists("/data")) {
         if (!sd.mkdir("/data")) {
             Serial.println("[NOSQL] ERROR: Cannot create /data/");
+            _nm_give();
             return false;
         }
         Serial.println("[NOSQL] Created /data/");
@@ -60,6 +75,7 @@ bool nosql_init(const char* category) {
     if (!sd.exists(catPath.c_str())) {
         if (!sd.mkdir(catPath.c_str())) {
             Serial.printf("[NOSQL] ERROR: Cannot create %s\n", catPath.c_str());
+            _nm_give();
             return false;
         }
         Serial.printf("[NOSQL] Created %s\n", catPath.c_str());
@@ -71,6 +87,7 @@ bool nosql_init(const char* category) {
         FsFile f = sd.open(idxPath.c_str(), O_WRITE | O_CREAT);
         if (!f) {
             Serial.printf("[NOSQL] ERROR: Cannot create %s\n", idxPath.c_str());
+            _nm_give();
             return false;
         }
         // Write a blank but valid index
@@ -81,7 +98,9 @@ bool nosql_init(const char* category) {
     }
 
     Serial.printf("[NOSQL] Category '%s' ready.\n", category);
+    _nm_give();
     return true;
+    _nm_give();
 }
 
 // ─────────────────────────────────────────────
@@ -89,6 +108,7 @@ bool nosql_init(const char* category) {
 //  Reads "count" field from index.json
 // ─────────────────────────────────────────────
 int nosql_get_count(const char* category) {
+    if (!_nm_take()) return 0;
     String idxPath = index_path(category);
     FsFile f = sd.open(idxPath.c_str(), O_READ);
     if (!f) return 0;
@@ -104,9 +124,12 @@ int nosql_get_count(const char* category) {
 
     if (err) {
         Serial.printf("[NOSQL] Count parse error: %s\n", err.c_str());
+        _nm_give();
         return 0;
     }
+    _nm_give();
     return doc["count"] | 0;
+    _nm_give();
 }
 
 // ─────────────────────────────────────────────
@@ -118,6 +141,7 @@ bool nosql_save_entry(const char* category,
                       const char* title,
                       const char* content,
                       const char* tags) {
+    if (!_nm_take()) return false;
 
     // Make sure the category is initialized
     if (!nosql_init(category)) return false;
@@ -126,6 +150,7 @@ bool nosql_save_entry(const char* category,
     int newId = nosql_get_count(category) + 1;
     if (newId > NOSQL_MAX_ENTRIES) {
         Serial.println("[NOSQL] ERROR: Max entries reached.");
+        _nm_give();
         return false;
     }
 
@@ -134,6 +159,7 @@ bool nosql_save_entry(const char* category,
     FsFile entryFile = sd.open(ePath.c_str(), O_WRITE | O_CREAT | O_TRUNC);
     if (!entryFile) {
         Serial.printf("[NOSQL] ERROR: Cannot write %s\n", ePath.c_str());
+        _nm_give();
         return false;
     }
 
@@ -153,6 +179,7 @@ bool nosql_save_entry(const char* category,
     FsFile idxRead = sd.open(idxPath.c_str(), O_READ);
     if (!idxRead) {
         Serial.println("[NOSQL] ERROR: Cannot read index for update.");
+        _nm_give();
         return false;
     }
 
@@ -162,6 +189,7 @@ bool nosql_save_entry(const char* category,
 
     if (err) {
         Serial.printf("[NOSQL] Index parse error: %s\n", err.c_str());
+        _nm_give();
         return false;
     }
 
@@ -183,13 +211,16 @@ bool nosql_save_entry(const char* category,
     FsFile idxWrite = sd.open(idxPath.c_str(), O_WRITE | O_CREAT | O_TRUNC);
     if (!idxWrite) {
         Serial.println("[NOSQL] ERROR: Cannot write updated index.");
+        _nm_give();
         return false;
     }
     serializeJsonPretty(idxDoc, idxWrite);
     idxWrite.close();
 
     Serial.printf("[NOSQL] Index updated. Total entries: %d\n", newId);
+    _nm_give();
     return true;
+    _nm_give();
 }
 
 // ─────────────────────────────────────────────
@@ -202,12 +233,14 @@ bool nosql_get_entry(const char* category,
                      int index,
                      String &title,
                      String &content) {
+    if (!_nm_take()) return false;
 
     // ── Step 1: Get filename from index ──
     String idxPath = index_path(category);
     FsFile idxFile = sd.open(idxPath.c_str(), O_READ);
     if (!idxFile) {
         Serial.println("[NOSQL] ERROR: Cannot open index.");
+        _nm_give();
         return false;
     }
 
@@ -223,12 +256,14 @@ bool nosql_get_entry(const char* category,
 
     if (err) {
         Serial.printf("[NOSQL] Index parse error: %s\n", err.c_str());
+        _nm_give();
         return false;
     }
 
     JsonArray entries = idxDoc["entries"].as<JsonArray>();
     if (index < 0 || index >= (int)entries.size()) {
         Serial.println("[NOSQL] ERROR: Index out of range.");
+        _nm_give();
         return false;
     }
 
@@ -240,6 +275,7 @@ bool nosql_get_entry(const char* category,
     FsFile entryFile = sd.open(ePath.c_str(), O_READ);
     if (!entryFile) {
         Serial.printf("[NOSQL] ERROR: Cannot open %s\n", ePath.c_str());
+        _nm_give();
         return false;
     }
 
@@ -254,11 +290,14 @@ bool nosql_get_entry(const char* category,
 
     if (err) {
         Serial.printf("[NOSQL] Entry parse error: %s\n", err.c_str());
+        _nm_give();
         return false;
     }
 
     content = entryDoc["content"].as<String>();
+    _nm_give();
     return true;
+    _nm_give();
 }
 
 // ─────────────────────────────────────────────
@@ -271,6 +310,7 @@ bool nosql_search(const char* category,
                   const char* keyword,
                   String &result_title,
                   String &result_content) {
+    if (!_nm_take()) return false;
 
     String idxPath = index_path(category);
     FsFile idxFile = sd.open(idxPath.c_str(), O_READ);
@@ -318,10 +358,13 @@ bool nosql_search(const char* category,
 
             result_title   = entryDoc["title"].as<String>();
             result_content = entryDoc["content"].as<String>();
+            _nm_give();
             return true;
         }
     }
 
     Serial.printf("[NOSQL] No match for '%s' in '%s'\n", keyword, category);
+    _nm_give();
     return false;
+    _nm_give();
 }

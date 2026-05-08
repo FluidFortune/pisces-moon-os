@@ -1,4 +1,4 @@
-# Pisces Moon OS — v1.1.0 "ELF Treaty"
+# Pisces Moon OS — v1.1.1 "ELF Treaty"
 
 A general-purpose operating system for the LilyGO T-Deck Plus
 (ESP32-S3 handheld computer).
@@ -211,5 +211,5 @@ intentional — the OS exists to be improved by its users, not enclosed.
 
 ---
 
-*Pisces Moon OS · v1.1.0 "ELF Treaty" · May 2026*  
+*Pisces Moon OS · v1.1.1 "ELF Treaty" · May 2026*  
 *fluidfortune.com · AGPL-3.0-or-later*

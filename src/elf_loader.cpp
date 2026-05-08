@@ -344,12 +344,16 @@ bool elf_load_manifest(const char* elf_filename, ElfManifest* out) {
             return false;
     }
 
+    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        Serial.println("[ELF] manifest read: mutex timeout");
+        return false;
+    }
     FsFile f = sd.open(json_path, O_RDONLY);
-    if (!f) return false;
-
+    if (!f) { if (spi_mutex) xSemaphoreGive(spi_mutex); return false; }
     char buf[512];
     size_t n = f.read(buf, sizeof(buf) - 1);
     f.close();
+    if (spi_mutex) xSemaphoreGive(spi_mutex);
     if (n == 0) return false;
     buf[n] = '\0';
 
@@ -448,6 +452,10 @@ bool elf_load_manifest(const char* elf_filename, ElfManifest* out) {
 int elf_scan_apps(ElfManifest* manifests, int max_count) {
     int found = 0;
 
+    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        Serial.println("[ELF] elf_scan_apps: mutex timeout");
+        return 0;
+    }
     FsFile dir = sd.open("/apps");
     if (!dir || !dir.isDirectory()) {
         Serial.println("[ELF] /apps/ directory not found on SD");
@@ -486,6 +494,7 @@ int elf_scan_apps(ElfManifest* manifests, int max_count) {
         entry.close();
     }
     dir.close();
+    if (spi_mutex) xSemaphoreGive(spi_mutex);
 
     Serial.printf("[ELF] Scan complete: %d ELF modules found in /apps/\n", found);
     return found;
@@ -518,8 +527,13 @@ int elf_scan_apps(ElfManifest* manifests, int max_count) {
 // ============================================================
 ElfLoadResult elf_execute(const char* elf_path, ElfContext* ctx) {
     // --- Open ELF file ---
+    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        Serial.printf("[ELF] elf_execute: mutex timeout for %s\n", elf_path);
+        return ELF_NOT_FOUND;
+    }
     FsFile f = sd.open(elf_path, O_RDONLY);
     if (!f) {
+        if (spi_mutex) xSemaphoreGive(spi_mutex);
         Serial.printf("[ELF] File not found: %s\n", elf_path);
         return ELF_NOT_FOUND;
     }
