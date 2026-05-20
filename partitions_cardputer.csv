@@ -1,0 +1,45 @@
+# Pisces Moon OS — Cardputer ADV Partition Table
+# Target hardware: M5Stack Cardputer ADV (ESP32-S3FN8, 8MB flash)
+#
+# Layout rationale:
+#   The Cardputer ADV ships with the Stamp-S3A core — ESP32-S3FN8 —
+#   which has 8MB of flash, half of what the T-Deck Plus and
+#   T-LoraPager carry. The 9.94MB app partition from the larger
+#   devices is impossible here. Every byte matters.
+#
+#   - nvs (20KB): standard, holds WiFi creds and per-app NVS keys.
+#   - otadata (8KB): bootloader requirement, costs nothing.
+#   - app0 (~5.6MB): firmware lives here. Current Pisces Moon
+#     binary is ~1.6MB on T-Deck Plus, so this is ~3.5x headroom.
+#     Comfortably accommodates the core app set plus MicroPython
+#     and the ELF runtime. Doom and SimCity are excluded from the
+#     Cardputer build (see CHANGELOG_v1_2_1.md) and would not fit
+#     in the gamedata partition below anyway.
+#   - gamedata (1.5MB FAT): internal flash for fast game asset
+#     reads. Doom shareware WAD (4.2MB) does NOT fit — Doom is
+#     compiled out of the Cardputer build. SimCity terrain data
+#     does fit (~400KB) but the 320x240 game canvas doesn't crop
+#     down sensibly to 240x135, so SimCity is also out. What
+#     remains: snake high scores, retro pack metadata, audio
+#     player playlists, calc history, journal index. 1.5MB is
+#     plenty for those.
+#   - spiffs (896KB): NoSQL store, secrets, theme prefs, ELF app
+#     manifests. Pisces Moon writes user data to SD by default;
+#     SPIFFS is the emergency fallback when SD is absent. Sized
+#     to fill remaining flash exactly — no wasted bytes.
+#
+# Total layout reaches 0x800000 (8MB) exactly. The 0x9000 region
+# at the start is reserved for the second-stage bootloader.
+#
+# Comparison with sibling devices:
+#   T-Deck Plus / T-LoraPager (16MB):
+#     app0=9.94MB, gamedata=5MB, spiffs=1MB
+#   Cardputer ADV (8MB):
+#     app0=5.56MB, gamedata=1.5MB, spiffs=896KB
+
+# Name,     Type,  SubType,  Offset,    Size
+nvs,        data,  nvs,      0x9000,    0x5000
+otadata,    data,  ota,      0xe000,    0x2000
+app0,       app,   factory,  0x10000,   0x590000
+gamedata,   data,  fat,      0x5A0000,  0x180000
+spiffs,     data,  spiffs,   0x720000,  0xE0000

@@ -1,0 +1,1533 @@
+<!--
+Pisces Moon OS
+Copyright (C) 2026 Eric Becker / Fluid Fortune
+SPDX-License-Identifier: AGPL-3.0-or-later
+
+This program is free software: you can redistribute it
+and/or modify it under the terms of the GNU Affero General
+Public License as published by the Free Software Foundation,
+either version 3 of the License, or any later version.
+
+fluidfortune.com
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pisces Moon OS — Web Demo</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&display=swap');
+:root{
+  --g:#00ff41;--t:#00d4ff;--r:#ff3131;--am:#ffb800;
+  --cy:#00ffff;--mg:#ff00ff;--dk:#080c10;--bg:#040608;
+}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{
+  background:var(--bg);display:flex;flex-direction:column;
+  align-items:center;justify-content:center;min-height:100vh;
+  font-family:'Share Tech Mono',monospace;color:var(--g);overflow-x:hidden;
+}
+body::before{
+  content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;
+  background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.15) 2px,rgba(0,0,0,0.15) 4px);
+}
+.page-hdr{
+  font-family:'Orbitron',monospace;font-size:10px;color:#003300;
+  letter-spacing:4px;margin-bottom:10px;text-align:center;
+}
+/* ── DEVICE SHELL ── */
+.device{
+  position:relative;width:340px;background:#0d0d0d;
+  border-radius:18px;border:2px solid #1a2a1a;
+  box-shadow:0 0 60px rgba(0,255,65,0.08),0 0 120px rgba(0,255,65,0.04),
+             inset 0 1px 0 rgba(255,255,255,0.05);
+  padding:12px 12px 8px;
+}
+.bezel{
+  background:#050505;border-radius:6px;border:2px solid #111;
+  overflow:hidden;position:relative;width:316px;height:240px;
+}
+.screen{
+  width:316px;height:240px;position:relative;overflow:hidden;
+  background:#000;animation:flk 8s infinite;
+}
+.scr-bg{
+  position:absolute;inset:0;
+  background-image:linear-gradient(rgba(0,50,0,0.3) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(0,50,0,0.3) 1px,transparent 1px);
+  background-size:20px 20px;
+}
+@keyframes flk{0%,100%{opacity:1}92%{opacity:1}93%{opacity:0.85}94%{opacity:1}}
+@keyframes scn{0%{top:-10px}100%{top:260px}}
+.scan-ln{
+  position:absolute;left:0;right:0;height:3px;pointer-events:none;z-index:5;
+  background:linear-gradient(transparent,rgba(0,255,65,0.06),transparent);
+  animation:scn 6s linear infinite;
+}
+/* ── PERSISTENT HDR ── */
+.hdr{
+  position:absolute;top:0;left:0;right:0;height:24px;
+  background:#060810;border-bottom:2px solid var(--g);
+  display:flex;align-items:center;padding:0 6px;z-index:10;cursor:pointer;
+}
+.hdr-chip{
+  width:10px;height:16px;background:#003300;border:1px solid var(--g);
+  margin-right:6px;flex-shrink:0;position:relative;
+}
+.hdr-chip::before,.hdr-chip::after{
+  content:'';position:absolute;left:-3px;width:2px;height:2px;background:var(--g);
+}
+.hdr-chip::before{top:3px;box-shadow:0 4px 0 var(--g),0 8px 0 var(--g);}
+.hdr-chip::after{right:-3px;left:auto;top:3px;box-shadow:0 4px 0 var(--g),0 8px 0 var(--g);}
+.hdr-title{font-size:9px;letter-spacing:1px;flex:1;}
+.c0{color:#f0f}.c1{color:#00f}.c2{color:#0ff}.c3{color:#0f0}
+.c4{color:#ff0}.c5{color:#f80}.c6{color:#fff}.c7{color:#f00}
+.hdr-ver{font-size:8px;color:#003300;margin-left:auto;}
+/* ── GEAR + STATUS ── */
+.gear{
+  position:absolute;bottom:18px;right:5px;font-size:13px;
+  cursor:pointer;z-index:20;transition:all 0.2s;user-select:none;
+  color:#005500;
+}
+.gear:hover{color:var(--g);}
+.gear.on{color:var(--g);}
+.gear.pulse{animation:gpulse 2s infinite;}
+@keyframes gpulse{
+  0%,100%{color:#005500;}
+  50%{color:var(--am);text-shadow:0 0 6px var(--am);}
+}
+/* Gear label strip - only shown on terminal */
+.gear-strip{
+  position:absolute;bottom:16px;left:0;right:0;
+  display:none;align-items:center;justify-content:center;
+  z-index:7;cursor:pointer;
+}
+.gear-label{
+  font-size:7px;letter-spacing:1px;padding:1px 4px;
+  border-radius:2px;transition:all 0.2s;
+}
+.gear-label.no-key{
+  color:var(--am);border:1px solid #332200;background:#1a0e00;
+  animation:glpulse 2s infinite;
+}
+@keyframes glpulse{
+  0%,100%{border-color:#332200;color:var(--am);}
+  50%{border-color:var(--am);color:#fff;box-shadow:0 0 6px rgba(255,184,0,0.3);}
+}
+.gear-label.has-key{color:#005500;border:1px solid #002200;background:transparent;}
+.status-bar{
+  position:absolute;bottom:0;left:0;right:0;height:14px;
+  background:#060810;border-top:1px solid #003300;
+  display:flex;align-items:center;padding:0 4px;font-size:7px;color:#003300;gap:6px;
+}
+/* ── GHOST ENGINE INDICATOR ── */
+.ghost-bar{
+  position:absolute;top:24px;left:0;right:0;height:12px;
+  background:#020402;border-bottom:1px solid #002200;
+  display:flex;align-items:center;padding:0 4px;font-size:7px;color:#003300;gap:8px;
+  z-index:8;
+}
+.ghost-dot{
+  width:6px;height:6px;border-radius:50%;background:#003300;
+  animation:gdot 2s infinite;flex-shrink:0;
+}
+@keyframes gdot{0%,100%{background:#003300}50%{background:var(--g);box-shadow:0 0 4px var(--g);}}
+/* ── VIEWS ── */
+.view{
+  position:absolute;top:36px;left:0;right:0;bottom:14px;
+  display:none;flex-direction:column;
+}
+.view.active{display:flex;}
+/* ── SETTINGS OVERLAY ── */
+.s-ov{
+  position:absolute;inset:0;background:rgba(0,0,0,0.96);
+  z-index:50;display:none;flex-direction:column;padding:10px;gap:6px;
+}
+.s-ov.open{display:flex;}
+.s-ttl{
+  font-family:'Orbitron',monospace;font-size:9px;color:var(--g);
+  letter-spacing:3px;border-bottom:1px solid #003300;padding-bottom:5px;
+}
+.s-lbl{font-size:7px;color:#aaa;letter-spacing:1px;margin-bottom:2px;}
+.s-in{
+  background:#060810;border:1px solid #003300;color:var(--g);
+  font-family:'Share Tech Mono',monospace;font-size:8px;
+  padding:4px;border-radius:3px;width:100%;outline:none;
+}
+.s-in:focus{border-color:var(--g);}
+.s-hint{font-size:7px;color:#003300;line-height:1.5;}
+.s-hint a{color:#005500;text-decoration:none;}
+.s-hint a:hover{color:var(--g);}
+.s-st{font-size:8px;min-height:12px;}
+.s-st.ok{color:var(--g);} .s-st.er{color:var(--r);}
+.s-row{display:flex;gap:4px;}
+.s-save{
+  background:#003300;border:1px solid var(--g);color:var(--g);
+  font-family:'Share Tech Mono',monospace;font-size:8px;
+  padding:4px 8px;cursor:pointer;border-radius:2px;flex:1;
+}
+.s-save:hover{background:var(--g);color:#000;}
+.s-clr{
+  background:transparent;border:1px solid #330000;color:#330000;
+  font-family:'Share Tech Mono',monospace;font-size:8px;
+  padding:4px 8px;cursor:pointer;border-radius:2px;
+}
+.s-clr:hover{border-color:var(--r);color:var(--r);}
+.s-close{
+  background:transparent;border:1px solid #003300;color:#003300;
+  font-family:'Share Tech Mono',monospace;font-size:8px;
+  padding:4px;cursor:pointer;border-radius:2px;text-align:center;margin-top:auto;
+}
+.s-close:hover{border-color:#aaa;color:#aaa;}
+.sdot{
+  display:inline-block;width:6px;height:6px;border-radius:50%;
+  background:#330000;margin-right:3px;vertical-align:middle;
+}
+.sdot.on{background:var(--g);box-shadow:0 0 4px var(--g);}
+/* ── BIOS ── */
+.bios-w{background:#000;height:100%;padding:4px;overflow:hidden;font-size:8px;}
+.bl{display:flex;gap:6px;margin-bottom:1px;opacity:0;animation:bin 0.05s forwards;}
+@keyframes bin{to{opacity:1}}
+.bt{color:#003300;width:30px;}.bp{color:var(--g);width:80px;}
+.ba{color:#555;width:70px;}.bok{color:var(--g);}
+/* ── EXPLAINER ── */
+.exp-w{
+  height:100%;overflow-y:auto;padding:6px;background:#000;
+  scrollbar-width:thin;scrollbar-color:#003300 transparent;
+}
+.exp-w::-webkit-scrollbar{width:3px;}
+.exp-w::-webkit-scrollbar-thumb{background:#003300;}
+.exp-section{margin-bottom:8px;}
+.exp-title{
+  font-family:'Orbitron',monospace;font-size:8px;color:var(--g);
+  letter-spacing:2px;border-bottom:1px solid #003300;
+  padding-bottom:3px;margin-bottom:4px;
+}
+.exp-text{font-size:7px;color:#aaa;line-height:1.5;}
+.exp-text strong{color:var(--g);}
+.exp-text .amber{color:var(--am);}
+.exp-text .cyan{color:var(--cy);}
+.exp-text .red{color:var(--r);}
+.exp-start{
+  background:#003300;border:1px solid var(--g);color:var(--g);
+  font-family:'Share Tech Mono',monospace;font-size:9px;
+  padding:6px;cursor:pointer;border-radius:3px;
+  text-align:center;letter-spacing:2px;margin-top:4px;
+  display:block;width:100%;
+}
+.exp-start:hover{background:var(--g);color:#000;}
+/* ── PIN (kept minimal, hidden in demo) ── */
+.pin-w{
+  display:flex;flex-direction:column;align-items:center;
+  justify-content:center;height:100%;gap:8px;background:#000;
+}
+.pin-t{font-family:'Orbitron',monospace;font-size:10px;color:var(--g);letter-spacing:3px;}
+.pin-s{font-size:7px;color:#003300;}
+.pin-dots{display:flex;gap:8px;}
+.pd{width:12px;height:12px;border-radius:50%;border:1px solid var(--g);background:transparent;transition:background 0.1s;}
+.pd.on{background:var(--g);}
+.pin-g{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;width:100px;}
+.pk{
+  background:#080c08;border:1px solid #003300;color:var(--g);
+  font-family:'Share Tech Mono',monospace;font-size:10px;
+  padding:5px;text-align:center;cursor:pointer;border-radius:3px;transition:all 0.1s;
+}
+.pk:hover{background:#003300;border-color:var(--g);}
+.pk:active{background:var(--g);color:#000;}
+.pin-e{font-size:8px;color:var(--r);height:10px;}
+.pin-m{font-size:7px;color:#003300;}
+/* ── LAUNCHER ── */
+.cat-g{
+  display:grid;grid-template-columns:repeat(3,1fr);
+  grid-template-rows:repeat(2,1fr);gap:3px;padding:4px;height:100%;
+}
+.cc{
+  border-radius:4px;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;cursor:pointer;
+  position:relative;transition:transform 0.1s;
+  background:#080c08;border:1px solid #003300;overflow:hidden;
+}
+.cc::before{
+  content:'';position:absolute;inset:0;
+  background:linear-gradient(135deg,rgba(255,255,255,0.03) 0%,transparent 50%);
+}
+.cc:hover{transform:scale(1.03);z-index:2;}
+.cc.comms:hover{background:#001a2a;border-color:#00d4ff;box-shadow:0 0 12px rgba(0,212,255,0.3);}
+.cc.cyber:hover{background:#2a0000;border-color:#ff3131;box-shadow:0 0 12px rgba(255,49,49,0.3);}
+.cc.tools:hover{background:#1a1000;border-color:#ffb800;box-shadow:0 0 12px rgba(255,184,0,0.3);}
+.cc.games:hover{background:#001a00;border-color:#00ff41;box-shadow:0 0 12px rgba(0,255,65,0.3);}
+.cc.intel:hover{background:#001a1a;border-color:#00ffff;box-shadow:0 0 12px rgba(0,255,255,0.3);}
+.cc.media:hover{background:#1a001a;border-color:#ff00ff;box-shadow:0 0 12px rgba(255,0,255,0.3);}
+.cc.system:hover{background:#111;border-color:#848484;box-shadow:0 0 12px rgba(132,132,132,0.3);}
+.ci{font-size:20px;}
+.cl{font-family:'Share Tech Mono',monospace;font-size:9px;letter-spacing:2px;margin-top:4px;}
+.comms .cl{color:#00d4ff}.cyber .cl{color:#ff3131}.tools .cl{color:#ffb800}
+.games .cl{color:#00ff41}.intel .cl{color:#00ffff}.media .cl{color:#ff00ff}
+.system .cl{color:#848484}
+/* ── APP GRID ── */
+.ag-w{display:flex;flex-direction:column;height:100%;}
+.ag-hdr{
+  height:18px;display:flex;align-items:center;
+  padding:0 6px;font-size:8px;border-bottom:1px solid #003300;gap:6px;
+}
+.ag-back{color:#003300;cursor:pointer;}
+.ag-back:hover{color:var(--g);}
+.ag{
+  display:grid;grid-template-columns:repeat(3,1fr);
+  grid-template-rows:repeat(2,1fr);gap:3px;padding:3px;flex:1;
+}
+.at{
+  border-radius:3px;display:flex;align-items:center;justify-content:center;
+  cursor:pointer;font-size:8px;letter-spacing:1px;text-align:center;
+  padding:3px;background:#080c08;border:1px solid #003300;
+  transition:all 0.1s;position:relative;
+}
+.at::after{content:'';position:absolute;bottom:3px;right:3px;width:3px;height:3px;background:#003300;}
+.at:hover{background:#0d1a0d;transform:scale(1.05);z-index:2;}
+/* ── TERMINAL ── */
+.term-w{display:flex;flex-direction:column;height:100%;background:#000;}
+.term-o{
+  flex:1;overflow-y:auto;padding:4px;font-size:8px;line-height:11px;
+  scrollbar-width:thin;scrollbar-color:#003300 transparent;
+}
+.term-o::-webkit-scrollbar{width:3px;}
+.term-o::-webkit-scrollbar-thumb{background:var(--g);}
+.tl{margin-bottom:1px;white-space:pre-wrap;word-break:break-all;}
+.tl.u{color:#00ff41}.tl.a{color:#ccc}.tl.s{color:#ffb800}
+.tl.d{color:#003300}.tl.e{color:#ff3131}.tl.b{color:var(--t)}
+.term-ir{
+  height:22px;border-top:1px solid #003300;
+  display:flex;align-items:center;padding:0 4px;gap:3px;background:#040608;
+}
+.term-pr{color:var(--g);font-size:8px;flex-shrink:0;}
+.term-in{
+  flex:1;background:transparent;border:none;outline:none;
+  color:#fff;font-family:'Share Tech Mono',monospace;font-size:8px;caret-color:var(--g);
+}
+.term-snd{
+  background:#003300;border:1px solid var(--g);color:var(--g);
+  font-family:'Share Tech Mono',monospace;font-size:7px;
+  padding:2px 5px;cursor:pointer;border-radius:2px;
+}
+.term-snd:hover{background:var(--g);color:#000;}
+/* ── WARDRIVE ── */
+.wd-w{display:flex;flex-direction:column;height:100%;padding:4px;gap:2px;}
+.wdr{display:flex;align-items:baseline;gap:6px;font-size:9px;}
+.wdl{color:#003300;width:42px;}
+.wdv{font-size:14px;font-family:'Orbitron',monospace;}
+.wdv.ww{color:var(--g)}.wdv.wb{color:var(--cy)}
+.wdv.ws{color:#fff}.wdv.wa{color:#aaa}.wdv.wc{color:#fff;font-size:10px;}
+.wd-info{
+  font-size:7px;color:#003300;line-height:1.4;
+  border:1px solid #002200;border-radius:2px;padding:3px;margin:2px 0;
+}
+.wd-info strong{color:#005500;}
+.wd-log{font-size:7px;color:#003300;height:20px;overflow:hidden;}
+.wd-btn{
+  margin-top:auto;padding:5px;text-align:center;border-radius:3px;
+  font-size:8px;letter-spacing:1px;cursor:pointer;transition:all 0.2s;
+}
+.wd-btn.on{background:var(--g);color:#000;}
+.wd-btn.off{background:var(--r);color:#fff;}
+/* ── CLOCK ── */
+.clk-w{
+  display:flex;flex-direction:column;align-items:center;
+  justify-content:center;height:100%;gap:4px;
+}
+.clk-t{
+  font-family:'Orbitron',monospace;font-size:28px;color:var(--g);
+  letter-spacing:2px;text-shadow:0 0 20px rgba(0,255,65,0.5);
+}
+.clk-d{font-size:9px;color:#aaa;letter-spacing:2px;}
+.clk-sw{font-family:'Orbitron',monospace;font-size:14px;color:#003300;margin-top:8px;}
+.clk-sw.run{color:var(--g);}
+.clk-swl{font-size:7px;color:#003300;text-align:center;}
+/* ── GPS ── */
+.gps-w{display:flex;flex-direction:column;height:100%;padding:4px;gap:3px;}
+.gps-map{
+  flex:1;background:#000;border:1px solid #003300;
+  position:relative;overflow:hidden;border-radius:3px;
+}
+.gps-grid{
+  position:absolute;inset:0;
+  background-image:linear-gradient(rgba(0,40,0,0.5) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(0,40,0,0.5) 1px,transparent 1px);
+  background-size:20px 20px;
+}
+.gps-dot{
+  position:absolute;width:8px;height:8px;background:var(--g);
+  border-radius:50%;border:1px solid #fff;transform:translate(-50%,-50%);
+  box-shadow:0 0 8px var(--g);animation:gp 2s infinite;
+}
+@keyframes gp{0%,100%{box-shadow:0 0 4px var(--g)}50%{box-shadow:0 0 16px var(--g),0 0 30px rgba(0,255,65,0.3)}}
+.gps-c{font-size:8px;color:#aaa;display:flex;gap:8px;}
+.gps-s{font-size:7px;color:var(--g);}
+/* ── ABOUT ── */
+.about-w{
+  display:flex;flex-direction:column;align-items:center;
+  justify-content:center;height:100%;gap:5px;padding:8px;text-align:center;
+}
+.about-logo{
+  font-family:'Orbitron',monospace;font-size:13px;font-weight:900;
+  background:linear-gradient(135deg,#f0f,#0ff,#0f0);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+  letter-spacing:2px;
+}
+.about-sub{font-size:8px;color:var(--g);letter-spacing:2px;}
+.about-ver{font-size:9px;color:var(--am);}
+.about-hw{font-size:7px;color:#555;}
+/* ── BRIDGE VIEW ── */
+.br-w{display:flex;flex-direction:column;height:100%;padding:4px;gap:4px;}
+.br-status{
+  padding:6px;border-radius:3px;font-size:8px;text-align:center;letter-spacing:1px;
+}
+.br-status.dc{background:#1a0000;border:1px solid #330000;color:var(--r);}
+.br-status.cn{background:#001a00;border:1px solid #003300;color:var(--g);}
+.br-info{font-size:7px;color:#003300;line-height:1.5;}
+.br-log{
+  flex:1;overflow-y:auto;font-size:7px;color:#003300;line-height:1.3;
+  border:1px solid #002200;border-radius:2px;padding:3px;
+}
+.br-log::-webkit-scrollbar{width:2px;}
+.br-log::-webkit-scrollbar-thumb{background:#003300;}
+.br-connect{
+  background:#003300;border:1px solid var(--g);color:var(--g);
+  font-family:'Share Tech Mono',monospace;font-size:8px;
+  padding:6px;cursor:pointer;border-radius:3px;text-align:center;letter-spacing:1px;
+}
+.br-connect:hover{background:var(--g);color:#000;}
+.br-connect:disabled{background:#111;border-color:#222;color:#333;cursor:not-allowed;}
+/* ── KEYBOARD ── */
+.kb-row{display:flex;justify-content:center;gap:3px;margin-top:6px;}
+.k{
+  width:18px;height:18px;background:#0d0d0d;border:1px solid #222;border-radius:3px;
+  display:flex;align-items:center;justify-content:center;font-size:7px;color:#444;
+  box-shadow:0 2px 0 #111;
+}
+.nav-hint{
+  margin-top:8px;font-size:8px;color:#003300;text-align:center;letter-spacing:1px;
+}
+/* ── DEVICE CONNECT BUTTON (outside screen) ── */
+.connect-row{
+  display:flex;align-items:center;justify-content:center;
+  gap:8px;margin-top:8px;
+}
+.dev-connect{
+  background:#003300;border:1px solid var(--g);color:var(--g);
+  font-family:'Share Tech Mono',monospace;font-size:8px;letter-spacing:1px;
+  padding:5px 12px;cursor:pointer;border-radius:3px;transition:all 0.2s;
+}
+.dev-connect:hover{background:var(--g);color:#000;}
+.dev-connect.connected{background:#001a00;border-color:var(--g);color:var(--g);}
+.dev-connect:disabled{background:#111;border-color:#222;color:#333;cursor:not-allowed;}
+.dev-status{font-size:7px;color:#003300;letter-spacing:1px;}
+.dev-status.on{color:var(--g);}
+.dev-status.er{color:var(--r);}
+</style>
+</head>
+<body>
+
+<div class="page-hdr">
+  PISCES MOON OS — WEB DEMO<br>
+  <span style="font-size:9px;letter-spacing:2px;color:#005500">LIMITED ONLY BY YOUR IMAGINATION · piscesdemo.fluidfortune.com</span>
+</div>
+
+<div class="device">
+  <div class="bezel">
+    <div class="screen" id="screen">
+      <div class="scr-bg"></div>
+      <div class="scan-ln"></div>
+
+      <!-- HEADER -->
+      <div class="hdr" id="main-hdr">
+        <div class="hdr-chip"></div>
+        <div class="hdr-title">
+          <span class="c0">P</span><span class="c1">I</span><span class="c2">S</span><span class="c3">C</span><span class="c4">E</span><span class="c5">S</span><span class="c6"> </span><span class="c7">M</span><span class="c5">O</span><span class="c3">O</span><span class="c2">N</span><span class="c6"> </span><span class="c3">O</span><span class="c0">S</span>
+        </div>
+        <div class="hdr-ver">WEB DEMO</div>
+      </div>
+
+      <!-- GHOST ENGINE BAR -->
+      <div class="ghost-bar" id="ghost-bar" style="display:none">
+        <div class="ghost-dot" id="ghost-dot"></div>
+        <span id="ghost-txt" style="font-size:7px;color:#003300">CORE 0: GHOST ENGINE ACTIVE</span>
+        <span id="ghost-counts" style="margin-left:auto;color:#003300"></span>
+      </div>
+
+      <!-- GEAR + LABEL -->
+      <div class="gear" id="s-gear" onclick="toggleSettings()">⚙</div>
+      <div class="gear-strip" onclick="toggleSettings()">
+        <span class="gear-label no-key" id="gear-label">⚙ GEMINI KEY REQUIRED FOR LIVE AI — SEE TERMINAL</span>
+      </div>
+
+      <!-- STATUS BAR -->
+      <div class="status-bar">
+        <span id="sb-conn" style="color:#330000">◉ NO DEVICE</span>
+        <span id="sb-time">--:--</span>
+        <span id="sb-gps">🛰 --</span>
+        <span style="margin-left:auto">🔋79%</span>
+      </div>
+
+      <!-- SETTINGS OVERLAY -->
+      <div class="s-ov" id="s-ov">
+        <div class="s-ttl">⚙ TERMINAL SETTINGS</div>
+        <div class="s-lbl">GOOGLE GEMINI API KEY</div>
+        <input class="s-in" id="s-key" type="password" placeholder="AIzaSy..." autocomplete="off" spellcheck="false">
+        <div class="s-hint">
+          🔒 Your key is stored in <strong>your browser only</strong>.
+          It goes directly to Google when you use the terminal —
+          never through our servers.<br><br>
+          To get a key (free, no credit card):<br>
+          1. Go to <strong style="color:#005500">aistudio.google.com/apikey</strong><br>
+          2. Sign in with any Google account<br>
+          3. Click "Create API Key"<br>
+          4. Paste it above and click Save<br><br>
+          Free tier: 1,500 requests/day.
+          This is the same key the real Pisces Moon device uses.
+        </div>
+        <div class="s-st" id="s-st"><span class="sdot" id="sdot"></span><span id="s-msg">No key — terminal runs in demo mode</span></div>
+        <div class="s-row">
+          <button class="s-save" onclick="saveKey()">SAVE KEY</button>
+          <button class="s-clr" onclick="clearKey()">CLEAR</button>
+        </div>
+        <div class="s-hint" style="border-top:1px solid #003300;padding-top:5px;margin-top:2px;">
+          Without a key: pre-written demo responses.<br>
+          With a key: live Gemini AI — identical to the real device.<br>
+          If device is connected via USB, terminal uses device's Gemini key.
+        </div>
+        <button class="s-close" onclick="toggleSettings()">CLOSE ✕</button>
+      </div>
+
+      <!-- ── BIOS ── -->
+      <div class="view active" id="view-bios">
+        <div class="bios-w" id="bios-out"></div>
+      </div>
+
+      <!-- ── HOW TO USE EXPLAINER ── -->
+      <div class="view" id="view-pin">
+        <div class="exp-w">
+
+          <div class="exp-section">
+            <div class="exp-title">WELCOME TO PISCES MOON OS</div>
+            <div class="exp-text">
+              A working demo of a general-purpose OS for the
+              <strong>LilyGO T-Deck Plus</strong> — a $50 handheld
+              computer built on the ESP32-S3. 47 apps. Dual-core
+              architecture. Built in one month.
+            </div>
+          </div>
+
+          <div class="exp-section">
+            <div class="exp-title">HOW TO NAVIGATE</div>
+            <div class="exp-text">
+              <strong>Tap any category</strong> to open it.<br>
+              <strong>Tap an app</strong> to launch it.<br>
+              <span class="amber">Tap the green header bar at the top</span>
+              to exit any app and go back.<br>
+              That's how the real device works too.
+            </div>
+          </div>
+
+          <div class="exp-section">
+            <div class="exp-title">GEMINI AI TERMINAL</div>
+            <div class="exp-text">
+              Open <strong>INTEL → TERMINAL</strong> to chat with
+              Google's Gemini AI — the same AI that runs on the
+              real device.<br><br>
+              You'll need a <span class="amber">free API key</span>
+              from Google. No credit card required. Get one at:<br>
+              <span class="cyan">aistudio.google.com/apikey</span><br><br>
+              The key is stored in your browser only.
+              It never touches our servers.
+            </div>
+          </div>
+
+          <div class="exp-section">
+            <div class="exp-title">CONNECT YOUR ESP32 DEVICE</div>
+            <div class="exp-text">
+              Have an <strong>ESP32-S3</strong> running Pisces Moon OS?
+              The <span class="cyan">Bridge App</span> lets you connect
+              your device via USB and drive the demo with
+              <strong>live real data</strong>.<br><br>
+              When connected, these apps use live device data:
+              <span class="amber">WarDrive, GPS, BT Radar,
+              Net Scanner, RF Spectrum, Packet Sniffer,
+              Hash Tool, Beacon Spotter</span> — and the
+              AI Terminal sends prompts to your device's
+              Gemini client directly.<br><br>
+              <span class="amber">⚠ Bridge App connectivity coming
+              to the repo on or before May 5, 2026.</span><br>
+              <span style="color:#003300">
+              github.com/FluidFortune/PiscesMoon</span>
+            </div>
+          </div>
+
+          <div class="exp-section">
+            <div class="exp-title">GHOST ENGINE</div>
+            <div class="exp-text">
+              Watch the <span class="amber">thin bar</span> just
+              below the header after launch. That's the
+              <strong>Ghost Engine</strong> — a simulated
+              background task running on Core 0, continuously
+              scanning for WiFi networks and BLE devices
+              while you use other apps on Core 1.<br><br>
+              On the real device, this runs literally in the
+              background while you play chess, write notes,
+              or chat with the AI. Dual-core, always on.
+            </div>
+          </div>
+
+          <button class="exp-start" onclick="startDemo()">
+            ▶ ENTER DEMO
+          </button>
+
+        </div>
+      </div>
+
+      <!-- ── LAUNCHER ── -->
+      <div class="view" id="view-launcher">
+        <div class="cat-g" id="cat-g"></div>
+      </div>
+
+      <!-- ── APP GRID ── -->
+      <div class="view" id="view-apps">
+        <div class="ag-w">
+          <div class="ag-hdr">
+            <span class="ag-back" onclick="showView('launcher')">◀ BACK</span>
+            <span id="ag-lbl" style="color:var(--g)">APPS</span>
+          </div>
+          <div class="ag" id="ag"></div>
+        </div>
+      </div>
+
+      <!-- ── TERMINAL ── -->
+      <div class="view" id="view-terminal">
+        <div class="term-w">
+          <div class="term-o" id="term-o"></div>
+          <div class="term-ir">
+            <span class="term-pr">USER&gt;</span>
+            <input class="term-in" id="term-in" placeholder="type your prompt..." autocomplete="off">
+            <button class="term-snd" onclick="termSend()">SEND</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── WARDRIVE ── -->
+      <div class="view" id="view-wardrive">
+        <div class="wd-w">
+          <div class="wdr"><span class="wdl">WIFI:</span><span class="wdv ww" id="wd-w">0</span></div>
+          <div class="wdr"><span class="wdl">BLE:</span><span class="wdv wb" id="wd-b">0</span></div>
+          <div class="wdr"><span class="wdl">SATS:</span><span class="wdv ws" id="wd-s">8</span></div>
+          <div class="wdr"><span class="wdl">ALT:</span><span class="wdv wa" id="wd-a">355 FT</span></div>
+          <div class="wdr"><span class="wdl">LAT:</span><span class="wdv wc" id="wd-lat">34.06713</span></div>
+          <div class="wdr"><span class="wdl">LNG:</span><span class="wdv wc" id="wd-lng">-118.20405</span></div>
+          <div class="wd-info">
+            <strong>On device:</strong> WarDrive runs on <strong>Core 0</strong> as the Ghost Engine —
+            a background task that continuously logs WiFi APs + BLE devices with GPS coordinates.
+            You can use <strong>any other app on Core 1</strong> simultaneously. The SPI Bus Treaty
+            coordinates SD card access between cores.
+          </div>
+          <div class="wd-log" id="wd-log"></div>
+          <div class="wd-btn off" id="wd-btn" onclick="toggleWD()">PAUSED (TAP TO START)</div>
+        </div>
+      </div>
+
+      <!-- ── CLOCK ── -->
+      <div class="view" id="view-clock">
+        <div class="clk-w">
+          <div class="clk-t" id="clk-t">00:00:00</div>
+          <div class="clk-d" id="clk-d">--- --- -- ----  UTC</div>
+          <div class="clk-swl">STOPWATCH  SPACE=start/pause  R=reset</div>
+          <div class="clk-sw" id="clk-sw">00:00:00.00</div>
+        </div>
+      </div>
+
+      <!-- ── GPS ── -->
+      <div class="view" id="view-gps">
+        <div class="gps-w">
+          <div class="gps-map">
+            <div class="gps-grid"></div>
+            <div class="gps-dot" id="gps-dot" style="left:50%;top:50%"></div>
+          </div>
+          <div class="gps-c">
+            <span>LAT: <strong id="gps-lat">34.06713</strong></span>
+            <span>LNG: <strong id="gps-lng">-118.20405</strong></span>
+          </div>
+          <div class="gps-s">🛰 SATS: <strong id="gps-s">8</strong> · ALT: <strong id="gps-a">355 FT</strong></div>
+        </div>
+      </div>
+
+      <!-- ── BRIDGE VIEW ── -->
+      <div class="view" id="view-bridge">
+        <div class="br-w">
+          <div class="br-status dc" id="br-status">⬡ NO DEVICE CONNECTED</div>
+          <div class="br-info" id="br-info">
+            Connect your ESP32 via USB, then click CONNECT DEVICE below.<br>
+            Works with T-Deck Plus, T-Deck, or any ESP32 running Pisces Moon OS.<br>
+            Requires Chrome or Edge browser (Web Serial API).
+          </div>
+          <div class="br-log" id="br-log"></div>
+          <button class="br-connect" id="br-btn" onclick="bridgeConnect()">⚡ CONNECT DEVICE</button>
+        </div>
+      </div>
+
+      <!-- ── ABOUT ── -->
+      <div class="view" id="view-about">
+        <div class="about-w">
+          <div class="about-logo">PISCES MOON</div>
+          <div class="about-sub">OPERATING SYSTEM</div>
+          <div class="about-ver">Version 1.0.0 "The Arsenal"</div>
+          <div class="about-hw">LilyGO T-Deck Plus · ESP32-S3 · 240MHz</div>
+          <div class="about-hw">8MB PSRAM · 16MB Flash · 320×240 IPS</div>
+          <div class="about-hw">WiFi · BLE 5.0 · LoRa SX1262 · GPS</div>
+          <div class="about-hw" style="margin-top:4px;color:var(--g)">47 apps · Dual-core · AGPL-3.0</div>
+          <div class="about-hw" style="color:#333;margin-top:2px">© 2026 Eric Becker / Fluid Fortune</div>
+          <div class="about-hw" style="color:#003300">fluidfortune.com · github.com/FluidFortune</div>
+        </div>
+      </div>
+
+    </div><!-- /screen -->
+  </div><!-- /bezel -->
+
+  <!-- KEYBOARD DECORATION -->
+  <div class="kb-row" style="opacity:0.25">
+    <div class="k">Q</div><div class="k">W</div><div class="k">E</div><div class="k">R</div>
+    <div class="k">T</div><div class="k">Y</div><div class="k">U</div><div class="k">I</div>
+    <div class="k">O</div><div class="k">P</div>
+  </div>
+  <div class="kb-row" style="opacity:0.25">
+    <div class="k">A</div><div class="k">S</div><div class="k">D</div><div class="k">F</div>
+    <div class="k">G</div><div class="k">H</div><div class="k">J</div><div class="k">K</div><div class="k">L</div>
+  </div>
+  <div class="kb-row" style="opacity:0.25">
+    <div class="k">Z</div><div class="k">X</div><div class="k">C</div>
+    <div class="k" style="width:50px">SPC</div>
+    <div class="k">B</div><div class="k">N</div><div class="k">M</div>
+  </div>
+
+  <!-- DEVICE CONNECT BUTTON (outside the screen bezel) -->
+  <div class="connect-row">
+    <button class="dev-connect" id="dev-btn" onclick="bridgeConnect()">⚡ CONNECT ESP32 DEVICE</button>
+    <span class="dev-status" id="dev-status">Chrome/Edge · Web Serial API</span>
+  </div>
+</div>
+
+<div class="nav-hint">
+  <span style="color:#005500">▲ TAP GREEN HEADER TO GO BACK</span> · ⚙ for Gemini key · Connect ESP32 below for live data
+</div>
+
+<script>
+'use strict';
+// ═══════════════════════════════════════════════════════
+//  PISCES MOON OS — WEB EMULATOR v3.0
+//  AGPL-3.0-or-later · fluidfortune.com
+// ═══════════════════════════════════════════════════════
+
+// ── CONSTANTS ───────────────────────────────────────────
+const KEY_LS = 'pm_gemini_key';
+const GEMINI  = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
+const SYS_PROMPT = `You are the Gemini AI terminal running inside Pisces Moon OS v1.0.0 "The Arsenal" — a cyberpunk operating system for the LilyGO T-Deck Plus (ESP32-S3, 8MB PSRAM, 320x240 display, LoRa, GPS, BLE). Be concise — the screen is tiny. Max 3-4 sentences unless asked for more. Stay in character as an embedded AI assistant. You can discuss the OS, embedded systems, ESP32 development, security research, wardriving, LoRa, or anything else.`;
+
+const CATS = [
+  {name:'COMMS',cls:'comms',icon:'📡',color:'#00d4ff',
+   apps:['WIFI JOIN','GPS','MESH','VOICE','LORA PTT']},
+  {name:'CYBER',cls:'cyber',icon:'⚡',color:'#ff3131',
+   apps:['WARDRIVE','BT RADAR','PKT SNIFF','BEACON','NET SCAN','HASH TOOL',
+         'GATT XPLR','WPA HS','RF SPECTRM','PROBE INTL','PKT ANLYS','BLE DUCKY',
+         'USB DUCKY','WIFI DUCKY']},
+  {name:'TOOLS',cls:'tools',icon:'🔧',color:'#ffb800',
+   apps:['JOURNAL','CALC','CLOCK','CALENDAR','ETCH']},
+  {name:'GAMES',cls:'games',icon:'🎮',color:'#00ff41',
+   apps:['SNAKE','PACMAN','GALAGA','CHESS','DOOM','SIMCITY','RETRO']},
+  {name:'INTEL',cls:'intel',icon:'🧠',color:'#00ffff',
+   apps:['TERMINAL','GEMINI LOG','REF MED','REF SURV','BASEBALL','TRAILS','SSH']},
+  {name:'MEDIA',cls:'media',icon:'🎵',color:'#ff00ff',
+   apps:['PLAYER','RECORDER']},
+  {name:'SYSTEM',cls:'system',icon:'⚙️',color:'#848484',
+   apps:['FILES','SD FILES','BRIDGE','ABOUT','SYSTEM','MICROPYTHON','ELF APPS']},
+];
+
+const SSIDS = [
+  'ATT-HomeWifi-2G','XFINITY_7A3F','FBI_Surveillance_Van','Pretty_Fly_4_WiFi',
+  'TellMyWifiLoveHer','not_your_network','Bill_Wi_The_Science_Fi','TP-LINK_9A2B',
+  'Linksys00234','NETGEAR-GUEST','Spectrum-4E7A','DIRECT-roku-ABCD',
+  'xfinitywifi','HP-Print-44-LaserJet','CenturyLink-9B3C','ASUS_RT-AX88U',
+];
+
+const DEMO_RESP = [
+  {k:['hello','hi','hey'],
+   r:'Pisces Moon OS v1.0.0 "The Arsenal" — ESP32-S3 dual-core at 240MHz, 8MB PSRAM. 47 apps across 7 categories. Ghost Engine wardriving on Core 0. What do you want to know?'},
+  {k:['wardrive','wifi','scan','network'],
+   r:'Ghost Engine active on Core 0. Logging: /wardrive_0017.csv. Last scan: 24 networks, 12 BLE devices. GPS fix: 8 sats, 34.06713 lat. SPI Bus Treaty coordinating SD writes.'},
+  {k:['ghost','partition','security','pin','tactical'],
+   r:'Ghost Partition: two partition entries on SD. Student Mode = normal device. Tactical Mode (PIN + unlock key) mounts hidden partition. Nuke wipes index in milliseconds — forensically unrecoverable.'},
+  {k:['elf','app','loader','module'],
+   r:'ELF loader ready. Drop .elf modules in /apps/ on SD. Runtime linker maps into PSRAM, calls entry point. No reflash required. NES/Game Boy/Atari emulators load this way.'},
+  {k:['lora','mesh','radio','rf'],
+   r:'LoRa: SX1262, 915MHz. Mesh Messenger runs multi-hop at up to 5km LOS. RF Spectrum sweeps 150-960MHz via SX1262 RSSI. LoRa PTT with Codec2 vocoder pending library build.'},
+  {k:['spi','bus','treaty','architecture','dual core','core'],
+   r:'SPI Bus Treaty: SD + LoRa share SPI. Wardrive on Core 0 uses FreeRTOS spi_mutex with hit-and-run access. wifi_in_use and sd_in_use flags prevent conflicts. First documented solution for this hardware.'},
+  {k:['kode','kodedot','esp32','compatible'],
+   r:'Same ESP32-S3 silicon as KodeDot. ELF modules port with display HAL changes. Their S3+C5 dual-chip architecture increases bus contention — the SPI Bus Treaty patterns apply directly.'},
+  {k:['bridge','serial','connect','usb'],
+   r:'Bridge mode: SYSTEM > BRIDGE on the real device. Opens JSON protocol over USB Serial at 115200 baud. The web emulator connects via Web Serial API in Chrome. Commands: ping, status, wardrive_status, wifi_scan, gps, gemini, ls, cat.'},
+];
+
+// ── STATE ────────────────────────────────────────────────
+let currentView = 'bios';
+let pinEntry = '';
+let wdActive = false, wdTimer = null;
+let swRun = false, swStart = 0, swElapsed = 0;
+let termHistory = [];
+
+// Ghost Engine simulation state
+let ghostActive = false;
+let ghostWifi = 0, ghostBle = 0, ghostTotal = 0;
+let ghostTimer = null;
+
+// Web Serial bridge state
+let serialPort = null;
+let serialReader = null;
+let serialWriter = null;
+let bridgeConnected = false;
+let pendingCmds = {};
+let cmdSeq = 0;
+let serialReadBuf = '';
+
+// Live device data (replaces sim when connected)
+let deviceData = null;
+
+// ── VIEW ─────────────────────────────────────────────────
+function showView(id) {
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  document.getElementById('view-' + id).classList.add('active');
+  currentView = id;
+  if (id !== 'wardrive' && wdTimer) { clearInterval(wdTimer); wdTimer = null; wdActive = false; }
+  // Gemini key strip only appears in terminal when no key is configured
+  const strip = document.getElementById('gear-strip');
+  if (strip) strip.style.display = (id === 'terminal' && !getKey()) ? 'flex' : 'none';
+}
+
+// ── GHOST ENGINE SIMULATION ──────────────────────────────
+function startGhostEngine() {
+  ghostActive = true;
+  document.getElementById('ghost-bar').style.display = 'flex';
+  ghostTimer = setInterval(() => {
+    if (!ghostActive) return;
+    // Simulate a scan window
+    const newWifi = 5 + Math.floor(Math.random() * 20);
+    const newBle  = 3 + Math.floor(Math.random() * 30);
+    ghostWifi = newWifi;
+    ghostBle  = newBle;
+    ghostTotal += newWifi;
+
+    // Update ghost bar
+    const counts = document.getElementById('ghost-counts');
+    counts.textContent = `W:${ghostWifi} BLE:${ghostBle} TOT:${ghostTotal}`;
+
+    // If wardrive view is open, update it
+    if (currentView === 'wardrive' && !bridgeConnected) {
+      document.getElementById('wd-w').textContent = ghostWifi;
+      document.getElementById('wd-b').textContent = ghostBle;
+      const lat = 34.06713 + (Math.random()-.5)*.0003;
+      const lng = -118.20405 + (Math.random()-.5)*.0003;
+      document.getElementById('wd-lat').textContent = lat.toFixed(5);
+      document.getElementById('wd-lng').textContent = lng.toFixed(5);
+      const ssid = SSIDS[Math.floor(Math.random()*SSIDS.length)];
+      document.getElementById('wd-log').textContent =
+        `[C0] → ${ssid} (-${55+Math.floor(Math.random()*40)}dBm ch${1+Math.floor(Math.random()*13)})`;
+    }
+
+    // Update GPS in status bar
+    document.getElementById('sb-gps').textContent = `🛰 ${7+Math.floor(Math.random()*3)}`;
+
+  }, 4000); // 4-second scan window matches real Ghost Engine
+}
+
+// ── API KEY ──────────────────────────────────────────────
+function getKey() { return localStorage.getItem(KEY_LS) || ''; }
+
+function saveKey() {
+  const v = document.getElementById('s-key').value.trim();
+  if (!v) { setSt('Enter a key first', 'er'); return; }
+  if (!v.startsWith('AIza')) { setSt('Invalid format — should start with AIza', 'er'); return; }
+  localStorage.setItem(KEY_LS, v);
+  setSt('Key saved ✓ — terminal is live', 'ok');
+  updateGear();
+}
+
+function clearKey() {
+  localStorage.removeItem(KEY_LS);
+  document.getElementById('s-key').value = '';
+  setSt('Key cleared — demo mode active', 'er');
+  updateGear();
+}
+
+function setSt(msg, cls) {
+  document.getElementById('s-msg').textContent = msg;
+  document.getElementById('s-st').className = 's-st ' + cls;
+  document.getElementById('sdot').className = 'sdot' + (cls === 'ok' ? ' on' : '');
+}
+
+function updateGear() {
+  const g   = document.getElementById('s-gear');
+  const lbl = document.getElementById('gear-label');
+  const has = !!getKey();
+  const strip = document.getElementById('gear-strip');
+  if (has) {
+    g.className   = 'gear on';
+    g.title       = 'Gemini key active ✓ — click to manage';
+    lbl.className = 'gear-label has-key';
+    lbl.textContent = '⚙ GEMINI AI ACTIVE';
+    if (strip) strip.style.display = 'none';
+  } else {
+    g.className   = 'gear pulse';
+    g.title       = 'Configure Gemini API key';
+    lbl.className = 'gear-label no-key';
+    lbl.textContent = '⚙ GEMINI KEY REQUIRED FOR LIVE AI — SEE TERMINAL';
+    // Only show strip if we're currently on terminal
+    if (strip) strip.style.display = (currentView === 'terminal') ? 'flex' : 'none';
+  }
+}
+
+function toggleSettings() {
+  const o = document.getElementById('s-ov');
+  const open = o.classList.toggle('open');
+  if (open) {
+    const k = getKey();
+    document.getElementById('s-key').value = k || '';
+    setSt(k ? 'Key configured ✓ — terminal is live' : 'No key — demo mode active', k ? 'ok' : 'er');
+  }
+}
+
+// ── BIOS ─────────────────────────────────────────────────
+const BIOS_LINES = [
+  ['00:00','PISCES MOON OS','WEB DEMO','OK'],
+  ['00:01','Shadow RAM','0x00010000','OK'],
+  ['00:02','PSRAM Init','8MB OPI','OK'],
+  ['00:03','Display SPI','320x240 IPS','OK'],
+  ['00:04','Touch GT911','I2C:0x5D','OK'],
+  ['00:05','SD Card','FAT32 32GB','OK'],
+  ['00:06','GPS UART','9600 baud','OK'],
+  ['00:07','SX1262 LoRa','915MHz','OK'],
+  ['00:08','ES7210 Mic','I2S:44.1kHz','OK'],
+  ['00:09','AXP2101 PMU','Batt:79%','OK'],
+  ['00:10','Ghost Partition','STUDENT MODE','OK'],
+  ['00:11','WiFi STA','Connected','OK'],
+  ['00:12','NimBLE Stack','Ready','OK'],
+  ['00:13','Core0 Ghost','Spawning...','OK'],
+  ['00:14','DEMO READY','LIMITED ONLY BY','OK'],
+  ['00:15','','YOUR IMAGINATION','OK'],
+];
+
+function runBios() {
+  const out = document.getElementById('bios-out');
+  out.innerHTML = '';
+  let delay = 200;
+  BIOS_LINES.forEach((l, i) => {
+    delay += i === 0 ? 0 : 60 + Math.random()*60;
+    setTimeout(() => {
+      const d = document.createElement('div');
+      d.className = 'bl';
+      d.innerHTML = `<span class="bt">${l[0]}</span><span class="bp">${l[1]}</span><span class="ba">${l[2]}</span><span class="bok">${l[3]}</span>`;
+      out.appendChild(d);
+      out.scrollTop = out.scrollHeight;
+    }, delay);
+  });
+  // Go to explainer after boot
+  setTimeout(() => showView('pin'), delay + 600);
+}
+
+function startDemo() {
+  showView('launcher');
+  startClock();
+  updateSBTime();
+  setInterval(updateSBTime, 30000);
+  updateGear();
+  setTimeout(() => startGhostEngine(), 1000);
+}
+
+// ── LAUNCHER ─────────────────────────────────────────────
+function buildLauncher() {
+  const g = document.getElementById('cat-g');
+  CATS.forEach((c, i) => {
+    const d = document.createElement('div');
+    d.className = `cc ${c.cls}`;
+    d.innerHTML = `<div class="ci">${c.icon}</div><div class="cl">${c.name}</div>`;
+    d.onclick = () => openCat(i);
+    g.appendChild(d);
+  });
+}
+
+function openCat(i) {
+  const c = CATS[i];
+  document.getElementById('ag-lbl').textContent = c.name;
+  document.getElementById('ag-lbl').style.color = c.color;
+  const g = document.getElementById('ag');
+  g.innerHTML = '';
+  c.apps.slice(0, 6).forEach(name => {
+    const t = document.createElement('div');
+    t.className = 'at';
+    t.style.color = c.color; t.style.borderColor = c.color+'44';
+    t.textContent = name;
+    t.onclick = () => launch(name, c);
+    g.appendChild(t);
+  });
+  showView('apps');
+}
+
+// ── LAUNCH ───────────────────────────────────────────────
+function launch(name, cat) {
+  const map = {
+    'TERMINAL': () => { showView('terminal'); initTerm(); },
+    'WARDRIVE': () => { showView('wardrive'); if(wdActive) document.getElementById('wd-btn').classList.replace('off','on'); },
+    'GPS':      () => { showView('gps'); startGPS(); },
+    'CLOCK':    () =>   showView('clock'),
+    'BRIDGE':   () =>   showView('bridge'),
+    'ABOUT':    () =>   showView('about'),
+  };
+  if (map[name]) map[name]();
+  else stub(name, cat);
+}
+
+function stub(name, cat) {
+  showView('terminal');
+  termHistory = [];
+  const o = document.getElementById('term-o'); o.innerHTML = '';
+  document.getElementById('term-in').style.display = '';
+  document.querySelector('.term-snd').style.display = '';
+  tl(`[SYSTEM] ${name}`, 's');
+  tl('', 'd');
+  tl(`${name} runs on the physical device.`, 'a');
+  tl('Connect your ESP32 below for live access,', 'a');
+  tl('or get the T-Deck Plus ($50) to run the full OS.', 'a');
+  tl('', 'd');
+  tl('github.com/FluidFortune/PiscesMoon', 's');
+  document.getElementById('term-in').style.display = 'none';
+  document.querySelector('.term-snd').style.display = 'none';
+}
+
+// ── WARDRIVE MANUAL TOGGLE ───────────────────────────────
+function toggleWD() {
+  wdActive = !wdActive;
+  const btn = document.getElementById('wd-btn');
+  btn.textContent = wdActive ? 'LOGGING WIFI+BLE (TAP TO PAUSE)' : 'PAUSED (TAP TO START)';
+  btn.className = 'wd-btn ' + (wdActive ? 'on' : 'off');
+
+  if (bridgeConnected) {
+    // Control real device
+    bridgeSend(wdActive ? 'wardrive_start' : 'wardrive_stop');
+  }
+}
+
+// ── TERMINAL ─────────────────────────────────────────────
+function initTerm() {
+  document.getElementById('term-in').style.display = '';
+  document.querySelector('.term-snd').style.display = '';
+  const o = document.getElementById('term-o');
+  if (o.children.length === 0) {
+    const has = !!getKey();
+    tl('GEMINI TERMINAL — Pisces Moon OS', 's');
+    tl('', 'd');
+    if (bridgeConnected) {
+      tl('Live device connected.', 'b');
+      tl('Prompts go to your device\'s Gemini client.', 'b');
+    } else if (has) {
+      tl('Gemini 2.0 Flash connected. Start typing.', 's');
+    } else {
+      tl('⚠  No Gemini API key configured.', 'e');
+      tl('', 'd');
+      tl('To enable live AI responses:', 'd');
+      tl('1. Go to aistudio.google.com/apikey', 'd');
+      tl('2. Sign in with any Google account', 'd');
+      tl('3. Click "Create API Key" (free, no card)', 'd');
+      tl('4. Click GET GEMINI KEY below and paste it', 'd');
+      tl('', 'd');
+      tl('Without a key, responses are pre-written demos.', 'd');
+
+      // Inline key entry button
+      const btn = document.createElement('button');
+      btn.className = 'term-snd';
+      btn.style.cssText = 'margin:4px;padding:4px 8px;font-size:8px;width:calc(100% - 8px);background:#1a0a00;border-color:var(--am);color:var(--am);';
+      btn.textContent = '⚙ GET GEMINI KEY AT aistudio.google.com/apikey';
+      btn.onclick = () => { toggleSettings(); };
+      o.appendChild(btn);
+    }
+    tl('', 'd');
+  }
+  const inp = document.getElementById('term-in');
+  inp.onkeydown = e => { if (e.key === 'Enter') termSend(); };
+  setTimeout(() => inp.focus(), 100);
+}
+
+function tl(text, cls) {
+  const o = document.getElementById('term-o');
+  const d = document.createElement('div');
+  d.className = `tl ${cls}`; d.textContent = text;
+  o.appendChild(d); o.scrollTop = o.scrollHeight;
+  return d;
+}
+
+async function termSend() {
+  const inp = document.getElementById('term-in');
+  const prompt = inp.value.trim(); if (!prompt) return;
+  inp.value = '';
+  tl('USER> ' + prompt, 'u');
+  const think = tl('AI> [thinking...]', 's');
+
+  // If device connected, send to device
+  if (bridgeConnected) {
+    think.textContent = 'AI> [sending to device...]';
+    try {
+      const resp = await bridgeSend('gemini', { prompt });
+      think.remove();
+      if (resp && resp.ok) {
+        wrapLines('AI> ', resp.data.response);
+        tl('', 'd');
+        tl('[LIVE DEVICE · Gemini via T-Deck]', 'b');
+      } else {
+        tl('AI> ERROR: ' + (resp?.error || 'Device error'), 'e');
+      }
+    } catch(e) {
+      think.remove();
+      tl('AI> ERROR: ' + e.message, 'e');
+    }
+    return;
+  }
+
+  termHistory.push({ role:'user', parts:[{ text:prompt }] });
+  const key = getKey();
+
+  if (key) {
+    // LIVE GEMINI
+    try {
+      const body = {
+        system_instruction: { parts:[{ text:SYS_PROMPT }] },
+        contents: termHistory.slice(-20),
+        generationConfig: { maxOutputTokens:300, temperature:0.7 }
+      };
+      const r = await fetch(`${GEMINI}?key=${key}`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(body)
+      });
+      const d = await r.json();
+      think.remove();
+      if (!r.ok) {
+        tl('AI> ERROR: ' + (d.error?.message || 'HTTP '+r.status), 'e');
+        if (r.status === 400 || r.status === 403) tl('Check your API key via ⚙', 'd');
+        return;
+      }
+      const reply = d.candidates?.[0]?.content?.parts?.[0]?.text || 'No response.';
+      termHistory.push({ role:'model', parts:[{ text:reply }] });
+      wrapLines('AI> ', reply);
+      tl('', 'd');
+    } catch(e) {
+      think.remove(); tl('AI> ERROR: ' + e.message, 'e');
+    }
+  } else {
+    // DEMO MODE
+    const low = prompt.toLowerCase();
+    const match = DEMO_RESP.find(d => d.k.some(k => low.includes(k)));
+    const reply = match ? match.r : 'Running on LilyGO T-Deck Plus — ESP32-S3, 8MB PSRAM, 47 apps. Add a free Gemini key via ⚙ for live AI responses.';
+    await new Promise(r => setTimeout(r, 600 + Math.random()*400));
+    think.remove();
+    wrapLines('AI> ', reply);
+    tl('', 'd');
+    tl('[DEMO · add Gemini key via ⚙ for live AI]', 'd');
+  }
+}
+
+function wrapLines(prefix, text) {
+  const W = 54;
+  const words = text.split(' ');
+  let line = prefix;
+  words.forEach(w => {
+    if ((line + w).length > W) { tl(line.trimEnd(), 'a'); line = '     ' + w + ' '; }
+    else line += w + ' ';
+  });
+  if (line.trim()) tl(line.trimEnd(), 'a');
+}
+
+// ── CLOCK ─────────────────────────────────────────────────
+function startClock() {
+  setInterval(() => {
+    const n = new Date(), p = x => String(x).padStart(2,'0');
+    document.getElementById('clk-t').textContent =
+      `${p(n.getUTCHours())}:${p(n.getUTCMinutes())}:${p(n.getUTCSeconds())}`;
+    const D=['SUN','MON','TUE','WED','THU','FRI','SAT'];
+    const M=['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+    document.getElementById('clk-d').textContent =
+      `${D[n.getUTCDay()]} ${M[n.getUTCMonth()]} ${p(n.getUTCDate())} ${n.getUTCFullYear()}  UTC`;
+    if (swRun) swElapsed = Date.now() - swStart;
+    const sw = swElapsed;
+    const sh=Math.floor(sw/3600000),sm=Math.floor((sw%3600000)/60000),
+          ss=Math.floor((sw%60000)/1000),ms=Math.floor((sw%1000)/10);
+    const el = document.getElementById('clk-sw');
+    el.textContent = `${p(sh)}:${p(sm)}:${p(ss)}.${p(ms)}`;
+    el.className = 'clk-sw' + (swRun ? ' run' : '');
+  }, 100);
+  document.addEventListener('keydown', e => {
+    if (currentView !== 'clock') return;
+    if (e.code === 'Space') { e.preventDefault();
+      if (!swRun) { swStart = Date.now()-swElapsed; swRun=true; } else swRun=false; }
+    if (e.key==='r'||e.key==='R') { swRun=false; swElapsed=0; }
+  });
+}
+
+function updateSBTime() {
+  const n = new Date();
+  document.getElementById('sb-time').textContent =
+    String(n.getHours()).padStart(2,'0')+':'+String(n.getMinutes()).padStart(2,'0');
+}
+
+// ── GPS ───────────────────────────────────────────────────
+function startGPS() {
+  let t = 0;
+  const id = setInterval(() => {
+    if (currentView !== 'gps') { clearInterval(id); return; }
+    // Use live device data if connected
+    if (bridgeConnected && deviceData?.gps?.valid) {
+      const g = deviceData.gps;
+      document.getElementById('gps-lat').textContent = g.lat.toFixed(5);
+      document.getElementById('gps-lng').textContent = g.lng.toFixed(5);
+      document.getElementById('gps-s').textContent   = g.sats;
+      document.getElementById('gps-a').textContent   = Math.round(g.alt_ft) + ' FT';
+      return;
+    }
+    t += 0.04;
+    const lat = 34.06713 + Math.sin(t)*.002;
+    const lng = -118.20405 + Math.cos(t)*.003;
+    document.getElementById('gps-lat').textContent = lat.toFixed(5);
+    document.getElementById('gps-lng').textContent = lng.toFixed(5);
+    document.getElementById('gps-s').textContent   = 7 + Math.floor(Math.random()*3);
+    document.getElementById('gps-a').textContent   = (350+Math.floor(Math.random()*20)) + ' FT';
+    document.getElementById('gps-dot').style.left  = (48+Math.cos(t)*8) + '%';
+    document.getElementById('gps-dot').style.top   = (48+Math.sin(t)*8) + '%';
+  }, 500);
+}
+
+// ═══════════════════════════════════════════════════════
+//  WEB SERIAL BRIDGE
+//  Connects to any ESP32 running Pisces Moon OS bridge mode
+//  via the Web Serial API (Chrome/Edge).
+//  Protocol: newline-delimited JSON
+// ═══════════════════════════════════════════════════════
+
+function brLog(msg, cls='') {
+  const log = document.getElementById('br-log');
+  const d = document.createElement('div');
+  d.textContent = msg;
+  if (cls) d.style.color = cls === 'ok' ? 'var(--g)' : cls === 'er' ? 'var(--r)' : 'var(--t)';
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+}
+
+function setDevStatus(connected, label) {
+  const btn = document.getElementById('dev-btn');
+  const st  = document.getElementById('dev-status');
+  const sb  = document.getElementById('sb-conn');
+  const brSt= document.getElementById('br-status');
+
+  if (connected) {
+    btn.textContent = '⬡ DISCONNECT DEVICE';
+    btn.className   = 'dev-connect connected';
+    st.textContent  = '✓ DEVICE CONNECTED';
+    st.className    = 'dev-status on';
+    sb.textContent  = '◉ DEVICE LIVE';
+    sb.style.color  = 'var(--g)';
+    brSt.textContent= '◉ DEVICE CONNECTED — ' + label;
+    brSt.className  = 'br-status cn';
+  } else {
+    btn.textContent = '⚡ CONNECT ESP32 DEVICE';
+    btn.className   = 'dev-connect';
+    st.textContent  = 'Chrome/Edge · Web Serial API';
+    st.className    = 'dev-status';
+    sb.textContent  = '◉ NO DEVICE';
+    sb.style.color  = '#330000';
+    brSt.textContent= '⬡ NO DEVICE CONNECTED';
+    brSt.className  = 'br-status dc';
+  }
+}
+
+async function bridgeConnect() {
+  // Disconnect if already connected
+  if (bridgeConnected) {
+    await bridgeDisconnect();
+    return;
+  }
+
+  // Check Web Serial support
+  if (!('serial' in navigator)) {
+    brLog('ERROR: Web Serial API not supported. Use Chrome or Edge.', 'er');
+    setDevStatus(false, '');
+    return;
+  }
+
+  try {
+    brLog('Requesting serial port access...');
+    const port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    serialPort = port;
+
+    const textDecoder  = new TextDecoderStream();
+    const textEncoder  = new TextEncoderStream();
+    port.readable.pipeTo(textDecoder.writable);
+    textEncoder.readable.pipeTo(port.writable);
+    serialReader = textDecoder.readable.getReader();
+    serialWriter = textEncoder.writable.getWriter();
+
+    bridgeConnected = true;
+    brLog('Serial port opened at 115200 baud.', 'ok');
+    brLog('Waiting for device handshake...');
+
+    // Start reading loop
+    readSerialLoop();
+
+    // Ping the device
+    setTimeout(async () => {
+      const resp = await bridgeSend('ping');
+      if (resp && resp.ok) {
+        const d = resp.data;
+        const label = `${d.os} ${d.version} · ${d.chip} · ${d.freq_mhz}MHz`;
+        setDevStatus(true, label);
+        brLog(`Connected: ${label}`, 'ok');
+        brLog(`Uptime: ${d.uptime_s}s · SDK: ${d.sdk}`);
+        document.getElementById('br-info').innerHTML =
+          `<strong style="color:var(--g)">${d.chip}</strong> · ${d.freq_mhz}MHz · ${d.os} ${d.version}<br>` +
+          `Uptime: ${d.uptime_s}s · SDK: ${d.sdk}<br>` +
+          `All emulator data now reflects the live device.`;
+
+        // Pull initial status
+        pollDeviceStatus();
+        setInterval(pollDeviceStatus, 5000);
+      } else {
+        brLog('Device did not respond to ping. Is bridge mode running?', 'er');
+        brLog('SYSTEM menu → BRIDGE on the device.', 'er');
+      }
+    }, 500);
+
+  } catch(e) {
+    brLog('Connection failed: ' + e.message, 'er');
+    bridgeConnected = false;
+    setDevStatus(false, '');
+  }
+}
+
+async function bridgeDisconnect() {
+  bridgeConnected = false;
+  setDevStatus(false, '');
+  try {
+    if (serialReader) { await serialReader.cancel(); serialReader = null; }
+    if (serialWriter) { serialWriter.close(); serialWriter = null; }
+    if (serialPort)   { await serialPort.close(); serialPort = null; }
+  } catch(e) { /* ignore */ }
+  brLog('Disconnected.');
+  deviceData = null;
+}
+
+async function readSerialLoop() {
+  let buf = '';
+  try {
+    while (serialReader) {
+      const { value, done } = await serialReader.read();
+      if (done) break;
+      buf += value;
+      const lines = buf.split('\n');
+      buf = lines.pop(); // keep incomplete line
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const msg = JSON.parse(trimmed);
+          handleSerialMessage(msg);
+        } catch(e) {
+          brLog('Parse error: ' + trimmed.substring(0,60));
+        }
+      }
+    }
+  } catch(e) {
+    if (bridgeConnected) {
+      brLog('Connection lost: ' + e.message, 'er');
+      await bridgeDisconnect();
+    }
+  }
+}
+
+function handleSerialMessage(msg) {
+  // ─── v1.1 STREAMING EVENTS ───────────────────────────────────
+  // Pisces Bridge v1.1 streams detection events live without
+  // requiring host polling. Update emulator views in real-time.
+  if (msg.event) {
+    switch (msg.event) {
+      case 'ready':
+        brLog(`Device ready: ${msg.os} ${msg.version}`, 'ok');
+        if (msg.capabilities && msg.capabilities.length) {
+          brLog(`Capabilities: ${msg.capabilities.join(', ')}`, 'ok');
+          window.deviceCapabilities = msg.capabilities;
+        }
+        if (msg.id) {
+          brLog(`Device ID: ${msg.id}`);
+        }
+        break;
+
+      case 'wifi_seen':
+        // Tag onto the live wardrive view if it exists
+        if (window.liveWifiCount === undefined) window.liveWifiCount = 0;
+        window.liveWifiCount++;
+        const wifiLabel = msg.ssid || '(hidden)';
+        const geo = (msg.lat && msg.lng)
+          ? ` @${msg.lat.toFixed(4)},${msg.lng.toFixed(4)}` : '';
+        brLog(`WIFI: ${wifiLabel} [${msg.mac}] RSSI:${msg.rssi}${geo}`);
+        appendDetection('wifi', msg);
+        break;
+
+      case 'ble_seen':
+        if (window.liveBleCount === undefined) window.liveBleCount = 0;
+        window.liveBleCount++;
+        const bleName = msg.name || '(unnamed)';
+        brLog(`BLE: ${bleName} [${msg.mac}] RSSI:${msg.rssi}`);
+        appendDetection('ble', msg);
+        break;
+
+      case 'lora_rx':
+        brLog(`LoRa RX: ${msg.len}B RSSI:${msg.rssi} hex:${(msg.hex||'').substring(0,24)}`);
+        break;
+
+      case 'gps':
+        if (msg.valid) {
+          brLog(`GPS: ${msg.lat.toFixed(6)}, ${msg.lng.toFixed(6)} (${msg.sats} sats)`, 'ok');
+        } else {
+          brLog(`GPS: NO FIX (sats: ${msg.sats || 0})`);
+        }
+        break;
+
+      case 'wifi_scan_done':
+        brLog(`WiFi scan done: ${msg.count} networks`, 'ok');
+        break;
+
+      case 'wardrive_status':
+        brLog(`Wardrive: ${msg.active ? 'ACTIVE' : 'IDLE'}`, msg.active ? 'ok' : '');
+        wdActive = msg.active;
+        const wdBtn = document.getElementById('wd-btn');
+        if (wdBtn) {
+          wdBtn.classList.toggle('on', msg.active);
+          wdBtn.classList.toggle('off', !msg.active);
+        }
+        break;
+
+      case 'thinking':
+        brLog('[AI] Thinking...');
+        break;
+
+      case 'pong':
+        brLog(`PONG ts:${msg.ts}`);
+        break;
+
+      case 'log':
+        brLog(`[device] ${msg.msg}`);
+        break;
+
+      case 'sysinfo':
+        brLog(`SysInfo: ${msg.chip_model} @${msg.cpu_mhz}MHz heap:${msg.free_heap}`);
+        break;
+
+      case 'disconnect':
+        brLog('Device exited bridge mode.');
+        bridgeDisconnect();
+        break;
+
+      case 'timeout':
+        brLog('Connection timeout.', 'er');
+        break;
+
+      default:
+        // Unrecognized event — just log it
+        brLog(`Event: ${msg.event}`);
+    }
+    return;
+  }
+
+  // ─── LEGACY COMMAND/RESPONSE PATTERN ─────────────────────────
+  // Some older bridge implementations correlate via _seq.
+  const seq = msg._seq;
+  if (seq !== undefined && pendingCmds[seq]) {
+    const { resolve } = pendingCmds[seq];
+    delete pendingCmds[seq];
+    resolve(msg);
+  }
+}
+
+// Append a detection to the live feed (used by wardrive view)
+function appendDetection(type, msg) {
+  // Cap the live store so we don't memory-leak during long sessions
+  if (!window.liveDetections) window.liveDetections = [];
+  window.liveDetections.push({ type, ts: Date.now(), data: msg });
+  if (window.liveDetections.length > 500) {
+    window.liveDetections = window.liveDetections.slice(-500);
+  }
+}
+
+function bridgeSend(cmd, args = {}, timeoutMs = 30000) {
+  if (!bridgeConnected || !serialWriter) return Promise.resolve(null);
+  const seq = ++cmdSeq;
+  const msg = JSON.stringify({ cmd, args, _seq: seq }) + '\n';
+  return new Promise((resolve, reject) => {
+    pendingCmds[seq] = { resolve, reject };
+    serialWriter.write(msg).catch(reject);
+    setTimeout(() => {
+      if (pendingCmds[seq]) {
+        delete pendingCmds[seq];
+        resolve(null); // Timeout — return null rather than reject
+      }
+    }, timeoutMs);
+  });
+}
+
+async function pollDeviceStatus() {
+  if (!bridgeConnected) return;
+  try {
+    const resp = await bridgeSend('status', {}, 5000);
+    if (!resp || !resp.ok) return;
+    deviceData = resp.data;
+
+    // Update wardrive display if open
+    if (currentView === 'wardrive' && resp.data.wardrive) {
+      const wd = resp.data.wardrive;
+      document.getElementById('wd-w').textContent = wd.networks;
+      document.getElementById('wd-b').textContent = wd.ble;
+      document.getElementById('wd-log').textContent =
+        `[LIVE] Session: ${wd.logfile} · Active: ${wd.active}`;
+    }
+
+    // Update GPS if open
+    if (currentView === 'gps' && resp.data.gps?.valid) {
+      const g = resp.data.gps;
+      document.getElementById('gps-lat').textContent = g.lat.toFixed(5);
+      document.getElementById('gps-lng').textContent = g.lng.toFixed(5);
+      document.getElementById('gps-s').textContent   = g.sats;
+      document.getElementById('gps-a').textContent   = Math.round(g.alt_ft) + ' FT';
+    }
+
+    // Update status bar GPS
+    if (resp.data.gps?.valid) {
+      document.getElementById('sb-gps').textContent = `🛰 ${resp.data.gps.sats}`;
+    }
+
+  } catch(e) { /* polling errors are non-fatal */ }
+}
+
+// ── HEADER TAP = BACK ────────────────────────────────────
+document.getElementById('main-hdr').addEventListener('click', () => {
+  if (['bios','pin','launcher'].includes(currentView)) return;
+  if (currentView === 'apps') { showView('launcher'); return; }
+  if (wdTimer) { clearInterval(wdTimer); wdTimer = null; }
+  showView('launcher');
+});
+
+// ── INIT ─────────────────────────────────────────────────
+buildLauncher();
+runBios();
+</script>
+</body>
+</html>

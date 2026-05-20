@@ -1,215 +1,168 @@
-# Pisces Moon OS — v1.1.1 "ELF Treaty"
+# Pisces Moon OS
 
-A general-purpose operating system for the LilyGO T-Deck Plus
-(ESP32-S3 handheld computer).
+**ESP32-S3 general-purpose handheld operating system**
 
-**Repo:** github.com/FluidFortune/PiscesMoon  
-**Web:** fluidfortune.com  
+A multi-device OS targeting the LilyGO T-Deck Plus, LilyGO T-LoRa
+Pager, and M5Stack Cardputer ADV. Ships ~50 apps across seven
+categories (Comms, Cyber, Tools, Games, Intel, Media, System).
+
+**Author:** Eric Becker / Fluid Fortune
 **License:** AGPL-3.0-or-later
+**Site:** fluidfortune.com
 
 ---
 
-## What's New in v1.1
+## Supported devices
 
-This release closes a foundational gap in the SPI Bus Treaty and ships
-significant stability fixes for the wardriving subsystem.
+| Device | Display | Input | LoRa | GPS | Battery PMU |
+|---|---|---|---|---|---|
+| **LilyGO T-Deck Plus** | 320×240 ST7789, IPS | Touch + QWERTY + trackball | SX1262 | L76K | AXP2101 |
+| **LilyGO T-LoRa Pager** | 480×222 ST7796U, IPS | QWERTY + rotary encoder | SX1262 | L76K | BQ27220 |
+| **M5Stack Cardputer ADV** | 240×135 ST7789V2, IPS | 56-key QWERTY | SX1262 (Cap LoRa868) | AT6668 (Cap LoRa868) | BAT_ADC |
 
-**Headline changes:**
-- **ELF API v1.1** — third-party ELF modules can now safely access the
-  SD card without violating the SPI Bus Treaty
-- **Random wardrive reboot fixed** — `String` allocation inside mutex
-  was the culprit; replaced with stack-allocated `char[]` buffers
-- **SPI Bus Treaty audit** — 7 apps had SD operations outside the
-  mutex; all fixed (Galaga, Pac-Man, Snake, SimCity, Doom, Notepad,
-  Filesystem)
-- **Filesystem refactor** — file viewer loads to PSRAM under mutex,
-  releases, then paginates without holding the bus
-- **Header tap standardization** — all apps now use `ty < 40` (the
-  v1.1 universal convention)
-
-See `CHANGELOG_v1_1_0.md` for the full list.
-
----
-
-## Hardware
-
-- **Target device:** LilyGO T-Deck Plus
-- **Chip:** ESP32-S3 (8MB PSRAM, 16MB flash)
-- **Display:** 320×240 IPS via ST7789
-- **Input:** GT911 capacitive touch + trackball + QWERTY keyboard
-- **Radio:** SX1262 LoRa
-- **GPS:** L76K via UART
-- **Power:** AXP2101 PMU
-- **Audio:** I2S DAC
-
----
-
-## Build & Flash
-
-This is a PlatformIO project. To build:
-
-```bash
-# Install PlatformIO if not already
-pip install platformio
-
-# Clone and build
-git clone https://github.com/FluidFortune/PiscesMoon.git
-cd PiscesMoon
-pio run -e esp32s3
-
-# Flash to T-Deck (USB-C connected)
-pio run -e esp32s3 -t upload
+Building is per-device:
+```
+pio run -e tdeck_plus
+pio run -e tlorapager
+pio run -e cardputer_adv
 ```
 
-For VS Code users: install the PlatformIO extension, open this folder,
-click "Build" then "Upload" in the bottom toolbar.
+---
 
-### Required: secrets.h
+## Core architecture
 
-Some apps (Gemini Terminal, Voice Terminal) need API keys. Copy the
-example and fill in your keys:
+### Ghost Engine
+A persistent Core-0 task that runs wardrive (WiFi + BLE +
+optionally LoRa observation logging) continuously across app
+launches. Apps that consume the radios coordinate via the SPI
+Bus Treaty mutex; the engine never stops just because an app
+exited.
 
-```bash
-cp include/secrets.h.example include/secrets.h
-# Edit include/secrets.h to add your Gemini API key
-```
+### SPI Bus Treaty
+A `spi_mutex` protects every SPI transaction. Each peripheral
+(display, SD, LoRa, NFC where applicable) takes the mutex with
+a named ownership tag, performs its transaction, and releases.
+500 ms timeout, named ownership logging. Library-free — uses
+our own mutex, not a wrapper around any third-party semaphore.
 
-`secrets.h` is gitignored — your keys never leave your machine.
+On the Cardputer specifically, the display is on a separate SPI
+controller (HSPI) from the shared SD+LoRa bus (FSPI); the Treaty
+only governs the shared bus.
 
-If you don't add keys, the affected apps will gracefully show a
-"no key configured" screen instead of crashing.
+### ELF loader
+Apps can ship as `.elf` files loaded from SD. The loader maps the
+ELF into PSRAM, resolves the small set of host symbols (gfx, sd,
+pm_input, etc.), and hands control to the ELF's entry point.
+Used by RetroPack for per-system emulators.
+
+### Bridge
+USB-CDC JSON protocol. The device acts as a sensor head for
+desktop tooling — Gemini integration, the web emulator at
+`piscesdemo.fluidfortune.com`, or any client that speaks the
+protocol. ~30 event types covering wardrive, BLE, GPS, and
+device telemetry.
+
+### Width-aware rendering
+Apps query `gfx->width()` / `gfx->height()` or per-device
+constants. Headers span full width; game canvases (Snake,
+Pac-Man, Galaga, Chess) keep fixed dimensions and center on
+wider screens. The Cardputer adds a third device-specific layout
+branch for the 240×135 form factor — labels become tighter,
+font sizes mostly textSize=1, and several apps use detail
+sub-screens instead of horizontally-scrolling tables.
 
 ---
 
-## Project Layout
+## Project layout
 
 ```
 PiscesMoon/
-├── platformio.ini           ← Build configuration
-├── partitions.csv           ← Flash partition table
-├── README.md                ← This file
-├── CHANGELOG_v1_1_0.md      ← v1.1 changes
-├── CLA.md                   ← Contributor License Agreement
-│
-├── src/                     ← All .cpp implementation files (60 files)
-│   ├── main.cpp             ← Setup, loop, dual-core task pinning
-│   ├── launcher.cpp         ← Home screen, app dispatch
-│   ├── elf_loader.cpp       ← v1.1 ELF runtime + SD helpers
-│   ├── wardrive.cpp         ← Active scan with treaty compliance
-│   └── ... (all apps)
-│
-├── include/                 ← All .h declarations (56 files)
-│   ├── apps.h               ← Function declarations for every app
-│   ├── elf_loader.h         ← ElfContext + ABI v1.1 surface
-│   ├── theme.h              ← Color constants
-│   ├── secrets.h.example    ← Template — copy to secrets.h
-│   └── ... (all module headers)
-│
+├── README.md                          ← you are here
+├── platformio.ini                     ← three build envs
+├── partitions.csv                     ← T-Deck Plus + T-LoRa Pager partition table
+├── partitions_cardputer.csv           ← Cardputer 8MB partition table
+├── secrets.h                          ← template, no keys (gitignored copy lives elsewhere)
+├── secrets_h.example                  ← same template, distributed publicly
+├── variants/
+│   └── m5stack_cardputer_adv/
+│       └── pins_arduino.h
+├── include/
+│   ├── theme.h                        ← color palette + per-device layout constants
+│   ├── pm_input.h                     ← unified keyboard / trackball / gamepad input
+│   ├── spi_treaty.h                   ← SPI Bus Treaty mutex
+│   ├── text_buffer.h                  ← PSRAM-backed scrollback (Terminal, MicroPython, Notepad)
+│   ├── game_input.h                   ← NES-layout input helper for games
+│   └── pm_disp_tlorapager.h           ← T-LoRa Pager custom display driver
+├── src/
+│   ├── main.cpp                       ← setup() + Ghost Engine task + boot screens
+│   ├── launcher.cpp                   ← T-Deck Plus + T-LoRa Pager launcher
+│   ├── launcher_cardputer.cpp         ← Cardputer launcher (single-row side-scroll)
+│   ├── about_app.cpp / system_app.cpp / etc.   ← ~50 apps
+│   ├── wardrive.cpp                   ← Ghost Engine implementation
+│   ├── bridge_app.cpp                 ← USB-CDC protocol
+│   ├── elf_loader.cpp                 ← ELF runtime
+│   ├── retro_elf_pack.cpp             ← RetroPack browser
+│   └── atari7800/                     ← 7800 emulator (in development)
+│       ├── README.md
+│       └── a7800_main.cpp
 └── docs/
-    ├── CHANGELOG_v1_0_0.md
-    ├── CHANGELOG_v1_0_1.md
-    ├── ELF_v1_1_MIGRATION.md ← How to migrate ELF modules to v1.1
-    └── fluid-fortune-bible.md ← Architecture notes
+    ├── CHANGELOG_v1_2_0.md            ← release notes
+    ├── HANDOFF_SUMMARY.md             ← session log + integration notes
+    └── (cardputer port docs)          ← phase plans, helper files, build instructions
 ```
 
 ---
 
-## SPI Bus Treaty — Quick Reference
+## Building
 
-The T-Deck Plus shares one SPI bus between SD card, LoRa radio, and
-display. Every operation that touches SD or LoRa **must** take
-`spi_mutex` first. This is enforced throughout the OS.
+Requires PlatformIO. From the project root:
 
-For app developers:
+```sh
+# T-Deck Plus
+pio run -e tdeck_plus -t upload
 
-```cpp
-extern SemaphoreHandle_t spi_mutex;
+# T-LoRa Pager
+pio run -e tlorapager -t upload
 
-if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-    FsFile f = sd.open("/my_data.txt", O_WRITE | O_CREAT);
-    if (f) {
-        f.print("hello");
-        f.close();
-    }
-    xSemaphoreGive(spi_mutex);
-}
+# M5Stack Cardputer ADV
+pio run -e cardputer_adv -t upload
 ```
 
-Helper functions (`nosql_*`, `database_*`) handle this internally.
+**First-time flash on each device:** flash the manufacturer's
+factory firmware first to verify hardware, then flash Pisces Moon.
 
-For ELF modules in v1.1+, use the `ctx->sd_*` helpers exposed via
-`ElfContext` — they take the mutex internally so treaty violations
-are impossible. See `docs/ELF_v1_1_MIGRATION.md`.
-
----
-
-## Architecture Highlights
-
-### Dual-Core Task Split
-- **Core 0:** Ghost Engine (background wardrive task)
-- **Core 1:** UI thread (apps, rendering, input)
-
-### Memory Strategy
-- **Heap:** ~280 KB for normal allocation
-- **PSRAM:** 8 MB for buffers, scrollback, ELF modules
-- All large allocations use `ps_malloc()` to target PSRAM
-- No stack allocations >1 KB
-
-### App Categories (7)
-- **TOOLS** — Notepad, Calculator, Clock, Calendar, Etch
-- **COMMS** — WiFi, GPS, Mesh Messenger, Voice Terminal, LoRa PTT
-- **CYBER** — Wardrive, BT Radar, Packet Sniffer, BLE Ducky, etc.
-- **GAMES** — Snake, Pac-Man, Galaga, Chess, Doom, SimCity, Retro ELFs
-- **INTEL** — Gemini Terminal, Reference DBs, SSH, Trails, Baseball
-- **MEDIA** — Audio Player, Audio Recorder
-- **SYSTEM** — File Browser, WiFi File Manager, Bridge, About
-
-### File Types (Pisces Moon Ecosystem)
-- **`.cpp`** — Your app code (logic, drawing, input handling)
-- **`.h`** — Declarations / shared interfaces
-- **`.elf`** — Compiled, loadable third-party module (`/sd/apps/`)
-- **`.bin`** — Full firmware image (the result of `pio run`)
-- **`.json`** — ELF manifest (paired with each `.elf`)
+**Cardputer-specific build:** uses 8 MB flash with `qio_opi` octal
+PSRAM memory mode. The `partitions_cardputer.csv` table is selected
+automatically by the `[env:cardputer_adv]` block in `platformio.ini`.
 
 ---
 
-## Companion Tools
+## Key invariants
 
-These run alongside Pisces Moon:
-
-- **Lety** — Browser-based IDE for Pisces Moon apps  
-  Live: lety.fluidfortune.com  
-  Repo: github.com/FluidFortune/lety
-
-- **SDL2 Emulator** — Run Pisces Moon on Mac/Linux/Windows  
-  Repo: github.com/FluidFortune/emulator
-
-- **Bridge App** — USB Serial bridge for the web emulator  
-  Built into Pisces Moon (SYSTEM → BRIDGE)
-
----
-
-## License
-
-GNU Affero General Public License v3.0 or later. See `CLA.md` for
-contribution terms.
-
-If you fork this project to run as a network service, AGPL requires
-that you publish your modifications under the same license. This is
-intentional — the OS exists to be improved by its users, not enclosed.
+1. **Ghost Engine never stops.** Apps that interact with radios
+   coordinate via the Treaty mutex, but the engine task itself
+   persists.
+2. **No exit on app crash.** App functions return to the launcher
+   on Q/Esc; assertion failure or watchdog reset boots back to
+   the launcher.
+3. **Three devices, one codebase.** Every device-specific path is
+   inside an `#ifdef DEVICE_*` block. Compiling for one device
+   produces output byte-identical to a prior version unless that
+   device's code path changed.
 
 ---
 
-## Credits
+## Documents
 
-- **Author:** Eric Becker / Fluid Fortune (fluidfortune.com)
-- **Hardware platform:** LilyGO T-Deck Plus
-- **Frameworks:** Arduino-ESP32, FreeRTOS, SdFat, Arduino_GFX,
-  TinyGPSPlus, NimBLE, RadioLib, ESP32-audioI2S
-- **AI assistance:** Claude (Anthropic) for development collaboration
-- **Special thanks:** the ESP32 hobbyist community
+- **`docs/CHANGELOG_v1_2_0.md`** — full v1.2.0 release notes
+  including the Cardputer port
+- **`docs/HANDOFF_SUMMARY.md`** — session integration notes
+- **`docs/CARDPUTER_PORT_PLAN.md`** — Cardputer reflow master plan
+  (all 48 apps with layout decisions)
 
 ---
 
-*Pisces Moon OS · v1.1.1 "ELF Treaty" · May 2026*  
-*fluidfortune.com · AGPL-3.0-or-later*
+*The Ghost Engine never stops. The SPI Bus Treaty is why.*
+
+*Pisces Moon OS — Fluid Fortune — fluidfortune.com*
+*AGPL-3.0-or-later*
