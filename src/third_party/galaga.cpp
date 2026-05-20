@@ -1,3 +1,5 @@
+// Retired duplicate. The maintained Galaga implementation is src/galaga.cpp.
+#if 0
 /**
  * PISCES MOON OS — GALAGA
  * Arcade-style space shooter clone for T-Deck Plus (320x240)
@@ -950,3 +952,4 @@ void run_galaga() {
     }
     showGameOver();
 }
+#endif

@@ -30,16 +30,25 @@
 #include <Arduino.h>
 #include <FS.h>
 #include "SdFat.h"
+#ifdef DEVICE_TLORAPAGER
+#include "pm_disp_tlorapager.h"
+#else
 #include <Arduino_GFX_Library.h>
+#endif
 #include "touch.h"
 #include "trackball.h"
 #include "keyboard.h"
+#include "pm_input.h"
 #include "theme.h"
 #include "elf_loader.h"
 #include "gamepad.h"
 #include "apps.h"
 
+#ifdef DEVICE_TLORAPAGER
+extern PMDispTLoRaPager *gfx;
+#else
 extern Arduino_GFX *gfx;
+#endif
 extern SdFat        sd;
 extern bool         exitApp;
 
@@ -414,9 +423,8 @@ static void eb_launch(ElfManifest* apps, int count, int cursor, int scroll) {
 // ─────────────────────────────────────────────
 //  MAIN ENTRY POINT
 // ─────────────────────────────────────────────
-void run_elf_browser() {
+static void run_elf_browser_inner(ElfManifest *apps) {
     // ── Scan /apps/ for ELF manifests ──
-    static ElfManifest apps[24];   // Static: lives in heap, not stack
     int count = elf_scan_apps(apps, 24);
 
     int cursor = 0;
@@ -482,7 +490,7 @@ void run_elf_browser() {
 
         // ── Keyboard ──
         char k = get_keypress();
-        if (k == 'b' || k == 'B' || k == 'q' || k == 'Q') return;
+        if (k == 'b' || k == 'B' || pm_is_exit_key(k)) return;
         if ((k == '\n' || k == '\r' || k == ' ') && count > 0) {
             eb_launch(apps, count, cursor, scroll);
             count = elf_scan_apps(apps, 24);
@@ -556,6 +564,21 @@ void run_elf_browser() {
 
         delay(20);
     }
+}
+
+void run_elf_browser() {
+    ElfManifest *apps = (ElfManifest*)calloc(24, sizeof(ElfManifest));
+    if (!apps) {
+        gfx->fillScreen(EA_BG);
+        gfx->setTextSize(1);
+        gfx->setTextColor(EA_RED);
+        gfx->setCursor(10, 60);
+        gfx->print("ELF browser memory unavailable.");
+        delay(1200);
+        return;
+    }
+    run_elf_browser_inner(apps);
+    free(apps);
 }
 
 
@@ -792,7 +815,7 @@ void run_gamepad_setup() {
         if (tb.x == -1) return;  // Trackball left = exit
 
         char k = get_keypress();
-        if (k == 'b' || k == 'B' || k == 'q' || k == 'Q') return;
+        if (k == 'b' || k == 'B' || pm_is_exit_key(k)) return;
         if (k == 'r' || k == 'R') {
             gamepad_disconnect();
             // Redraw status after disconnect request

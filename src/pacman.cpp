@@ -2,8 +2,8 @@
  * PISCES MOON OS — PAC-MAN
  * Faithful arcade clone for LilyGO T-Deck Plus (320x240)
  *
- * Layout: 8px tiles, 28x31 maze = 224x248px
- * Centered horizontally (48px left margin), 8px top for score strip
+ * Layout: scaled per target so the full 28x31 maze fits on screen.
+ * T-Deck uses 7px tiles, Pager uses 6px tiles, Cardputer uses 4px.
  *
  * Ghost AI (faithful to original):
  * BLINKY  (red)   — targets Pac-Man directly
@@ -11,32 +11,59 @@
  * INKY    (cyan)  — targets using Blinky's position as mirror point
  * CLYDE   (orange)— targets directly if >8 tiles away, else scatter
  *
- * Controls: Trackball direction = next turn intent, WASD fallback, Q=quit
+ * Controls: Trackball direction = next turn intent.
+ * NES keys: A-left, W-up, D-right, Z-down, B-Start/pause, Q-quit.
  */
 
 #include <Arduino.h>
+#include <math.h>
+#ifdef DEVICE_TLORAPAGER
+#include "pm_disp_tlorapager.h"
+#else
 #include <Arduino_GFX_Library.h>
+#endif
 #include <SdFat.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
-#include "touch.h"
 #include "trackball.h"
-#include "keyboard.h"
+#include "game_input.h"
 #include "theme.h"
 #include "pacman.h"
 
+#ifdef DEVICE_TLORAPAGER
+extern PMDispTLoRaPager *gfx;
+#else
 extern Arduino_GFX *gfx;
+#endif
 extern SdFat sd;
 extern SemaphoreHandle_t spi_mutex;
 
 // ─────────────────────────────────────────────
 //  CONSTANTS
 // ─────────────────────────────────────────────
-#define TS          8           // Tile size in pixels
+#ifdef DEVICE_CARDPUTER_ADV
+#define SCREEN_W    240
+#define SCREEN_H    135
+#define TS          4
+#define HUD_H       8
+#define MAZE_TOP    9
+#elif defined(DEVICE_TLORAPAGER)
+#define SCREEN_W    320
+#define SCREEN_H    222
+#define TS          6
+#define HUD_H       12
+#define MAZE_TOP    20
+#else
+#define SCREEN_W    320
+#define SCREEN_H    240
+#define TS          7
+#define HUD_H       14
+#define MAZE_TOP    18
+#endif
 #define MAZE_W      28
 #define MAZE_H      31
-#define MARGIN_X    ((320 - MAZE_W * TS) / 2)   // 48
-#define MARGIN_Y    10          // Score strip height
+#define MARGIN_X    ((SCREEN_W - MAZE_W * TS) / 2)
+#define MARGIN_Y    MAZE_TOP
 #define HS_PATH     "/pacman_hs.txt"
 
 // Tile types
@@ -62,6 +89,8 @@ extern SemaphoreHandle_t spi_mutex;
 
 // Colors (RGB565)
 #define COL_WALL        0x0410   // Dark blue
+#define COL_WALL_HI     0x05FF   // Electric blue edge
+#define COL_WALL_DIM    0x0018   // Deep blue body
 #define COL_DOT         0xFFDF   // Cream
 #define COL_ENERGIZER   0xFFDF
 #define COL_PACMAN      0xFFE0   // Yellow
@@ -103,7 +132,7 @@ static const char MAZE_TEMPLATE[MAZE_H][MAZE_W + 2] = { // FIX: Changed from MAZ
     "W............WW............W",
     "W.WWWW.WWWWW.WW.WWWWW.WWWW.W",
     "W.WWWW.WWWWW.WW.WWWWW.WWWW.W",
-    "Wo..WW.................WW..oW",
+    "Wo..WW................WW..oW",
     "WWW.WW.WW.WWWWWWWW.WW.WW.WWW",
     "WWW.WW.WW.WWWWWWWW.WW.WW.WWW",
     "W......WW....WW....WW......W",
@@ -123,7 +152,7 @@ static int totalDots     = 0;
 // ─────────────────────────────────────────────
 struct Entity {
     int   tx, ty;       // Tile position (whole number)
-    float px, py;       // Pixel position (sub-tile for smooth movement)
+    float px, py;       // Maze-local pixel position, snapped at tile centers
     int   dir;          // Current direction
     int   nextDir;      // Queued direction
     float speed;        // Tiles per tick
@@ -157,11 +186,21 @@ static const int MODE_DURATIONS[] = {70,200,70,200,50,200,50,9999};
 // Frightened duration ticks per stage
 static const int FRIGHTENED_TICKS[] = {60,50,40,30,20,15,10,5,0,0,0,0,0,0,0,0,0,0,0};
 
+static int viewX() {
+    int w = gfx->width();
+    return (w > SCREEN_W) ? (w - SCREEN_W) / 2 : 0;
+}
+
+static int viewY() {
+    int h = gfx->height();
+    return (h > SCREEN_H) ? (h - SCREEN_H) / 2 : 0;
+}
+
 // ─────────────────────────────────────────────
 //  HELPER: tile pixel coords
 // ─────────────────────────────────────────────
-static inline int tileX(int tx) { return MARGIN_X + tx * TS; }
-static inline int tileY(int ty) { return MARGIN_Y + ty * TS; }
+static inline int tileX(int tx) { return viewX() + MARGIN_X + tx * TS; }
+static inline int tileY(int ty) { return viewY() + MARGIN_Y + ty * TS; }
 
 // ─────────────────────────────────────────────
 //  HELPER: direction vectors
@@ -174,24 +213,100 @@ static void dirVec(int dir, int& dx, int& dy) {
     else if (dir == DIR_DOWN)  dy =  1;
 }
 
+static bool isTunnelRow(int ty) {
+    return ty == 14;
+}
+
+static int wrapTx(int tx, int ty) {
+    if (!isTunnelRow(ty)) return tx;
+    if (tx < 0)       return MAZE_W - 1;
+    if (tx >= MAZE_W) return 0;
+    return tx;
+}
+
 // ─────────────────────────────────────────────
 //  HELPER: can move to tile?
 // ─────────────────────────────────────────────
 static bool canEnter(int tx, int ty, bool isGhost = false) {
-    // Wrap tunnel (rows 14)
-    if (tx < 0)       tx = MAZE_W - 1;
-    if (tx >= MAZE_W) tx = 0;
     if (ty < 0 || ty >= MAZE_H) return false;
+    tx = wrapTx(tx, ty);
+    if (tx < 0 || tx >= MAZE_W) return false;
     uint8_t t = maze[ty][tx];
     if (t == T_WALL) return false;
     if (t == T_DOOR && !isGhost) return false;
     return true;
 }
 
-static int wrapTx(int tx) {
-    if (tx < 0)       return MAZE_W - 1;
-    if (tx >= MAZE_W) return 0;
-    return tx;
+static void setEntityTile(Entity &e, int tx, int ty) {
+    e.ty = ty;
+    e.tx = wrapTx(tx, ty);
+    e.px = e.tx * TS;
+    e.py = e.ty * TS;
+}
+
+static bool isEntityCentered(const Entity &e) {
+    return fabsf(e.px - e.tx * TS) < 0.01f &&
+           fabsf(e.py - e.ty * TS) < 0.01f;
+}
+
+static bool nextTileFor(const Entity &e, int dir, bool isGhost,
+                        int &ntx, int &nty, float &targetPx, float &targetPy) {
+    int dx, dy;
+    dirVec(dir, dx, dy);
+    if (dx == 0 && dy == 0) return false;
+
+    int rawTx = e.tx + dx;
+    nty = e.ty + dy;
+    if (!canEnter(rawTx, nty, isGhost)) return false;
+
+    ntx = wrapTx(rawTx, nty);
+    if (dx < 0 && isTunnelRow(e.ty) && rawTx < 0) {
+        targetPx = -TS;
+    } else if (dx > 0 && isTunnelRow(e.ty) && rawTx >= MAZE_W) {
+        targetPx = MAZE_W * TS;
+    } else {
+        targetPx = ntx * TS;
+    }
+    targetPy = nty * TS;
+    return true;
+}
+
+static bool canMoveDir(const Entity &e, int dir, bool isGhost = false) {
+    int ntx, nty;
+    float targetPx, targetPy;
+    return nextTileFor(e, dir, isGhost, ntx, nty, targetPx, targetPy);
+}
+
+static bool advanceEntity(Entity &e, bool isGhost = false) {
+    int dx, dy;
+    dirVec(e.dir, dx, dy);
+    if (dx == 0 && dy == 0) return false;
+
+    int ntx, nty;
+    float targetPx, targetPy;
+    if (!nextTileFor(e, e.dir, isGhost, ntx, nty, targetPx, targetPy)) return false;
+
+    float step = max(0.1f, e.speed * TS);
+    bool reached = false;
+
+    if (dx < 0) {
+        e.px -= step;
+        if (e.px <= targetPx) { e.px = targetPx; reached = true; }
+    } else if (dx > 0) {
+        e.px += step;
+        if (e.px >= targetPx) { e.px = targetPx; reached = true; }
+    } else if (dy < 0) {
+        e.py -= step;
+        if (e.py <= targetPy) { e.py = targetPy; reached = true; }
+    } else if (dy > 0) {
+        e.py += step;
+        if (e.py >= targetPy) { e.py = targetPy; reached = true; }
+    }
+
+    if (reached) {
+        setEntityTile(e, ntx, nty);
+    }
+    return reached;
 }
 
 // ─────────────────────────────────────────────
@@ -217,23 +332,56 @@ static void initMaze() {
 // ─────────────────────────────────────────────
 //  DRAW MAZE
 // ─────────────────────────────────────────────
+static bool isWallAt(int tx, int ty) {
+    if (tx < 0 || tx >= MAZE_W || ty < 0 || ty >= MAZE_H) return false;
+    return maze[ty][tx] == T_WALL;
+}
+
+static void drawWallTile(int tx, int ty) {
+    int px = tileX(tx), py = tileY(ty);
+    gfx->fillRect(px, py, TS, TS, COL_BLACK);
+
+    bool l = isWallAt(tx - 1, ty);
+    bool r = isWallAt(tx + 1, ty);
+    bool u = isWallAt(tx, ty - 1);
+    bool d = isWallAt(tx, ty + 1);
+
+    int cx = px + TS / 2;
+    int cy = py + TS / 2;
+    int thick = (TS >= 7) ? 3 : 2;
+    int half = thick / 2;
+
+    if (!l && !r && !u && !d) {
+        gfx->fillRect(px + 1, py + 1, max(1, TS - 2), max(1, TS - 2), COL_WALL_DIM);
+        gfx->drawRect(px + 1, py + 1, max(1, TS - 2), max(1, TS - 2), COL_WALL_HI);
+        return;
+    }
+
+    if (l) gfx->fillRect(px, cy - half, TS / 2 + 1, thick, COL_WALL_HI);
+    if (r) gfx->fillRect(cx, cy - half, TS - TS / 2, thick, COL_WALL_HI);
+    if (u) gfx->fillRect(cx - half, py, thick, TS / 2 + 1, COL_WALL_HI);
+    if (d) gfx->fillRect(cx - half, cy, thick, TS - TS / 2, COL_WALL_HI);
+    gfx->fillCircle(cx, cy, half + 1, COL_WALL_HI);
+    if (TS >= 6) gfx->drawPixel(cx, cy, 0xFFFF);
+}
+
 static void drawMazeFull() {
-    gfx->fillRect(MARGIN_X, MARGIN_Y, MAZE_W * TS, MAZE_H * TS, COL_BLACK);
+    gfx->fillRect(tileX(0), tileY(0), MAZE_W * TS, MAZE_H * TS, COL_BLACK);
     for (int y = 0; y < MAZE_H; y++) {
         for (int x = 0; x < MAZE_W; x++) {
             int px = tileX(x), py = tileY(y);
             switch (maze[y][x]) {
                 case T_WALL:
-                    gfx->fillRect(px, py, TS, TS, COL_WALL);
+                    drawWallTile(x, y);
                     break;
                 case T_DOT:
-                    gfx->fillRect(px + 3, py + 3, 2, 2, COL_DOT);
+                    gfx->fillCircle(px + TS / 2, py + TS / 2, (TS >= 7) ? 1 : 0, COL_DOT);
                     break;
                 case T_ENERGIZER:
-                    gfx->fillCircle(px + 4, py + 4, 3, COL_ENERGIZER);
+                    gfx->fillCircle(px + TS / 2, py + TS / 2, max(2, TS / 3), COL_ENERGIZER);
                     break;
                 case T_DOOR:
-                    gfx->fillRect(px, py + 3, TS, 2, 0xFBB7); // Pink door
+                    gfx->fillRect(px, py + TS / 2, TS, 2, 0xFBB7); // Pink door
                     break;
                 default: break;
             }
@@ -246,16 +394,16 @@ static void drawTile(int tx, int ty) {
     gfx->fillRect(px, py, TS, TS, COL_BLACK);
     switch (maze[ty][tx]) {
         case T_WALL:
-            gfx->fillRect(px, py, TS, TS, COL_WALL);
+            drawWallTile(tx, ty);
             break;
         case T_DOT:
-            gfx->fillRect(px + 3, py + 3, 2, 2, COL_DOT);
+            gfx->fillCircle(px + TS / 2, py + TS / 2, (TS >= 7) ? 1 : 0, COL_DOT);
             break;
         case T_ENERGIZER:
-            gfx->fillCircle(px + 4, py + 4, 3, COL_ENERGIZER);
+            gfx->fillCircle(px + TS / 2, py + TS / 2, max(2, TS / 3), COL_ENERGIZER);
             break;
         case T_DOOR:
-            gfx->fillRect(px, py + 3, TS, 2, 0xFBB7);
+            gfx->fillRect(px, py + TS / 2, TS, 2, 0xFBB7);
             break;
         default: break;
     }
@@ -268,7 +416,7 @@ static void drawTile(int tx, int ty) {
 // ─────────────────────────────────────────────
 static int loadHS() {
     int score = 0;
-    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+    if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
         if (sd.exists(HS_PATH)) {
             FsFile f = sd.open(HS_PATH, O_READ);
             if (f) {
@@ -278,35 +426,46 @@ static int loadHS() {
                 score = atoi(buf);
             }
         }
-        xSemaphoreGive(spi_mutex);
+        xSemaphoreGiveRecursive(spi_mutex);
     }
     return score;
 }
 static void saveHS(int hs) {
-    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+    if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
         FsFile f = sd.open(HS_PATH, O_WRITE | O_CREAT | O_TRUNC);
         if (f) {
             f.printf("%d", hs);
             f.close();
         }
-        xSemaphoreGive(spi_mutex);
+        xSemaphoreGiveRecursive(spi_mutex);
     }
 }
 
 static void drawHUD() {
-    gfx->fillRect(0, 0, 320, MARGIN_Y, COL_BLACK);
+    int vx = viewX();
+    int vy = viewY();
+    gfx->fillRect(vx, vy, SCREEN_W, HUD_H, COL_BLACK);
     gfx->setTextSize(1);
     gfx->setTextColor(COL_SCORE);
-    gfx->setCursor(MARGIN_X, 1);
+#ifdef DEVICE_CARDPUTER_ADV
+    gfx->setCursor(vx + 2, vy);
+    gfx->printf("S:%d", score);
+    gfx->setCursor(vx + 58, vy);
+    gfx->printf("H:%d", highScore);
+    gfx->setCursor(vx + 112, vy);
+    gfx->printf("L:%d", lives);
+#else
+    gfx->setCursor(vx + 6, vy + 2);
     gfx->printf("SC:%d", score);
-    gfx->setCursor(MARGIN_X + 80, 1);
+    gfx->setCursor(vx + 88, vy + 2);
     gfx->printf("HI:%d", highScore);
-    gfx->setCursor(MARGIN_X + 160, 1);
+    gfx->setCursor(vx + 170, vy + 2);
     gfx->printf("STG:%d", stage);
     // Lives as dots
     for (int i = 0; i < lives; i++) {
-        gfx->fillCircle(MARGIN_X + 220 + i * 10, 5, 3, COL_PACMAN);
+        gfx->fillCircle(vx + 250 + i * 10, vy + 6, 3, COL_PACMAN);
     }
+#endif
 }
 
 // ─────────────────────────────────────────────
@@ -314,8 +473,8 @@ static void drawHUD() {
 // ─────────────────────────────────────────────
 static void erasePac() {
     // pac.px/py are tile-space coords; screen coords need MARGIN added
-    int sx = (int)pac.px + MARGIN_X;
-    int sy = (int)pac.py + MARGIN_Y;
+    int sx = (int)pac.px + viewX() + MARGIN_X;
+    int sy = (int)pac.py + viewY() + MARGIN_Y;
     gfx->fillRect(sx - 1, sy - 1, TS + 2, TS + 2, COL_BLACK);
     // Redraw any maze tiles we covered — use tile-space px/py directly
     for (int dy = -1; dy <= 1; dy++) {
@@ -329,15 +488,29 @@ static void erasePac() {
 }
 
 static void drawPac() {
-    int px = (int)pac.px + MARGIN_X;
-    int py = (int)pac.py + MARGIN_Y;
-    gfx->fillCircle(px + TS/2, py + TS/2, TS/2 - 1, COL_PACMAN);
+    int px = (int)pac.px + viewX() + MARGIN_X;
+    int py = (int)pac.py + viewY() + MARGIN_Y;
+    int cx = px + TS / 2;
+    int cy = py + TS / 2;
+    int r = max(2, TS / 2 - 1);
+    gfx->fillCircle(cx, cy, r, COL_PACMAN);
+    if (TS >= 5) {
+        if (pac.dir == DIR_RIGHT) {
+            gfx->fillTriangle(cx, cy, cx + r + 1, cy - r, cx + r + 1, cy + r, COL_BLACK);
+        } else if (pac.dir == DIR_LEFT) {
+            gfx->fillTriangle(cx, cy, cx - r - 1, cy - r, cx - r - 1, cy + r, COL_BLACK);
+        } else if (pac.dir == DIR_UP) {
+            gfx->fillTriangle(cx, cy, cx - r, cy - r - 1, cx + r, cy - r - 1, COL_BLACK);
+        } else if (pac.dir == DIR_DOWN) {
+            gfx->fillTriangle(cx, cy, cx - r, cy + r + 1, cx + r, cy + r + 1, COL_BLACK);
+        }
+    }
 }
 
 static void eraseGhost(int g) {
     // e.px/py are tile-space; screen coords need MARGIN added
-    int sx = (int)ghosts[g].e.px + MARGIN_X;
-    int sy = (int)ghosts[g].e.py + MARGIN_Y;
+    int sx = (int)ghosts[g].e.px + viewX() + MARGIN_X;
+    int sy = (int)ghosts[g].e.py + viewY() + MARGIN_Y;
     gfx->fillRect(sx - 1, sy - 1, TS + 2, TS + 2, COL_BLACK);
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
@@ -351,8 +524,8 @@ static void eraseGhost(int g) {
 
 static void drawGhost(int g) {
     Ghost& gh = ghosts[g];
-    int px = (int)gh.e.px + MARGIN_X + TS/2;
-    int py = (int)gh.e.py + MARGIN_Y + TS/2;
+    int px = (int)gh.e.px + viewX() + MARGIN_X + TS/2;
+    int py = (int)gh.e.py + viewY() + MARGIN_Y + TS/2;
     uint16_t color;
     if      (gh.state == GS_FRIGHTENED) color = COL_FRIGHTENED;
     else if (gh.state == GS_EATEN)      color = COL_BLACK; // Eyes only
@@ -360,11 +533,14 @@ static void drawGhost(int g) {
 
     if (gh.state != GS_EATEN) {
         // Ghost body: rounded top, skirt bottom
-        gfx->fillCircle(px, py - 1, TS/2 - 1, color);
-        gfx->fillRect(px - TS/2 + 1, py - 1, TS - 2, TS/2, color);
+        int r = max(2, TS / 2 - 1);
+        gfx->fillCircle(px, py - 1, r, color);
+        gfx->fillRect(px - r, py - 1, r * 2 + 1, max(2, TS / 2), color);
         // Skirt bumps
-        for (int b = 0; b < 3; b++)
-            gfx->fillCircle(px - 3 + b * 3, py + TS/2 - 3, 2, color);
+        if (TS >= 5) {
+            for (int b = 0; b < 3; b++)
+                gfx->fillCircle(px - r + b * r, py + TS/2 - 2, 1, color);
+        }
     }
     // Eyes (always visible)
     gfx->fillCircle(px - 2, py - 1, 2, COL_SCORE);
@@ -376,13 +552,42 @@ static void drawGhost(int g) {
     gfx->fillCircle(px + 2 + ex, py - 1 + ey, 1, 0x001F);
 }
 
+static bool waitForPacmanResume() {
+    const int boxW = 132;
+    const int boxH = 44;
+    const int boxX = viewX() + (SCREEN_W - boxW) / 2;
+    const int boxY = viewY() + (SCREEN_H - boxH) / 2;
+    gfx->fillRect(boxX, boxY, boxW, boxH, COL_BLACK);
+    gfx->drawRect(boxX, boxY, boxW, boxH, COL_SCORE);
+    gfx->setTextSize(1);
+    gfx->setTextColor(COL_PACMAN);
+    gfx->setCursor(boxX + 46, boxY + 10);
+    gfx->print("PAUSED");
+    gfx->setTextColor(COL_SCORE);
+    gfx->setCursor(boxX + 10, boxY + 28);
+    gfx->print("B START / Q QUIT");
+
+    while (true) {
+        PMNesInput input = pm_read_nes_input(true);
+        if (input.quit) return false;
+        if (input.start) {
+            drawMazeFull();
+            drawHUD();
+            drawPac();
+            for (int g = 0; g < 4; g++) drawGhost(g);
+            return true;
+        }
+        delay(30);
+        yield();
+    }
+}
+
 // ─────────────────────────────────────────────
 //  ENTITY INIT
 // ─────────────────────────────────────────────
 static void initEntities() {
     // Pac-Man starts at tile (13,23) facing left
-    pac.tx = 13; pac.ty = 23;
-    pac.px = pac.tx * TS; pac.py = pac.ty * TS;
+    setEntityTile(pac, 13, 23);
     pac.dir = DIR_LEFT; pac.nextDir = DIR_LEFT;
     pac.speed = 0.15f;
 
@@ -396,9 +601,7 @@ static void initEntities() {
     const int houseTimers[4] = {0, 30, 80, 160};
 
     for (int i = 0; i < 4; i++) {
-        ghosts[i].e.tx = startX[i]; ghosts[i].e.ty = startY[i];
-        ghosts[i].e.px = startX[i] * TS;
-        ghosts[i].e.py = startY[i] * TS;
+        setEntityTile(ghosts[i].e, startX[i], startY[i]);
         ghosts[i].e.dir  = DIR_LEFT;
         ghosts[i].e.nextDir = DIR_LEFT;
         ghosts[i].e.speed = 0.12f;
@@ -425,6 +628,11 @@ static void getGhostTarget(int g, int& targetX, int& targetY) {
     if (gh.state == GS_SCATTER) {
         targetX = gh.scatterTx;
         targetY = gh.scatterTy;
+        return;
+    }
+    if (gh.state == GS_EATEN) {
+        targetX = 13;
+        targetY = 14;
         return;
     }
 
@@ -492,7 +700,18 @@ static void chooseGhostDir(int g) {
             if (dirs[i] == opp) continue;
             int dx, dy;
             dirVec(dirs[i], dx, dy);
-            int nx = wrapTx(tx + dx), ny = ty + dy;
+            int ny = ty + dy;
+            int nx = wrapTx(tx + dx, ny);
+            if (canEnter(nx, ny, true)) {
+                gh.e.nextDir = dirs[i];
+                return;
+            }
+        }
+        for (int i = 0; i < 4; i++) {
+            int dx, dy;
+            dirVec(dirs[i], dx, dy);
+            int ny = ty + dy;
+            int nx = wrapTx(tx + dx, ny);
             if (canEnter(nx, ny, true)) {
                 gh.e.nextDir = dirs[i];
                 return;
@@ -508,10 +727,23 @@ static void chooseGhostDir(int g) {
             if (d == opp) continue;
             int ddx, ddy;
             dirVec(d, ddx, ddy);
-            int nx = wrapTx(tx + ddx), ny = ty + ddy;
+            int ny = ty + ddy;
+            int nx = wrapTx(tx + ddx, ny);
             if (!canEnter(nx, ny, true)) continue;
             int dist = dist2(nx, ny, targetX, targetY);
             if (dist < bestDist) { bestDist = dist; bestDir = d; }
+        }
+        if (bestDir == DIR_NONE) {
+            for (int i = 0; i < 4; i++) {
+                int d = tryDirs[i];
+                int ddx, ddy;
+                dirVec(d, ddx, ddy);
+                int ny = ty + ddy;
+                int nx = wrapTx(tx + ddx, ny);
+                if (!canEnter(nx, ny, true)) continue;
+                int dist = dist2(nx, ny, targetX, targetY);
+                if (dist < bestDist) { bestDist = dist; bestDir = d; }
+            }
         }
         if (bestDir != DIR_NONE) gh.e.nextDir = bestDir;
     }
@@ -524,9 +756,9 @@ static void moveGhost(int g) {
         gh.houseTimer--;
         if (gh.houseTimer <= 0) {
             gh.state = GS_SCATTER;
-            gh.e.tx = 13; gh.e.ty = 11; // Exit position
-            gh.e.px = gh.e.tx * TS;
-            gh.e.py = gh.e.ty * TS;
+            setEntityTile(gh.e, 13, 11); // Exit position
+            gh.e.dir = DIR_LEFT;
+            gh.e.nextDir = DIR_LEFT;
         }
         return;
     }
@@ -548,27 +780,23 @@ static void moveGhost(int g) {
         gh.e.speed = 0.12f + (stage - 1) * 0.005f;
     }
 
-    // At tile center: choose new direction
-    float cx = gh.e.tx * TS, cy = gh.e.ty * TS;
-    float distToCenter = abs(gh.e.px - cx) + abs(gh.e.py - cy);
-    if (distToCenter < gh.e.speed * 1.5f) {
-        gh.e.px = cx; gh.e.py = cy;
+    if (isEntityCentered(gh.e)) {
         chooseGhostDir(g);
-        gh.e.dir = gh.e.nextDir;
+        if (canMoveDir(gh.e, gh.e.nextDir, true)) {
+            gh.e.dir = gh.e.nextDir;
+        }
+        if (!canMoveDir(gh.e, gh.e.dir, true)) {
+            gh.e.dir = DIR_NONE;
+            return;
+        }
     }
 
-    // Move
-    int dx, dy;
-    dirVec(gh.e.dir, dx, dy);
-    int ntx = wrapTx(gh.e.tx + dx);
-    int nty = gh.e.ty + dy;
-    if (canEnter(ntx, nty, true)) {
-        gh.e.px += dx * gh.e.speed * TS;
-        gh.e.py += dy * gh.e.speed * TS;
-        // Update tile position
-        gh.e.tx = (int)(gh.e.px / TS + 0.5f);
-        gh.e.ty = (int)(gh.e.py / TS + 0.5f);
-        gh.e.tx = wrapTx(gh.e.tx);
+    bool reached = advanceEntity(gh.e, true);
+    if (reached && gh.state == GS_EATEN && gh.e.tx == 13 && gh.e.ty == 14) {
+        gh.state = GS_SCATTER;
+        gh.e.speed = 0.12f;
+        gh.e.dir = DIR_LEFT;
+        gh.e.nextDir = DIR_LEFT;
     }
 }
 
@@ -576,36 +804,18 @@ static void moveGhost(int g) {
 //  PAC-MAN MOVEMENT
 // ─────────────────────────────────────────────
 static void movePac() {
-    float cx = pac.tx * TS, cy = pac.ty * TS;
-    float distToCenter = abs(pac.px - cx) + abs(pac.py - cy);
-
-    if (distToCenter < pac.speed * 1.5f) {
-        pac.px = cx; pac.py = cy;
-
-        // Try to turn if next direction is queued
-        int ndx, ndy;
-        dirVec(pac.nextDir, ndx, ndy);
-        int ntx = wrapTx(pac.tx + ndx), nty = pac.ty + ndy;
-        if (canEnter(ntx, nty)) {
+    if (isEntityCentered(pac)) {
+        if (canMoveDir(pac, pac.nextDir)) {
             pac.dir = pac.nextDir;
         }
-        // If current dir blocked, stop
-        int cdx, cdy;
-        dirVec(pac.dir, cdx, cdy);
-        ntx = wrapTx(pac.tx + cdx); nty = pac.ty + cdy;
-        if (!canEnter(ntx, nty)) return;
+        if (!canMoveDir(pac, pac.dir)) {
+            pac.dir = DIR_NONE;
+            return;
+        }
     }
 
-    int dx, dy;
-    dirVec(pac.dir, dx, dy);
-    int ntx = wrapTx(pac.tx + dx), nty = pac.ty + dy;
-    if (!canEnter(ntx, nty)) return;
-
-    pac.px += dx * pac.speed * TS;
-    pac.py += dy * pac.speed * TS;
-    pac.tx = (int)(pac.px / TS + 0.5f);
-    pac.ty = (int)(pac.py / TS + 0.5f);
-    pac.tx = wrapTx(pac.tx);
+    bool reached = advanceEntity(pac);
+    if (!reached && !isEntityCentered(pac)) return;
 
     // Eat dot or energizer
     uint8_t& tile = maze[pac.ty][pac.tx];
@@ -645,8 +855,8 @@ static bool checkGhostCollision(int g) {
 //  DEATH ANIMATION
 // ─────────────────────────────────────────────
 static void deathAnimation() {
-    int cx = (int)pac.px + MARGIN_X + TS/2;
-    int cy = (int)pac.py + MARGIN_Y + TS/2;
+    int cx = (int)pac.px + viewX() + MARGIN_X + TS/2;
+    int cy = (int)pac.py + viewY() + MARGIN_Y + TS/2;
     for (int r = TS/2; r >= 0; r--) {
         gfx->fillCircle(cx, cy, r, COL_PACMAN);
         delay(60);
@@ -674,19 +884,23 @@ static void stageCompleteFlash() {
 //  GAME OVER SCREEN
 // ─────────────────────────────────────────────
 static void showGameOver() {
-    gfx->fillRect(MARGIN_X + 20, MARGIN_Y + 80, 190, 80, C_DARK);
-    gfx->drawRect(MARGIN_X + 20, MARGIN_Y + 80, 190, 80, COL_PACMAN);
+    int boxW = min(190, SCREEN_W - 20);
+    int boxH = 80;
+    int boxX = viewX() + (SCREEN_W - boxW) / 2;
+    int boxY = viewY() + (SCREEN_H - boxH) / 2;
+    gfx->fillRect(boxX, boxY, boxW, boxH, C_DARK);
+    gfx->drawRect(boxX, boxY, boxW, boxH, COL_PACMAN);
     gfx->setTextSize(2);
     gfx->setTextColor(C_RED);
-    gfx->setCursor(MARGIN_X + 45, MARGIN_Y + 95);
+    gfx->setCursor(boxX + (boxW - 108) / 2, boxY + 15);
     gfx->print("GAME OVER");
     gfx->setTextSize(1);
     gfx->setTextColor(COL_SCORE);
-    gfx->setCursor(MARGIN_X + 50, MARGIN_Y + 122);
+    gfx->setCursor(boxX + 34, boxY + 42);
     gfx->printf("SCORE: %d", score);
     if (score >= highScore && score > 0) {
         gfx->setTextColor(COL_PACMAN);
-        gfx->setCursor(MARGIN_X + 35, MARGIN_Y + 138);
+        gfx->setCursor(boxX + 22, boxY + 58);
         gfx->print("** NEW HIGH SCORE! **");
     }
     delay(3000);
@@ -714,40 +928,30 @@ void run_pacman() {
         // Ready screen
         gfx->setTextSize(1);
         gfx->setTextColor(COL_PACMAN);
-        gfx->setCursor(MARGIN_X + 70, MARGIN_Y + 140);
+        gfx->setCursor(viewX() + (SCREEN_W - 42) / 2, viewY() + SCREEN_H / 2);
         gfx->print("READY!");
         delay(2000);
-        gfx->fillRect(MARGIN_X + 70, MARGIN_Y + 138, 50, 10, COL_BLACK);
+        gfx->fillRect(viewX() + (SCREEN_W - 54) / 2, viewY() + SCREEN_H / 2 - 2, 60, 12, COL_BLACK);
 
         bool stageDone = false;
         bool died      = false;
 
         while (!stageDone && !died) {
             // Input
-            char k = get_keypress();
-            if (k == 'q' || k == 'Q') {
+            PMNesInput input = pm_read_nes_input(true);
+            if (input.quit) {
                 lives = 0; stageDone = true; break;
             }
-            if (k == 'a' || k == 'A') pac.nextDir = DIR_LEFT;
-            if (k == 'd' || k == 'D') pac.nextDir = DIR_RIGHT;
-            if (k == 'w' || k == 'W') pac.nextDir = DIR_UP;
-            if (k == 's' || k == 'S') pac.nextDir = DIR_DOWN;
-
-            TrackballState tb = update_trackball();
-            if (tb.x == -1) pac.nextDir = DIR_LEFT;
-            if (tb.x ==  1) pac.nextDir = DIR_RIGHT;
-            // tb.y = -1 is UP (matches keyboard 'w'), tb.y = 1 is DOWN
-            if (tb.y == -1) pac.nextDir = DIR_UP;
-            if (tb.y ==  1) pac.nextDir = DIR_DOWN;
-            // Y axis is physically inverted on T-Deck Plus trackball —
-            // rolling "up" fires the DOWN pin and vice versa
-            // tb.y handled above
-
-            int16_t tx, ty;
-            if (get_touch(&tx, &ty) && ty < MARGIN_Y) {
-                while (get_touch(&tx, &ty)) { delay(10); }
-                lives = 0; stageDone = true; break;
+            if (input.start) {
+                if (!waitForPacmanResume()) {
+                    lives = 0; stageDone = true; break;
+                }
+                continue;
             }
+            if (input.left)  pac.nextDir = DIR_LEFT;
+            if (input.right) pac.nextDir = DIR_RIGHT;
+            if (input.up)    pac.nextDir = DIR_UP;
+            if (input.down)  pac.nextDir = DIR_DOWN;
 
             // Erase
             erasePac();

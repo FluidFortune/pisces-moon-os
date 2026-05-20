@@ -37,17 +37,26 @@
 
 #include <Arduino.h>
 #include <FS.h>
+#ifdef DEVICE_TLORAPAGER
+#include "pm_disp_tlorapager.h"
+#else
 #include <Arduino_GFX_Library.h>
+#endif
 #include "SdFat.h"
 #include <ArduinoJson.h>
 #include "touch.h"
 #include "trackball.h"
 #include "keyboard.h"
+#include "pm_input.h"
 #include "theme.h"
 #include "baseball.h"
 #include "baseball_fetch.h"
 
+#ifdef DEVICE_TLORAPAGER
+extern PMDispTLoRaPager *gfx;
+#else
 extern Arduino_GFX *gfx;
+#endif
 extern SdFat sd;
 
 // ─────────────────────────────────────────────
@@ -418,6 +427,12 @@ void run_baseball() {
 
     bool inCard = false;
     int cardScroll = 0;
+    bool searchActive =
+#ifdef DEVICE_TLORAPAGER
+        false;
+#else
+        true;
+#endif
 
     while (true) {
         char k = get_keypress();
@@ -444,7 +459,13 @@ void run_baseball() {
             continue;
         }
 
-        if (k == 'q' || k == 'Q') {
+        if (pm_is_exit_key(k) &&
+#ifdef DEVICE_TLORAPAGER
+            (inCard || !searchActive)
+#else
+            true
+#endif
+        ) {
             if (inCard) {
                 inCard = false; cardScroll = 0;
                 drawSearchScreen(query, resultCount, selectedResult, resultScroll);
@@ -464,14 +485,24 @@ void run_baseball() {
             // Search mode
             bool queryChanged = false;
 
+#ifdef DEVICE_TLORAPAGER
+            if (tb.clicked) {
+                searchActive = !searchActive;
+                drawSearchScreen(query, resultCount, selectedResult, resultScroll);
+                delay(120);
+                yield();
+                continue;
+            }
+#endif
+
             // Keyboard input
-            if (k >= 'a' && k <= 'z') { 
+            if (searchActive && k >= 'a' && k <= 'z') { 
                 int ql = strlen(query);
                 if (ql < 30) { query[ql] = k; query[ql+1] = '\0'; queryChanged = true; }
-            } else if (k >= 'A' && k <= 'Z') {
+            } else if (searchActive && k >= 'A' && k <= 'Z') {
                 int ql = strlen(query);
                 if (ql < 30) { query[ql] = k - 'A' + 'a'; query[ql+1] = '\0'; queryChanged = true; }
-            } else if ((k == 8 || k == 127) && strlen(query) > 0) {
+            } else if (searchActive && (k == 8 || k == 127) && strlen(query) > 0) {
                 query[strlen(query)-1] = '\0'; queryChanged = true;
             }
 
@@ -483,12 +514,16 @@ void run_baseball() {
 
             // Trackball navigation
             bool navChanged = false;
-            if (tb.y == -1 && selectedResult > 0) {
+            bool navEnabled = true;
+#ifdef DEVICE_TLORAPAGER
+            navEnabled = !searchActive;
+#endif
+            if (navEnabled && tb.y == -1 && selectedResult > 0) {
                 selectedResult--;
                 if (selectedResult < resultScroll) resultScroll--;
                 navChanged = true;
             }
-            if (tb.y ==  1 && selectedResult < resultCount - 1) {
+            if (navEnabled && tb.y ==  1 && selectedResult < resultCount - 1) {
                 selectedResult++;
                 if (selectedResult >= resultScroll + RESULTS_PER_PAGE)
                     resultScroll++;
@@ -497,7 +532,7 @@ void run_baseball() {
             if (navChanged) drawSearchScreen(query, resultCount, selectedResult, resultScroll);
 
             // F key = open fetch screen
-            if (k == 'f' || k == 'F') {
+            if (navEnabled && (k == 'f' || k == 'F')) {
                 run_baseball_fetch();
                 resultCount = loadIndex(query);
                 selectedResult = 0; resultScroll = 0;
@@ -506,7 +541,7 @@ void run_baseball() {
             }
 
             // Open card
-            if ((tb.clicked || k == 13) && resultCount > 0) {
+            if (((navEnabled && tb.clicked) || (navEnabled && k == 13)) && resultCount > 0) {
                 inCard = true; cardScroll = 0;
                 drawPlayerCard(searchResults[selectedResult].id, cardScroll);
             }

@@ -13,7 +13,7 @@
  * PISCES MOON OS — BRIDGE APP
  * Web Serial bridge for the Pisces Moon Web Emulator.
  *
- * Opens a JSON command/response protocol over USB Serial (115200 baud).
+ * Opens a JSON command/response protocol over USB Serial (921600 baud).
  * Works on any ESP32 — not just the T-Deck Plus.
  * The web emulator at piscesdemo.fluidfortune.com connects via
  * the Web Serial API (Chrome/Edge) and drives the device remotely.
@@ -46,13 +46,18 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
+#ifdef DEVICE_TLORAPAGER
+#include "pm_disp_tlorapager.h"
+#else
 #include <Arduino_GFX_Library.h>
+#endif
 #include <esp_mac.h>
 #include <TinyGPSPlus.h>
 #include "touch.h"
 #include "trackball.h"
 #include "theme.h"
 #include "keyboard.h"
+#include "pm_input.h"
 #include "gemini_client.h"
 #include "wardrive.h"
 #include "pm_promiscuous.h"
@@ -60,7 +65,11 @@
 #include "time.h"
 #include <TinyGPSPlus.h>
 
-extern Arduino_GFX    *gfx;
+#ifdef DEVICE_TLORAPAGER
+extern PMDispTLoRaPager *gfx;
+#else
+extern Arduino_GFX *gfx;
+#endif
 extern SdFat           sd;
 extern TinyGPSPlus     gps;
 extern volatile bool   wifi_in_use;
@@ -114,7 +123,7 @@ static void cmdPing() {
     resp["ok"] = true;
     resp["data"]["pong"]    = true;
     resp["data"]["os"]      = "Pisces Moon OS";
-    resp["data"]["version"] = "1.0.0";
+    resp["data"]["version"] = PISCES_OS_VERSION;
     resp["data"]["codename"]= "The Arsenal";
     resp["data"]["chip"]    = ESP.getChipModel();
     resp["data"]["cores"]   = ESP.getChipCores();
@@ -131,7 +140,9 @@ static void cmdStatus() {
 
     // System
     resp["data"]["os"]        = "Pisces Moon OS";
-    resp["data"]["version"]   = "1.0.0";
+    resp["data"]["version"]      = PISCES_OS_VERSION;
+    resp["data"]["ghost_engine"]  = wardrive_active ? "active" : "idle";
+    resp["data"]["wardrive_mode"] = (wardrive_mode == WARDRIVE_MODE_PROMISCUOUS) ? "promiscuous" : "scan";
     resp["data"]["uptime_s"]  = millis() / 1000;
     resp["data"]["free_heap"] = ESP.getFreeHeap();
     resp["data"]["free_psram"]= ESP.getFreePsram();
@@ -285,7 +296,7 @@ static void cmdLS(JsonObject& args) {
     const char* path = args["path"] | "/";
 
     if (!sd_in_use && spi_mutex &&
-        xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
 
         JsonDocument resp;
         resp["ok"] = true;
@@ -311,7 +322,7 @@ static void cmdLS(JsonObject& args) {
             resp["ok"]    = false;
             resp["error"] = "Cannot open directory";
         }
-        xSemaphoreGive(spi_mutex);
+        xSemaphoreGiveRecursive(spi_mutex);
         serializeJson(resp, Serial);
         Serial.println();
     } else {
@@ -324,11 +335,11 @@ static void cmdCat(JsonObject& args) {
     if (strlen(path) == 0) { sendError("path required"); return; }
 
     if (!sd_in_use && spi_mutex &&
-        xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
 
         FsFile file = sd.open(path, O_READ);
         if (!file || file.isDir()) {
-            xSemaphoreGive(spi_mutex);
+            xSemaphoreGiveRecursive(spi_mutex);
             sendError("File not found or is directory");
             return;
         }
@@ -336,7 +347,7 @@ static void cmdCat(JsonObject& args) {
         uint32_t size = file.fileSize();
         if (size > 4096) {
             file.close();
-            xSemaphoreGive(spi_mutex);
+            xSemaphoreGiveRecursive(spi_mutex);
             sendError("File too large for bridge (max 4KB)");
             return;
         }
@@ -347,7 +358,7 @@ static void cmdCat(JsonObject& args) {
             content += (char)file.read();
         }
         file.close();
-        xSemaphoreGive(spi_mutex);
+        xSemaphoreGiveRecursive(spi_mutex);
 
         JsonDocument resp;
         resp["ok"]            = true;
@@ -581,31 +592,19 @@ static const char* pulse_glyph(bool present, uint32_t last_event_ms) {
 }
 
 // ─────────────────────────────────────────────
-//  TOGGLE PANEL STATE
-//  4 toggles: Wardrive, BLE, GPS, Promiscuous
-//  Trackball up/down to move cursor, click to toggle.
-//  Touch directly on a row also toggles it.
+//  TOGGLE STATE
 // ─────────────────────────────────────────────
-static int  tog_cursor = 0;   // 0=WD 1=BLE 2=GPS 3=PROMISC
-
-// BLE-specific active flag (separate from wardrive BLE)
-// When BLE toggle is OFF, wardrive skips BLE scan phase.
-// Exposed via extern in wardrive.h v1.1.1
+static int  tog_cursor       = 0;
 static bool bridge_ble_enabled = true;
 static bool bridge_gps_enabled = true;
 
-// Layout constants
-#define TOG_X       0
-#define TOG_W       130
-#define TOG_H       20
-#define TOG_Y0      44    // first row y
-#define TOG_GAP     22    // row pitch
-#define VIS_X       135   // visualizer column x
-#define VIS_W       185   // visualizer column width
+// Toggle layout — single horizontal row
+#define TOG_Y       38
+#define TOG_H       18
+#define TOG_ROW_W   78    // each of 4 cells across 320px = 80px each
 
-static const char* tog_labels[] = { "WARDRIVE", "BLE", "GPS", "PROMISC" };
+static const char* tog_short[] = { "WD", "BLE", "GPS", "PM" };
 
-// Returns current ON/OFF state for each toggle
 static bool tog_state(int i) {
     switch (i) {
         case 0: return wardrive_active;
@@ -616,61 +615,52 @@ static bool tog_state(int i) {
     }
 }
 
-// Apply a toggle action
 static void tog_apply(int i) {
     switch (i) {
-        case 0: // Wardrive
+        case 0:
             wardrive_active = !wardrive_active;
             if (!wardrive_active) wardrive_bridge_streaming = false;
             break;
-        case 1: // BLE
+        case 1:
             bridge_ble_enabled = !bridge_ble_enabled;
             break;
-        case 2: // GPS
+        case 2:
             bridge_gps_enabled = !bridge_gps_enabled;
             break;
-        case 3: // Promiscuous
+        case 3:
             if (wardrive_mode == WARDRIVE_MODE_PROMISCUOUS) {
                 wardrive_set_mode(WARDRIVE_MODE_SCAN);
             } else {
                 wardrive_set_mode(WARDRIVE_MODE_PROMISCUOUS);
-                wardrive_active = true;   // promisc implies wardrive on
+                wardrive_active = true;
             }
             break;
     }
 }
 
-// Draw one toggle row
-static void draw_toggle_row(int i, bool force_full) {
-    int y    = TOG_Y0 + i * TOG_GAP;
-    bool on  = tog_state(i);
-    bool sel = (i == tog_cursor);
+static void draw_toggle_row() {
+    for (int i = 0; i < 4; i++) {
+        int x   = i * 80;
+        bool on = tog_state(i);
+        bool sel = (i == tog_cursor);
 
-    // Background
-    gfx->fillRect(TOG_X, y, TOG_W, TOG_H - 1, sel ? C_DARK : C_BLACK);
+        gfx->fillRect(x, TOG_Y, 79, TOG_H, C_DARK);
+        if (sel) gfx->drawRect(x, TOG_Y, 79, TOG_H, C_CYAN);
 
-    // Selection indicator
-    if (sel) {
-        gfx->drawRect(TOG_X, y, TOG_W, TOG_H - 1, C_CYAN);
+        // Label
+        gfx->setCursor(x + 4, TOG_Y + 5);
+        gfx->setTextColor(sel ? C_CYAN : C_WHITE);
+        gfx->setTextSize(1);
+        gfx->print(tog_short[i]);
+
+        // Badge
+        uint16_t bc = on ? C_GREEN : 0x4208;
+        gfx->fillRect(x + 30, TOG_Y + 3, 42, 12, on ? 0x0180 : 0x0841);
+        gfx->drawRect(x + 30, TOG_Y + 3, 42, 12, bc);
+        gfx->setCursor(x + 34, TOG_Y + 5);
+        gfx->setTextColor(bc);
+        gfx->print(on ? " ON " : " OFF");
     }
-
-    // Label
-    gfx->setCursor(TOG_X + 6, y + 6);
-    gfx->setTextColor(sel ? C_CYAN : C_WHITE);
-    gfx->setTextSize(1);
-    gfx->print(tog_labels[i]);
-
-    // ON/OFF badge — flush right
-    uint16_t badge_col = on ? C_GREEN : 0x4208;
-    gfx->fillRect(TOG_X + TOG_W - 32, y + 3, 28, 14, on ? 0x0200 : 0x0841);
-    gfx->drawRect(TOG_X + TOG_W - 32, y + 3, 28, 14, badge_col);
-    gfx->setCursor(TOG_X + TOG_W - 28, y + 6);
-    gfx->setTextColor(badge_col);
-    gfx->print(on ? " ON" : "OFF");
-}
-
-static void draw_all_toggles() {
-    for (int i = 0; i < 4; i++) draw_toggle_row(i, true);
 }
 
 // ─────────────────────────────────────────────
@@ -679,198 +669,168 @@ static void draw_all_toggles() {
 static void drawBridgeShell(bool connected) {
     gfx->fillScreen(C_BLACK);
 
-    // Header
+    // Header bar
     gfx->fillRect(0, 0, 320, 24, C_DARK);
     gfx->drawFastHLine(0, 24, 320, 0x07FF);
     gfx->setCursor(10, 7);
     gfx->setTextColor(0x07FF);
     gfx->setTextSize(1);
-    gfx->print("BRIDGE | TAP HEADER TO EXIT");
+    gfx->print("BRIDGE | " PM_EXIT_COPY);
 
-    // Divider between toggle panel and visualizer
-    gfx->drawFastVLine(TOG_W + 2, 30, 185, 0x4208);
+    // Status strip
+    gfx->fillRect(0, 25, 320, 12, C_DARK);
 
-    // Section labels above visualizer column
+    // Toggle row
+    draw_toggle_row();
+    gfx->drawFastHLine(0, TOG_Y + TOG_H, 320, 0x4208);
+
+    // Section labels
+    int body_top = TOG_Y + TOG_H + 3;
     gfx->setTextColor(0x4208);
     gfx->setTextSize(1);
-    gfx->setCursor(VIS_X, 33);  gfx->print("WIFI");
-    gfx->setCursor(VIS_X + 50, 33); gfx->print("BLE");
-    gfx->setCursor(VIS_X + 95, 33); gfx->print("GPS");
+    gfx->setCursor(8,   body_top);      gfx->print("WiFi");
+    gfx->setCursor(8,   body_top + 22); gfx->print("BLE");
+    gfx->setCursor(8,   body_top + 44); gfx->print("GPS");
+    gfx->setCursor(8,   body_top + 72); gfx->print("LoRa");
 
-    // JSON stream divider
-    gfx->drawFastHLine(0, 132, 320, 0x4208);
-    gfx->setCursor(8, 135);
-    gfx->setTextColor(0x4208);
-    gfx->print("STREAM");
-
-    draw_all_toggles();
+    // Dividers
+    gfx->drawFastHLine(0, body_top + 67, 320, 0x4208);  // above LoRa
+    gfx->drawFastHLine(0, 207,           320, 0x4208);  // above stream
 }
 
 // ─────────────────────────────────────────────
 //  PARTIAL UPDATE — 10Hz
 // ─────────────────────────────────────────────
 static void drawBridgeUpdate(bool connected) {
-    // ── Status strip (top, replaces old) ──────
-    gfx->fillRect(0, 26, 320, 14, C_DARK);
+    extern int      networks_found;
+    extern volatile int bt_found;
+    extern uint32_t last_scan_ms;
+
+    // ── Status strip ──────────────────────────
+    gfx->fillRect(0, 25, 320, 12, C_DARK);
     gfx->setTextSize(1);
 
     gfx->setTextColor(C_GREY);
-    gfx->setCursor(8, 28);
+    gfx->setCursor(8, 27);
     gfx->printf("ID:%s", device_id);
 
     gfx->setTextColor(connected ? C_GREEN : 0xFD20);
-    gfx->setCursor(90, 28);
+    gfx->setCursor(100, 27);
     gfx->print(connected ? "HOST:CONN" : "HOST:----");
 
     bool wd_strm = wardrive_bridge_streaming;
     bool blink   = ((millis() / 500) & 1);
     gfx->setTextColor(wd_strm ? (blink ? C_RED : 0xFD20) : 0x4208);
-    gfx->setCursor(185, 28);
+    gfx->setCursor(200, 27);
     gfx->print(wd_strm ? "STREAMING" : "LOCAL    ");
 
-    gfx->setTextColor(C_GREY);
-    gfx->setCursor(258, 28);
-    gfx->printf("%lu/%lu", (unsigned long)bridge_tx_events,
-                           (unsigned long)bridge_rx_cmds);
+    // ── Toggle row ────────────────────────────
+    draw_toggle_row();
 
-    // ── Toggle rows (left panel) ───────────────
-    draw_all_toggles();
+    // ── Body layout ───────────────────────────
+    int bx  = 44;    // bar start x (after label)
+    int bw  = 252;   // bar width
+    int bh  = 13;
+    int bt  = TOG_Y + TOG_H + 4;  // body top
 
-    // ── Visualizer (right panel) ───────────────
-    extern int networks_total;
-    extern int ble_total;
-    extern int networks_found;
-    extern volatile int bt_found;
-    extern uint32_t last_scan_ms;
-
-    // WiFi bar
-    gfx->fillRect(VIS_X, 42, VIS_W, 14, C_BLACK);
-    int wd = wardrive_active ? min(max(networks_total, networks_found), VIS_WIFI_MAX) : 0;
-    draw_bar(VIS_X, 42, 55, 12, wd, VIS_WIFI_MAX, C_GREEN);
-    gfx->setCursor(VIS_X + 58, 44);
+    // WiFi bar — current scan count only
+    gfx->fillRect(bx, bt, bw + 24, bh, C_BLACK);
+    int wn = wardrive_active ? min(networks_found, VIS_WIFI_MAX) : 0;
+    draw_bar(bx, bt, bw, bh, wn, VIS_WIFI_MAX, C_GREEN);
+    gfx->setCursor(bx + bw + 3, bt + 2);
     gfx->setTextColor(C_GREEN);
-    gfx->printf("%d", networks_total);
+    gfx->printf("%2d", wn);
 
-    // BLE bar
-    gfx->fillRect(VIS_X + 50, 42, 55, 14, C_BLACK);
-    int bd = (wardrive_active && bridge_ble_enabled) ? min((int)bt_found, VIS_BLE_MAX) : 0;
-    draw_bar(VIS_X + 50, 42, 55, 12, bd, VIS_BLE_MAX, 0x07FF);
-    gfx->setCursor(VIS_X + 108, 44);
+    // BLE bar — current window count only
+    gfx->fillRect(bx, bt + 22, bw + 24, bh, C_BLACK);
+    int bn = (wardrive_active && bridge_ble_enabled) ? min((int)bt_found, VIS_BLE_MAX) : 0;
+    draw_bar(bx, bt + 22, bw, bh, bn, VIS_BLE_MAX, 0x07FF);
+    gfx->setCursor(bx + bw + 3, bt + 24);
     gfx->setTextColor(0x07FF);
-    gfx->printf("%d", ble_total);
+    gfx->printf("%2d", bn);
 
-    // GPS status
-    gfx->fillRect(VIS_X + 95, 40, 88, 18, C_BLACK);
-    gfx->setCursor(VIS_X + 97, 44);
+    // GPS line — full width, clean
+    gfx->fillRect(bx, bt + 44, 276, 18, C_BLACK);
     if (!bridge_gps_enabled) {
         gfx->setTextColor(0x4208);
-        gfx->print("OFF");
+        gfx->setCursor(bx, bt + 47);
+        gfx->print("disabled");
     } else if (gps_subsystem_ready() && gps.location.isValid()) {
         gfx->setTextColor(C_GREEN);
-        gfx->print("LOCK");
+        gfx->setCursor(bx, bt + 47);
+        gfx->printf("%.4f  %.4f  %.0fm  %dsat",
+            gps.location.lat(), gps.location.lng(),
+            gps.altitude.meters(), (int)gps.satellites.value());
     } else if (gps_subsystem_ready()) {
         gfx->setTextColor(0xFD20);
-        gfx->print("SRCH");
+        gfx->setCursor(bx, bt + 47);
+        gfx->print("searching...");
     } else {
         gfx->setTextColor(0x4208);
-        gfx->print("N/A");
+        gfx->setCursor(bx, bt + 47);
+        gfx->print("not present");
     }
 
-    // Promiscuous stats (if active) or last scan age
-    gfx->fillRect(VIS_X, 58, VIS_W, 70, C_BLACK);
-    gfx->setTextSize(1);
+    // Promiscuous overlay — replaces GPS line when active
     if (wardrive_mode == WARDRIVE_MODE_PROMISCUOUS && wardrive_active) {
         pm_stats_t ps;
         pm_promiscuous_get_stats(&ps);
-        gfx->setTextColor(C_GREEN);
-        gfx->setCursor(VIS_X, 58);
-        gfx->printf("BCN:%lu", ps.beacon_count);
-        gfx->setTextColor(0x07FF);
-        gfx->setCursor(VIS_X, 70);
-        gfx->printf("PRB:%lu", ps.probe_req_count);
-        gfx->setTextColor(ps.deauth_count ? C_RED : C_GREY);
-        gfx->setCursor(VIS_X, 82);
-        gfx->printf("DTH:%lu", ps.deauth_count);
-        gfx->setTextColor(C_GREY);
-        gfx->setCursor(VIS_X, 94);
-        gfx->printf("ch%-2d %lu/s", pm_promiscuous_channel(), ps.frames_per_sec);
-        if (ps.deauth_count > 0 && ((millis()/400)&1)) {
-            gfx->setTextColor(C_RED);
-            gfx->setCursor(VIS_X, 108);
-            gfx->print("! DEAUTH");
-        }
-    } else {
-        // Scan mode — GPS coords + scan age
-        if (gps_subsystem_ready() && gps.location.isValid()) {
-            gfx->setTextColor(C_GREEN);
-            gfx->setCursor(VIS_X, 58);
-            gfx->printf("%.4f", gps.location.lat());
-            gfx->setCursor(VIS_X, 70);
-            gfx->printf("%.4f", gps.location.lng());
-            gfx->setTextColor(C_GREY);
-            gfx->setCursor(VIS_X, 82);
-            gfx->printf("%.0fm %dsat", gps.altitude.meters(), gps.satellites.value());
-        } else {
-            gfx->setTextColor(0x4208);
-            gfx->setCursor(VIS_X, 58);
-            gfx->print(bridge_gps_enabled ? "NO FIX" : "GPS OFF");
-        }
-        if (last_scan_ms > 0) {
-            uint32_t ago = (millis() - last_scan_ms) / 1000;
-            gfx->setTextColor(0x4208);
-            gfx->setCursor(VIS_X, 96);
-            if (wardrive_active) {
-                gfx->print("scanning...");
-            } else {
-                gfx->printf("%ds ago", (int)ago);
-            }
-        }
+        uint8_t ch = pm_promiscuous_channel();
+        gfx->fillRect(bx, bt + 44, 276, 18, C_BLACK);
+        gfx->setTextColor(ps.deauth_count ? C_RED : C_GREEN);
+        gfx->setCursor(bx, bt + 47);
+        gfx->printf("BCN:%-4lu PRB:%-4lu DTH:%-3lu ch%-2d %lu/s",
+            ps.beacon_count, ps.probe_req_count,
+            ps.deauth_count, ch, ps.frames_per_sec);
     }
 
-    // LoRa trace — narrow strip
-    gfx->fillRect(VIS_X, 110, VIS_W, 18, C_BLACK);
+    // LoRa trace — full width oscilloscope
+    gfx->fillRect(0, 170, 320, 36, C_BLACK);
     if (lora_subsystem_ready()) {
         lora_trace_decay();
-        draw_lora_trace(VIS_X, 110, VIS_W, 18);
+        draw_lora_trace(44, 170, 276, 36);
+        gfx->setTextColor(0x4208);
+        gfx->setCursor(8, 182);
+        gfx->print("TX^");
+        gfx->setCursor(8, 192);
+        gfx->print("RXv");
     } else {
         gfx->setTextColor(0x4208);
-        gfx->setCursor(VIS_X, 114);
-        gfx->print("LoRa N/A");
+        gfx->setCursor(bx, 182);
+        gfx->print("no radio");
     }
 
     // ── Stream line ───────────────────────────
-    gfx->fillRect(0, 136, 320, 30, C_BLACK);
+    gfx->fillRect(0, 208, 320, 18, C_BLACK);
     if (vis_last_json[0]) {
         uint32_t age = millis() - vis_last_json_ms;
-        uint16_t col = (age < 150) ? (vis_last_was_tx ? C_GREEN : 0x07FF)
-                     : (age < VIS_JSON_FADE_MS) ? (vis_last_was_tx ? 0x05E0 : 0x05FF)
+        uint16_t col = age < 200  ? (vis_last_was_tx ? C_GREEN : 0x07FF)
+                     : age < 1200 ? (vis_last_was_tx ? 0x03E0  : 0x03FF)
                      : 0x4208;
         gfx->setTextColor(col);
-        gfx->setCursor(8, 138);
-        gfx->print(vis_last_was_tx ? "<= " : "=> ");
-        char buf[44];
-        int len = strlen(vis_last_json);
-        if (len > 41) { strncpy(buf, vis_last_json, 38); strcpy(buf+38,"..."); }
-        else           strcpy(buf, vis_last_json);
+        gfx->setCursor(4, 210);
+        gfx->print(vis_last_was_tx ? "<" : ">");
+        // Truncate to fit — 52 chars at size 1
+        char buf[53];
+        int  len = strlen(vis_last_json);
+        if (len > 51) { strncpy(buf, vis_last_json, 48); strcpy(buf+48, "..."); }
+        else           strncpy(buf, vis_last_json, 52);
+        buf[52] = 0;
+        gfx->setCursor(12, 210);
         gfx->print(buf);
-        gfx->setTextColor(0x4208);
-        gfx->setCursor(8, 150);
-        gfx->printf("cmd:%s  tx:%lu rx:%lu",
-            last_cmd_label,
-            (unsigned long)bridge_tx_events,
-            (unsigned long)bridge_rx_cmds);
     } else {
         gfx->setTextColor(0x4208);
-        gfx->setCursor(8, 138);
+        gfx->setCursor(4, 210);
         gfx->print("(idle)");
     }
 
     // ── Uptime ────────────────────────────────
-    gfx->fillRect(0, 163, 320, 12, C_BLACK);
+    int footerY = max(0, gfx->height() - 14);
+    gfx->fillRect(0, footerY, gfx->width(), 14, C_DARK);
     uint32_t up = millis() / 1000;
     gfx->setTextColor(0x4208);
-    gfx->setCursor(8, 165);
-    gfx->printf("Up: %02d:%02d:%02d  [W]ard [B]le [G]ps [P]romisc",
+    gfx->setCursor(4, footerY + 3);
+    gfx->printf("Up:%02d:%02d:%02d  [W][B][G][P]  TB:sel  CLK:tog",
         (int)(up/3600), (int)((up/60)%60), (int)(up%60));
 }
 
@@ -910,7 +870,7 @@ void run_bridge() {
     unsigned long lastVisUpdate = 0;
 
     // Announce readiness
-    const char* readyMsg = "{\"event\":\"ready\",\"os\":\"Pisces Moon OS\",\"version\":\"1.1.1\"}";
+    const char* readyMsg = "{\"event\":\"ready\",\"os\":\"Pisces Moon OS\",\"version\":" PISCES_OS_VERSION "}";
     vis_record_tx(readyMsg);
     Serial.println(readyMsg);
 
@@ -926,7 +886,7 @@ void run_bridge() {
             break;
         }
         char k = get_keypress();
-        if (k == 'q' || k == 'Q') {
+        if (pm_is_exit_key(k)) {
             wardrive_bridge_streaming = false;
             const char* msg = "{\"event\":\"disconnect\",\"reason\":\"user_exit\"}";
             vis_record_tx(msg);
@@ -945,12 +905,12 @@ void run_bridge() {
         if (tb.y ==  1 && tog_cursor < 3)  tog_cursor++;
         if (tb.clicked) tog_apply(tog_cursor);
 
-        // Touch — tap a toggle row directly
-        if (get_touch(&tx, &ty) && tx < TOG_W && ty >= TOG_Y0) {
-            int row = (ty - TOG_Y0) / TOG_GAP;
-            if (row >= 0 && row < 4) {
-                tog_cursor = row;
-                tog_apply(row);
+        // Touch — tap a toggle cell directly (horizontal row)
+        if (get_touch(&tx, &ty) && ty >= TOG_Y && ty < TOG_Y + TOG_H) {
+            int col = tx / 80;
+            if (col >= 0 && col < 4) {
+                tog_cursor = col;
+                tog_apply(col);
                 while (get_touch(&tx, &ty)) { delay(10); yield(); }
             }
         }

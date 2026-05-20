@@ -87,8 +87,24 @@ const RetroSystemInfo RETRO_SYSTEMS[SYS_COUNT] = {
 // ============================================================
 //  ROM LIST — static allocation
 // ============================================================
-static RomEntry  _roms[ROM_LIST_MAX];
+static RomEntry* _roms = nullptr;
 static int       _rom_count = 0;
+
+static bool ensure_rom_list() {
+    if (_roms) return true;
+    _roms = (RomEntry*)calloc(ROM_LIST_MAX, sizeof(RomEntry));
+    if (!_roms) {
+        Serial.println("[RETRO] ROM list allocation failed");
+        return false;
+    }
+    return true;
+}
+
+static void free_rom_list() {
+    free(_roms);
+    _roms = nullptr;
+    _rom_count = 0;
+}
 
 // ============================================================
 //  LAYOUT CONSTANTS
@@ -138,6 +154,7 @@ static void strip_ext(const char* filename, char* name_buf, int buf_size) {
 // ============================================================
 static void scan_roms() {
     _rom_count = 0;
+    if (!ensure_rom_list()) return;
 
     for (int s = 0; s < SYS_COUNT && _rom_count < ROM_LIST_MAX; s++) {
         const char* dir_path = RETRO_SYSTEMS[s].dir;
@@ -418,7 +435,7 @@ static void rb_launch(int cursor) {
 // ============================================================
 //  run_retro_pack() — MAIN ENTRY POINT
 // ============================================================
-void run_retro_pack() {
+static void run_retro_pack_inner() {
     scan_roms();
 
     int cursor = 0;
@@ -499,7 +516,7 @@ void run_retro_pack() {
         int16_t tx, ty;
         if (get_touch(&tx, &ty)) {
             while (get_touch(&tx, &ty)) { delay(10); }
-            if (ty < 40) return; // header tap = exit
+            if (ty < 24) return; // header tap = exit
             if (ty >= RB_ROW_Y0 && ty < RB_ROW_MAX && _rom_count > 0) {
                 int slot = (ty - RB_ROW_Y0) / RB_ROW_H;
                 int tgt  = scroll + slot;
@@ -517,4 +534,18 @@ void run_retro_pack() {
 
         delay(20);
     }
+}
+
+void run_retro_pack() {
+    if (!ensure_rom_list()) {
+        gfx->fillScreen(RB_BG);
+        gfx->setTextSize(1);
+        gfx->setTextColor(0xF800);
+        gfx->setCursor(10, 60);
+        gfx->print("ROM browser memory unavailable.");
+        delay(1200);
+        return;
+    }
+    run_retro_pack_inner();
+    free_rom_list();
 }

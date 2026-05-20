@@ -54,6 +54,7 @@
 #include "keyboard.h"
 #include "theme.h"
 #include "lora_voice.h"
+#include "pm_lora_pins.h"
 
 // ── Codec2 optional include ───────────────────────────────────────────────
 // Add meshtastic/ESP32_Codec2 to lib_deps and -DCODEC2_AVAILABLE to
@@ -83,12 +84,12 @@ volatile bool lora_voice_active = false;
 #define LV_RX_COLOR  0x07E0
 
 // ─────────────────────────────────────────────
-//  LORA HARDWARE (T-Deck Plus SX1262)
+//  LORA HARDWARE
 // ─────────────────────────────────────────────
-#define LORA_CS_PIN   9
-#define LORA_RST_PIN  17
-#define LORA_DIO1_PIN 45
-#define LORA_BUSY_PIN 13
+#define LORA_CS_PIN   PM_LORA_CS
+#define LORA_RST_PIN  PM_LORA_RST
+#define LORA_DIO1_PIN PM_LORA_IRQ
+#define LORA_BUSY_PIN PM_LORA_BUSY
 
 // ─────────────────────────────────────────────
 //  AUDIO CONFIG

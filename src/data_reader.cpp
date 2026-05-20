@@ -29,21 +29,38 @@
  *   ESC/Q    — back to list
  */
 
+#ifdef DEVICE_TLORAPAGER
+#include "pm_disp_tlorapager.h"
+#else
 #include <Arduino_GFX_Library.h>
+#endif
 #include "touch.h"
 #include "trackball.h"
 #include "theme.h"
 #include "keyboard.h"
+#include "pm_input.h"
 #include "nosql_store.h"
 #include "apps.h"
 
+#ifdef DEVICE_TLORAPAGER
+extern PMDispTLoRaPager *gfx;
+#else
 extern Arduino_GFX *gfx;
+#endif
 
 // ─────────────────────────────────────────────
 //  HARDWARE CONSTANTS
 // ─────────────────────────────────────────────
+#ifdef DEVICE_TLORAPAGER
+#define SCREEN_W        480
+#define SCREEN_H        222
+#elif defined(DEVICE_CARDPUTER_ADV)
+#define SCREEN_W        240
+#define SCREEN_H        135
+#else
 #define SCREEN_W        320
-#define SCREEN_H        218
+#define SCREEN_H        240
+#endif
 #define HEADER_H        26
 #define FOOTER_H        14
 #define TEXT_START_X    5
@@ -55,9 +72,9 @@ extern Arduino_GFX *gfx;
 
 // Detail viewer geometry
 #define DV_CONTENT_Y    (HEADER_H + 2)
-#define DV_CONTENT_H    (240 - HEADER_H - FOOTER_H)
+#define DV_CONTENT_H    (SCREEN_H - HEADER_H - FOOTER_H)
 #define DV_LINE_H       9     // px per line at textSize(1)
-#define DV_CHARS        52    // chars per line (320-10) / 6
+#define DV_CHARS        ((SCREEN_W - 10) / CHAR_W)
 #define DV_LINES_PER_PAGE   (DV_CONTENT_H / DV_LINE_H)  // ~20
 
 // ─────────────────────────────────────────────
@@ -176,9 +193,9 @@ static void dr_draw_row(int i, int entryIdx, const String &title,
 //  DETAIL VIEWER FOOTER
 // ─────────────────────────────────────────────
 static void dv_draw_footer(int firstLine, int totalLines) {
-    int fy = 240 - FOOTER_H;
-    gfx->fillRect(0, fy, 320, FOOTER_H, C_DARK);
-    gfx->drawFastHLine(0, fy, 320, 0x0421);
+    int fy = SCREEN_H - FOOTER_H;
+    gfx->fillRect(0, fy, SCREEN_W, FOOTER_H, C_DARK);
+    gfx->drawFastHLine(0, fy, SCREEN_W, 0x0421);
     gfx->setTextSize(1);
 
     if (totalLines <= DV_LINES_PER_PAGE) {
@@ -214,7 +231,7 @@ static void dv_draw_footer(int firstLine, int totalLines) {
 //  DETAIL VIEWER PAGE RENDERER
 // ─────────────────────────────────────────────
 static void dv_render_page(String* lines, int lineCount, int firstLine) {
-    gfx->fillRect(0, DV_CONTENT_Y, 320, DV_CONTENT_H, 0x0000);
+    gfx->fillRect(0, DV_CONTENT_Y, SCREEN_W, DV_CONTENT_H, 0x0000);
     gfx->setTextSize(1);
     gfx->setTextColor(C_WHITE);
 
@@ -287,7 +304,7 @@ void dr_view_entry(const char* category, int entryIndex) {
         }
 
         char c = get_keypress();
-        if (c == 27 || c == 'q' || c == 'Q') break;
+        if (c == 27 || pm_is_exit_key(c)) break;
         if (c == ' ') {
             int next = firstLine + DV_LINES_PER_PAGE;
             if (next < lineCount) { firstLine = next; dv_render_page(lines, lineCount, firstLine); }
@@ -310,7 +327,7 @@ void dr_view_entry(const char* category, int entryIndex) {
 // ─────────────────────────────────────────────
 void dr_search_screen(const char* category, const char* display_name) {
     gfx->fillScreen(0x0000);
-    dr_draw_header("SEARCH | HDR: BACK");
+    dr_draw_header("SEARCH", PM_BACK_COPY);
 
     gfx->setCursor(TEXT_START_X, TEXT_START_Y);
     gfx->setTextColor(C_WHITE);
@@ -378,7 +395,7 @@ void dr_search_screen(const char* category, const char* display_name) {
         }
 
         char c = get_keypress();
-        if (c == 27 || c == 'q' || c == 'Q') break;
+        if (c == 27 || pm_is_exit_key(c)) break;
         if (c == ' ') {
             int next = firstLine + DV_LINES_PER_PAGE;
             if (next < lineCount) { firstLine = next; dv_render_page(lines, lineCount, firstLine); }
@@ -445,7 +462,11 @@ void dr_browse(const char* category, const char* display_name) {
         int pg    = (pageStart / MAX_LIST_ROWS) + 1;
         int pgMax = ((total - 1) / MAX_LIST_ROWS) + 1;
         snprintf(hdr, sizeof(hdr), "%s  [%d/%d]", display_name, pg, pgMax);
+#ifdef DEVICE_TLORAPAGER
+        dr_draw_header(hdr, "Q EXIT");
+#else
         dr_draw_header(hdr, "HDR:EXIT");
+#endif
 
         gfx->setTextColor(C_GREY);
         gfx->setTextSize(1);
@@ -539,7 +560,7 @@ void dr_browse(const char* category, const char* display_name) {
         } else if (c == 's' || c == 'S') {
             dr_search_screen(category, display_name);
             redraw = true;
-        } else if (c == 27) {
+        } else if (c == 27 || pm_is_exit_key(c)) {
             return;
         }
 

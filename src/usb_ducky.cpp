@@ -35,15 +35,29 @@
  */
 
 #include <Arduino.h>
+#ifdef DEVICE_TLORAPAGER
+#include "pm_disp_tlorapager.h"
+#else
 #include <Arduino_GFX_Library.h>
+#endif
 #include "SdFat.h"
 #include "touch.h"
 #include "trackball.h"
 #include "keyboard.h"
+#include "pm_input.h"
 #include "theme.h"
 #include "usb_ducky.h"
 
+#ifdef DEVICE_TLORAPAGER
+extern PMDispTLoRaPager *gfx;
+static constexpr int DISP_W = 480;
+#elif defined(DEVICE_CARDPUTER_ADV)
 extern Arduino_GFX *gfx;
+static constexpr int DISP_W = 240;
+#else
+extern Arduino_GFX *gfx;
+static constexpr int DISP_W = 320;
+#endif
 extern SdFat sd;
 
 // ─────────────────────────────────────────────
@@ -70,8 +84,8 @@ extern SdFat sd;
 
 static void udShowWrongBuild() {
     gfx->fillScreen(UD_BG);
-    gfx->fillRect(0, 0, 320, 24, UD_HDR);
-    gfx->drawFastHLine(0, 23, 320, UD_RED);
+    gfx->fillRect(0, 0, DISP_W, 24, UD_HDR);
+    gfx->drawFastHLine(0, 23, DISP_W, UD_RED);
     gfx->setTextColor(UD_RED); gfx->setTextSize(1);
     gfx->setCursor(6, 8); gfx->print("USB DUCKY — WRONG BUILD");
 
@@ -82,7 +96,7 @@ static void udShowWrongBuild() {
     gfx->setCursor(6, 50); gfx->print("Current build: CDC (serial/flash mode)");
     gfx->setCursor(6, 62); gfx->print("USB HID and USB CDC cannot coexist.");
 
-    gfx->drawFastHLine(0, 78, 320, 0x2000);
+    gfx->drawFastHLine(0, 78, DISP_W, 0x2000);
     gfx->setTextColor(UD_ORANGE);
     gfx->setCursor(6, 86); gfx->print("TO ENABLE USB DUCKY:");
     gfx->setTextColor(UD_WHITE);
@@ -96,13 +110,13 @@ static void udShowWrongBuild() {
     gfx->setTextColor(UD_CYAN);
     gfx->setCursor(14, 172); gfx->print("Double-tap RST → UART flash → pio upload");
 
-    gfx->drawFastHLine(0, 188, 320, 0x2000);
+    gfx->drawFastHLine(0, 188, DISP_W, 0x2000);
     gfx->setTextColor(UD_DIM);
     gfx->setCursor(6, 196); gfx->print("BLE Ducky works without reflashing.");
     gfx->setCursor(6, 208); gfx->print("CYBER > BLE DUCKY for wireless injection.");
 
-    gfx->fillRect(0, 220, 320, 20, 0x1000);
-    gfx->drawFastHLine(0, 220, 320, UD_RED);
+    gfx->fillRect(0, 220, DISP_W, 20, 0x1000);
+    gfx->drawFastHLine(0, 220, DISP_W, UD_RED);
     gfx->setTextColor(UD_DIM); gfx->setCursor(100, 228);
     gfx->print("Tap header or Q to exit");
 
@@ -110,7 +124,7 @@ static void udShowWrongBuild() {
         char k = get_keypress();
         int16_t tx, ty;
         if (get_touch(&tx, &ty) && ty < 40) { while(get_touch(&tx,&ty)){delay(10);} return; }
-        if (k == 'q' || k == 'Q') return;
+        if (pm_is_exit_key(k)) return;
         delay(50);
     }
 }
@@ -304,8 +318,8 @@ static void udScanPayloads() {
 //  DRAWING
 // ─────────────────────────────────────────────
 static void udDrawHeader(bool enumerated) {
-    gfx->fillRect(0, 0, 320, 24, UD_HDR);
-    gfx->drawFastHLine(0, 23, 320, UD_RED);
+    gfx->fillRect(0, 0, DISP_W, 24, UD_HDR);
+    gfx->drawFastHLine(0, 23, DISP_W, UD_RED);
     gfx->setTextSize(1);
     gfx->setTextColor(UD_RED);
     gfx->setCursor(6, 4); gfx->print("USB DUCKY");
@@ -317,12 +331,12 @@ static void udDrawHeader(bool enumerated) {
 }
 
 static void udDrawPayloadList(int scroll, int selected) {
-    gfx->fillRect(0, 26, 320, 172, UD_BG);
+    gfx->fillRect(0, 26, DISP_W, 172, UD_BG);
     gfx->setTextSize(1);
     gfx->setTextColor(UD_DIM);
     gfx->setCursor(4, 28);
     gfx->printf("PAYLOADS (%d)  /payloads/", udPayloadCount);
-    gfx->drawFastHLine(0, 37, 320, 0x2000);
+    gfx->drawFastHLine(0, 37, DISP_W, 0x2000);
 
     if (udPayloadCount == 0) {
         gfx->setTextColor(UD_DIM);
@@ -335,7 +349,7 @@ static void udDrawPayloadList(int scroll, int selected) {
     for (int i = scroll; i < scroll + show && i < udPayloadCount; i++) {
         int ry  = 40 + (i - scroll) * 20;
         bool sel = (i == selected);
-        gfx->fillRect(0, ry, 320, 19, sel ? UD_SEL : (i%2==0 ? 0x0821 : UD_BG));
+        gfx->fillRect(0, ry, DISP_W, 19, sel ? UD_SEL : (i%2==0 ? 0x0821 : UD_BG));
         const char* slash = strrchr(udPayloads[i], '/');
         gfx->setTextColor(sel ? UD_ORANGE : 0xC618);
         gfx->setCursor(8, ry + 5);
@@ -345,18 +359,20 @@ static void udDrawPayloadList(int scroll, int selected) {
 }
 
 static void udProgressStatus(const char* lineText, int n, int tot) {
-    gfx->fillRect(0, 198, 320, 42, 0x1000);
-    gfx->drawFastHLine(0, 198, 320, UD_RED);
+    const int y = max(0, gfx->height() - 42);
+    gfx->fillRect(0, y, DISP_W, gfx->height() - y, 0x1000);
+    gfx->drawFastHLine(0, y, DISP_W, UD_RED);
     gfx->setTextSize(1);
     gfx->setTextColor(UD_DIM);
-    gfx->setCursor(4, 202); gfx->printf("Line %d/%d", n, tot);
+    gfx->setCursor(4, y + 4); gfx->printf("Line %d/%d", n, tot);
     if (tot > 0) {
-        int bw = (298 * n) / tot;
-        gfx->fillRect(4, 213, 298, 6, 0x0821);
-        gfx->fillRect(4, 213, bw,  6, UD_RED);
+        int barW = min(298, DISP_W - 8);
+        int bw = (barW * n) / tot;
+        gfx->fillRect(4, y + 15, barW, 6, 0x0821);
+        gfx->fillRect(4, y + 15, bw,   6, UD_RED);
     }
     gfx->setTextColor(UD_ORANGE);
-    gfx->setCursor(4, 222);
+    gfx->setCursor(4, min(y + 24, gfx->height() - 9));
     char buf[44]; strncpy(buf, lineText, 43); buf[43]='\0';
     gfx->print(buf);
 }
@@ -398,8 +414,8 @@ void run_usb_ducky() {
     udDrawHeader(enumerated);
     udDrawPayloadList(scroll, selected);
 
-    gfx->fillRect(0, 210, 320, 30, 0x1000);
-    gfx->drawFastHLine(0, 210, 320, UD_RED);
+    gfx->fillRect(0, 210, DISP_W, 30, 0x1000);
+    gfx->drawFastHLine(0, 210, DISP_W, UD_RED);
     gfx->setTextSize(1);
     gfx->setTextColor(enumerated ? UD_GREEN : UD_ORANGE);
     gfx->setCursor(4, 220);
@@ -411,7 +427,7 @@ void run_usb_ducky() {
         int16_t tx, ty;
 
         if (get_touch(&tx, &ty) && ty < 40) { while(get_touch(&tx,&ty)){delay(10);} break; }
-        if (k == 'q' || k == 'Q') break;
+        if (pm_is_exit_key(k)) break;
 
         if (tb.y == -1 && selected > 0)                { selected--; if(selected<scroll) scroll--; }
         if (tb.y ==  1 && selected < udPayloadCount-1)  { selected++; if(selected>=scroll+7) scroll++; }
@@ -419,30 +435,30 @@ void run_usb_ducky() {
 
         if (tb.clicked && udPayloadCount > 0) {
             udAbort = false;
-            gfx->fillRect(0, 24, 320, 174, UD_BG);
+            gfx->fillRect(0, 24, DISP_W, 174, UD_BG);
             gfx->setTextColor(UD_ORANGE); gfx->setTextSize(1);
             gfx->setCursor(6, 30);
             const char* slash = strrchr(udPayloads[selected], '/');
             gfx->printf("INJECTING: %s", slash ? slash+1 : udPayloads[selected]);
             gfx->setTextColor(UD_DIM); gfx->setCursor(6, 44);
-            gfx->print("Q / tap header to abort.");
+            gfx->print(PM_ABORT_COPY);
 
             udExecutePayload(udPayloads[selected], [](const char* line, int n, int tot){
                 udProgressStatus(line, n, tot);
                 char k2 = get_keypress();
-                if (k2=='q'||k2=='Q') udAbort = true;
+                if (pm_is_exit_key(k2)) udAbort = true;
                 int16_t tx2,ty2;
                 if (get_touch(&tx2,&ty2) && ty2 < 24) udAbort = true;
             });
 
-            gfx->fillRect(0, 198, 320, 42, 0x1000);
-            gfx->drawFastHLine(0, 198, 320, UD_RED);
+            gfx->fillRect(0, 198, DISP_W, 42, 0x1000);
+            gfx->drawFastHLine(0, 198, DISP_W, UD_RED);
             gfx->setTextColor(udAbort ? UD_RED : UD_GREEN);
             gfx->setCursor(4, 220);
             gfx->print(udAbort ? "Payload ABORTED." : "Payload complete.");
             delay(1500);
 
-            gfx->fillRect(0, 24, 320, 216, UD_BG);
+            gfx->fillRect(0, 24, DISP_W, 216, UD_BG);
             udDrawPayloadList(scroll, selected);
         }
 

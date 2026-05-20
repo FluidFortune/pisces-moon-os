@@ -21,19 +21,31 @@
  */
 
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+extern SemaphoreHandle_t spi_mutex;
 #include <SPI.h>
 #include <FS.h>
 #include "SdFat.h"
+#ifdef DEVICE_TLORAPAGER
+#include "pm_disp_tlorapager.h"
+#else
 #include <Arduino_GFX_Library.h>
+#endif
 #include "ghost_partition.h"
 #include "theme.h"
 #include "keyboard.h"
+#include "pm_input.h"
 #include "touch.h"
 
 // ─────────────────────────────────────────────
 //  EXTERNAL DEPENDENCIES
 // ─────────────────────────────────────────────
-extern Arduino_GFX* gfx;
+#ifdef DEVICE_TLORAPAGER
+extern PMDispTLoRaPager *gfx;
+#else
+extern Arduino_GFX *gfx;
+#endif
 extern SdFat sd;            // Main public SdFat instance (Partition 1)
 
 // ─────────────────────────────────────────────
@@ -140,61 +152,75 @@ static void _drawMFAScreen() {
 static void _drawPinScreen(const String& entered, const String& statusMsg, uint16_t statusColor) {
     gfx->fillScreen(C_BLACK);
 
-    // Header bar
-    gfx->fillRect(0, 0, 320, 26, 0x0841);
+    // Read actual display dimensions. T-Deck Plus = 320x240; T-LoraPager = 480x222.
+    const int W = gfx->width();
+    const int H = gfx->height();
+    const int CX = W / 2;
+
+    // Header bar — full width, fixed 26px tall
+    gfx->fillRect(0, 0, W, 26, 0x0841);
     gfx->setTextColor(C_GREEN);
     gfx->setTextSize(1);
     gfx->setCursor(10, 8);
     gfx->print("PISCES MOON OS  //  SECURE BOOT");
 
-    // Lock icon (simple pixel art padlock)
-    int lx = 148, ly = 60;
+    // Lock icon (simple pixel art padlock) — centered horizontally,
+    // positioned just below the header bar.
+    int lx = CX - 12;
+    int ly = 50;
     gfx->fillRect(lx,      ly,      24, 18, 0x4208);   // Body
     gfx->drawRect(lx,      ly,      24, 18, C_GREEN);
     gfx->fillRect(lx + 8,  ly + 6,  8,  8,  C_BLACK);  // Keyhole
     gfx->drawRect(lx + 4,  ly - 10, 16, 14, C_GREEN);  // Shackle outer
     gfx->fillRect(lx + 6,  ly - 10, 12, 12, C_BLACK);  // Shackle inner
 
-    // Title
+    // Title — "ENTER PIN" centered, below lock
     gfx->setTextSize(2);
     gfx->setTextColor(C_WHITE);
-    gfx->setCursor(72, 95);
+    const int titleW = 9 * 12;  // 9 chars * 12px (size-2 char width)
+    gfx->setCursor(CX - titleW / 2, ly + 28);
     gfx->print("ENTER PIN");
 
-    // PIN dots display — shows one dot per character entered
-    int dotStartX = 160 - (PIN_MAX_ATTEMPTS * 14) / 2;
-    for (int i = 0; i < 8; i++) {  // Max 8 dots shown
+    // PIN dots display — up to 8 dots, centered horizontally
+    const int dotCount = 8;
+    const int dotSpacing = 18;
+    const int dotsRowY = ly + 65;
+    int dotStartX = CX - ((dotCount * dotSpacing) / 2) + (dotSpacing / 2);
+    for (int i = 0; i < dotCount; i++) {
         uint16_t dotColor = (i < (int)entered.length()) ? C_GREEN : 0x2104;
-        gfx->fillCircle(dotStartX + (i * 18), 135, 6, dotColor);
+        gfx->fillCircle(dotStartX + (i * dotSpacing), dotsRowY, 6, dotColor);
     }
 
     // Input echo (masked) — shows length only, not characters
     gfx->setTextSize(1);
     gfx->setTextColor(0x4208);
-    gfx->setCursor(10, 155);
+    gfx->setCursor(10, dotsRowY + 18);
     gfx->print("Length: ");
     gfx->setTextColor(C_CYAN);
     gfx->print(entered.length());
     gfx->print(" chars");
 
-    // Status message (errors, lockout countdown)
+    // Status message (errors, lockout countdown) — centered
     if (statusMsg.length() > 0) {
         gfx->setTextSize(1);
         gfx->setTextColor(statusColor);
-        int sx = (320 - statusMsg.length() * 6) / 2;
-        gfx->setCursor(sx, 175);
+        int sx = CX - (statusMsg.length() * 6) / 2;
+        if (sx < 4) sx = 4;
+        gfx->setCursor(sx, dotsRowY + 34);
         gfx->print(statusMsg);
     }
 
-    // Instructions
+    // Instructions — anchored to bottom of screen with safe margin
+    int instrY = H - 14;
     gfx->setTextColor(0x4208);
-    gfx->setCursor(10, 210);
-    gfx->print("ENTER to confirm   BKSP to clear   Q to power off");
+    gfx->setCursor(6, instrY);
+    gfx->print("ENTER=confirm  BKSP=clear  Q=off");
 
-    // Attempt counter (dim, bottom right)
+    // Attempt counter (dim, bottom right) — only if attempts > 0
     if (_attemptCount > 0) {
         gfx->setTextColor(0xF800);
-        gfx->setCursor(250, 225);
+        int attemptW = 14 * 6;  // ~14 chars * 6px (size-1 char width)
+        gfx->setCursor(W - attemptW - 4, instrY - 12);
         gfx->printf("Attempts: %d/%d", _attemptCount, PIN_MAX_ATTEMPTS);
     }
 }
@@ -320,7 +346,12 @@ bool ghost_partition_mount_public(uint8_t csPin, SPIClass& spi) {
 
 #ifdef GHOST_PARTITION_ENABLED
     // Mount with SdSpiConfig — standard single begin() call
-    if (!sd.begin(cfg)) {
+    // SPI Bus Treaty — hold the shared mutex during SD card
+    // initialization so display/LoRa/NFC don't collide.
+    if (spi_mutex) xSemaphoreTakeRecursive(spi_mutex, portMAX_DELAY);
+    bool ok = sd.begin(cfg);
+    if (spi_mutex) xSemaphoreGiveRecursive(spi_mutex);
+    if (!ok) {
         Serial.println("[SD] Public partition (P1) mount failed.");
         return false;
     }
@@ -342,7 +373,10 @@ bool ghost_partition_mount_public(uint8_t csPin, SPIClass& spi) {
 
 #else
     // Standard single-partition mount — identical to original main.cpp behavior
-    return sd.begin(cfg);
+    if (spi_mutex) xSemaphoreTakeRecursive(spi_mutex, portMAX_DELAY);
+    bool ok2 = sd.begin(cfg);
+    if (spi_mutex) xSemaphoreGiveRecursive(spi_mutex);
+    return ok2;
 #endif
 }
 
@@ -368,6 +402,9 @@ void ghost_partition_run_pin_screen() {
     // settle period after the splash animation before the PIN screen
     // renders cleanly. Without this, splash content bleeds through
     // until the first keypress triggers a full redraw.
+#ifdef DEVICE_TDECK_PLUS
+    gfx->setRotation(1);       // T-Deck's known landscape render state.
+#endif
     gfx->fillScreen(0x0000);
     gfx->setCursor(0, 0);       // Reset cursor to origin
     gfx->setTextSize(1);        // Reset text size
@@ -408,7 +445,15 @@ void ghost_partition_run_pin_screen() {
             continue;
         }
 
+        // DIAGNOSTIC — remove once PIN entry is confirmed working
+        Serial.printf("[PIN-DIAG] received char=0x%02X (%d) '%c'  entered='%s' len=%d\n",
+                      (unsigned char)c, (int)(unsigned char)c,
+                      (c >= 32 && c <= 126) ? c : '?',
+                      entered.c_str(), entered.length());
+
         if (c == 13 || c == 10) {
+            Serial.printf("[PIN-DIAG] ENTER pressed. entered.length()=%d, entered='%s'\n",
+                          entered.length(), entered.c_str());
             // ENTER — evaluate PIN
             if (entered.length() == 0) continue;
 
@@ -456,7 +501,7 @@ void ghost_partition_run_pin_screen() {
                 _drawPinScreen(entered, statusMsg, statusColor);
             }
 
-        } else if (c == 'Q' || c == 'q') {
+        } else if (pm_is_exit_key(c)) {
             // Q = Power off / abort (enters Student mode as safe fallback)
             _loadStudentMode();
             return;

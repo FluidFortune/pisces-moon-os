@@ -65,14 +65,29 @@
 #include "SdFat.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#ifdef DEVICE_TLORAPAGER
+#include "pm_disp_tlorapager.h"
+#else
 #include <Arduino_GFX_Library.h>
+#endif
+#include "keyboard.h"
+#include "pm_input.h"
 #include "touch.h"
 #include "theme.h"
 #include "wifi_filemgr.h"
 #include "wardrive.h"
 
 extern SdFat             sd;
-extern Arduino_GFX      *gfx;
+#ifdef DEVICE_TLORAPAGER
+extern PMDispTLoRaPager *gfx;
+static constexpr int DISP_W = 480;
+#elif defined(DEVICE_CARDPUTER_ADV)
+extern Arduino_GFX *gfx;
+static constexpr int DISP_W = 240;
+#else
+extern Arduino_GFX *gfx;
+static constexpr int DISP_W = 320;
+#endif
 extern volatile bool     wifi_in_use;
 extern volatile bool     sd_in_use;
 extern SemaphoreHandle_t spi_mutex;
@@ -329,9 +344,9 @@ static uint32_t _zip_walk(WiFiClient& client,
             if (isDir) {
                 entry.close();
                 // Recurse — release and re-acquire mutex around the recursive call
-                xSemaphoreGive(spi_mutex);
+                xSemaphoreGiveRecursive(spi_mutex);
                 _zip_walk(client, fullSdPath, zipName, streamOffset);
-                xSemaphoreTake(spi_mutex, portMAX_DELAY);
+                xSemaphoreTakeRecursive(spi_mutex, portMAX_DELAY);
             } else {
                 if (_zipFileCount >= ZIP_MAX_FILES) { entry.close(); break; }
 
@@ -454,9 +469,9 @@ static void _handleBackupZip() {
 
     // Walk and stream — hold mutex across each file, release between dirs
     uint32_t streamOffset = 0;
-    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+    if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
         _zip_walk(client, "/", "", streamOffset);
-        xSemaphoreGive(spi_mutex);
+        xSemaphoreGiveRecursive(spi_mutex);
     }
 
     // Write central directory
@@ -522,9 +537,9 @@ static void _selectWalkDir(const String& sdPath,
 
                 // Recurse with increased indent
                 int nextIndent = indent.toInt() + 16;
-                xSemaphoreGive(spi_mutex);
+                xSemaphoreGiveRecursive(spi_mutex);
                 _selectWalkDir(fullPath, String(nextIndent), html);
-                xSemaphoreTake(spi_mutex, portMAX_DELAY);
+                xSemaphoreTakeRecursive(spi_mutex, portMAX_DELAY);
             } else {
                 uint32_t sz = entry.fileSize();
                 String ep   = _htmlEsc(fullPath);
@@ -580,9 +595,9 @@ static void _handleSelectPage() {
             "<th><input type='checkbox' id='all' onchange='selAll(this.checked)'> NAME</th>"
             "<th>SIZE</th><th>DL</th></tr>";
 
-    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
         _selectWalkDir("/", "18", html);
-        xSemaphoreGive(spi_mutex);
+        xSemaphoreGiveRecursive(spi_mutex);
     }
     html += "</table>";
 
@@ -667,7 +682,7 @@ static void _handleRoot() {
                 "<td class='sz'>—</td><td></td></tr>";
     }
 
-    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+    if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
         FsFile dir = sd.open(path.c_str());
         if (dir && dir.isDir()) {
             for (int pass = 0; pass < 2; pass++) {
@@ -705,7 +720,7 @@ static void _handleRoot() {
             }
             dir.close();
         }
-        xSemaphoreGive(spi_mutex);
+        xSemaphoreGiveRecursive(spi_mutex);
     }
     html += "</table>";
 
@@ -738,10 +753,10 @@ static void _handleDownload() {
     if (!_server.hasArg("path")) { _server.send(400,"text/plain","Missing path"); return; }
     String path = _server.arg("path");
 
-    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+    if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
         FsFile file = sd.open(path.c_str(), O_READ);
         if (!file || file.isDir()) {
-            xSemaphoreGive(spi_mutex);
+            xSemaphoreGiveRecursive(spi_mutex);
             _server.send(404,"text/plain","Not found"); return;
         }
         String fname = path.substring(path.lastIndexOf('/')+1);
@@ -755,7 +770,7 @@ static void _handleDownload() {
             client.write(buf, n); yield();
         }
         file.close();
-        xSemaphoreGive(spi_mutex);
+        xSemaphoreGiveRecursive(spi_mutex);
     } else {
         _server.send(503,"text/plain","SD busy");
     }
@@ -796,22 +811,22 @@ static void _handleUploadData() {
         String dest = (_upDir == "/") ? "/" + String(up.filename.c_str())
                                       : _upDir + "/" + String(up.filename.c_str());
         Serial.printf("[FILEMGR] Upload start: %s\n", dest.c_str());
-        if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
             if (!sd.exists(_upDir.c_str())) sd.mkdir(_upDir.c_str());
             _upFile = sd.open(dest.c_str(), O_WRITE | O_CREAT | O_TRUNC);
-            xSemaphoreGive(spi_mutex);
+            xSemaphoreGiveRecursive(spi_mutex);
             _upOk = (bool)_upFile;
         }
         if (!_upOk) Serial.printf("[FILEMGR] Upload open FAILED: %s\n", dest.c_str());
     } else if (up.status == UPLOAD_FILE_WRITE && _upOk) {
-        if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
             _upFile.write(up.buf, up.currentSize);
-            xSemaphoreGive(spi_mutex);
+            xSemaphoreGiveRecursive(spi_mutex);
         }
     } else if (up.status == UPLOAD_FILE_END && _upOk) {
-        if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
             _upFile.close();
-            xSemaphoreGive(spi_mutex);
+            xSemaphoreGiveRecursive(spi_mutex);
         }
         Serial.printf("[FILEMGR] Upload done: %lu B\n", (unsigned long)up.totalSize);
     }
@@ -824,11 +839,11 @@ static void _handleDelete() {
     if (!_server.hasArg("path")) { _server.send(400,"text/plain","Missing path"); return; }
     String path = _server.arg("path");
     String par  = _parentOf(path);
-    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+    if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
         if (sd.exists(path.c_str())) {
             if (!sd.remove(path.c_str())) sd.rmdir(path.c_str());
         }
-        xSemaphoreGive(spi_mutex);
+        xSemaphoreGiveRecursive(spi_mutex);
     }
     _server.sendHeader("Location","/?path="+par);
     _server.send(303);
@@ -842,9 +857,9 @@ static void _handleMkdir() {
     String name = _server.hasArg("d")    ? _server.arg("d")    : "";
     if (name.length() > 0) {
         String np = (base == "/") ? "/" + name : base + "/" + name;
-        if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
             sd.mkdir(np.c_str());
-            xSemaphoreGive(spi_mutex);
+            xSemaphoreGiveRecursive(spi_mutex);
         }
     }
     _server.sendHeader("Location","/?path="+base);
@@ -856,11 +871,11 @@ static void _handleMkdir() {
 // ─────────────────────────────────────────────
 static void _drawScreen(const String& ip) {
     gfx->fillScreen(C_BLACK);
-    gfx->fillRect(0, 0, 320, 24, C_DARK);
-    gfx->drawFastHLine(0, 24, 320, C_GREEN);
+    gfx->fillRect(0, 0, DISP_W, 24, C_DARK);
+    gfx->drawFastHLine(0, 24, DISP_W, C_GREEN);
     gfx->setCursor(10, 7);
     gfx->setTextColor(C_GREEN); gfx->setTextSize(1);
-    gfx->print("WIFI FILE MGR | TAP HEADER TO STOP");
+    gfx->print("WIFI FILE MGR | " PM_STOP_COPY);
 
     gfx->setTextSize(2); gfx->setTextColor(C_WHITE);
     gfx->setCursor(10, 34); gfx->print("SERVER ACTIVE");
@@ -881,10 +896,10 @@ static void _drawScreen(const String& ip) {
     gfx->setCursor(10, 122); gfx->print("If ping fails: router AP isolation ON.");
     gfx->setCursor(10, 134); gfx->print("(Disable 'Client Isolation' in router)");
 
-    gfx->fillRect(0, 210, 320, 30, 0x2000);
-    gfx->drawFastHLine(0, 210, 320, 0xF800);
+    gfx->fillRect(0, 210, DISP_W, 30, 0x2000);
+    gfx->drawFastHLine(0, 210, DISP_W, 0xF800);
     gfx->setTextColor(0xF800); gfx->setCursor(60, 220);
-    gfx->print("TAP HEADER TO STOP SERVER");
+    gfx->print(PM_STOP_COPY " SERVER");
 }
 
 // ─────────────────────────────────────────────
@@ -893,8 +908,8 @@ static void _drawScreen(const String& ip) {
 void run_wifi_filemgr() {
     if (WiFi.status() != WL_CONNECTED) {
         gfx->fillScreen(C_BLACK);
-        gfx->fillRect(0, 0, 320, 24, C_DARK);
-        gfx->drawFastHLine(0, 24, 320, 0xF800);
+        gfx->fillRect(0, 0, DISP_W, 24, C_DARK);
+        gfx->drawFastHLine(0, 24, DISP_W, 0xF800);
         gfx->setCursor(10, 7); gfx->setTextColor(0xF800); gfx->setTextSize(1);
         gfx->print("NOT CONNECTED TO WIFI");
         gfx->setCursor(10, 50); gfx->setTextColor(C_GREY);
@@ -941,6 +956,9 @@ void run_wifi_filemgr() {
         int16_t tx, ty;
         if (get_touch(&tx, &ty) && ty < 40) {
             while (get_touch(&tx, &ty)) { delay(10); yield(); }
+            _serverRunning = false;
+        }
+        if (pm_is_exit_key(get_keypress())) {
             _serverRunning = false;
         }
         delay(2);

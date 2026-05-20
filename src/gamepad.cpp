@@ -18,14 +18,23 @@
 #include <FS.h>
 #include "SdFat.h"
 #include <NimBLEDevice.h>
+#ifdef DEVICE_TLORAPAGER
+#include "pm_disp_tlorapager.h"
+#else
 #include <Arduino_GFX_Library.h>
+#endif
 #include "gamepad.h"
 #include "theme.h"
 #include "keyboard.h"
+#include "pm_input.h"
 #include "trackball.h"
 #include "touch.h"
 
+#ifdef DEVICE_TLORAPAGER
+extern PMDispTLoRaPager* gfx;
+#else
 extern Arduino_GFX* gfx;
+#endif
 extern SdFat        sd;
 
 GamepadState g_gamepad = {};
@@ -180,12 +189,18 @@ void gamepad_init() {
     Serial.println("[GAMEPAD] Init v1.1 — MAC persist + pairing flow");
     strncpy(g_gamepad.device_name, "none", sizeof(g_gamepad.device_name)-1);
 
+    _load_mac();
+    if (!NimBLEDevice::getInitialized()) {
+        Serial.println("[GAMEPAD] NimBLE not ready — reconnect deferred");
+        return;
+    }
+
     NimBLEScan* scan = NimBLEDevice::getScan();
     scan->setActiveScan(true);
     scan->setInterval(200);
     scan->setWindow(150);
 
-    if (_load_mac() && _saved_mac[0]) {
+    if (_saved_mac[0]) {
         if (_connect_by_mac(_saved_mac)) { Serial.println("[GAMEPAD] Reconnected by saved MAC"); return; }
         Serial.println("[GAMEPAD] Saved MAC failed — scan fallback");
     }
@@ -225,7 +240,7 @@ bool gamepad_pair() {
     gfx->fillRect(0, 210, 320, 30, C_DARK);
     gfx->drawFastHLine(0, 210, 320, 0x2104);
     gfx->setTextColor(C_GREY);
-    gfx->setCursor(10, 220); gfx->print("Any key / tap header to cancel");
+    gfx->setCursor(10, 220); gfx->print("Any key / " PM_ABORT_COPY);
 
     // ── Start 30s pairing scan ───────────────────────────────
     NimBLEScan* scan = NimBLEDevice::getScan();
@@ -367,19 +382,17 @@ void gamepad_forget() {
 //  gamepad_poll()
 // ============================================================
 bool gamepad_poll() {
+    static uint16_t last_polled_buttons = 0;
+
+    uint16_t cur = g_gamepad.buttons;
+    g_gamepad.pressed  = cur & ~last_polled_buttons;
+    g_gamepad.released = last_polled_buttons & ~cur;
+    last_polled_buttons = cur;
+
     if (g_gamepad.pressed & GP_HOME) {
         g_gamepad.buttons = g_gamepad.pressed = g_gamepad.released = 0;
+        last_polled_buttons = 0;
         return true;
-    }
-    static uint32_t last_rescan_ms = 0;
-    if (!g_gamepad.connected && millis() - last_rescan_ms > 15000) {
-        last_rescan_ms = millis();
-        if (_saved_mac[0] && !NimBLEDevice::getScan()->isScanning()) {
-            _connect_by_mac(_saved_mac);
-        } else if (!NimBLEDevice::getScan()->isScanning()) {
-            NimBLEDevice::getScan()->setAdvertisedDeviceCallbacks(&_gp_auto_scan_cb, false);
-            NimBLEDevice::getScan()->start(3, false);
-        }
     }
     return false;
 }

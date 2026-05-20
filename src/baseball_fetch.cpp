@@ -41,17 +41,26 @@
 #include <FS.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#ifdef DEVICE_TLORAPAGER
+#include "pm_disp_tlorapager.h"
+#else
 #include <Arduino_GFX_Library.h>
+#endif
 #include "SdFat.h"
 #include <ArduinoJson.h>
 #include "touch.h"
 #include "trackball.h"
 #include "keyboard.h"
+#include "pm_input.h"
 #include "theme.h"
 #include "baseball_fetch.h"
 #include "gemini_client.h"   // For ask_gemini() — historical player lookup
 
+#ifdef DEVICE_TLORAPAGER
+extern PMDispTLoRaPager *gfx;
+#else
 extern Arduino_GFX *gfx;
+#endif
 extern SdFat sd;
 extern volatile bool wifi_in_use;
 
@@ -133,7 +142,7 @@ static bool updateIndex(const char* id, const char* name,
     if (doc["entries"].isNull()) {
         doc.to<JsonObject>();
         doc["category"] = "baseball";
-        doc["version"]  = "1.0";
+        doc["version"]  = "1.2.0";
         doc["entries"].to<JsonArray>();
     }
 
@@ -540,7 +549,12 @@ void run_baseball_fetch() {
         while (true) {
             int16_t tx, ty; TrackballState tb = update_trackball();
             if (get_touch(&tx,&ty) && ty<40) { while(get_touch(&tx,&ty)){delay(10);} break; }
-            if (tb.clicked || get_keypress() == 'q') break;
+            char k = get_keypress();
+#ifdef DEVICE_TLORAPAGER
+            if (pm_is_exit_key(k)) break;
+#else
+            if (tb.clicked || pm_is_exit_key(k)) break;
+#endif
             delay(50);
         }
         return;
@@ -548,6 +562,12 @@ void run_baseball_fetch() {
 
     char query[48] = "";
     int mode = 0;
+    bool inputActive =
+#ifdef DEVICE_TLORAPAGER
+        false;
+#else
+        true;
+#endif
     drawFetchScreen(query, mode);
 
     while (true) {
@@ -559,7 +579,32 @@ void run_baseball_fetch() {
             while(get_touch(&tx,&ty)){delay(10);}
             break;
         }
-        if (k == 'q' || k == 'Q') break;
+        if (pm_is_exit_key(k) &&
+#ifdef DEVICE_TLORAPAGER
+            !inputActive
+#else
+            true
+#endif
+        ) break;
+
+#ifdef DEVICE_TLORAPAGER
+        if (tb.clicked) {
+            inputActive = !inputActive;
+            drawFetchScreen(query, mode, inputActive ? PM_TEXT_ACTIVE_COPY : PM_TEXT_COPY);
+            delay(120);
+            yield();
+            continue;
+        }
+        if (!inputActive) {
+            if (k == 9) {
+                mode = 1 - mode;
+                drawFetchScreen(query, mode);
+            }
+            delay(40);
+            yield();
+            continue;
+        }
+#endif
 
         if (k == 9) {
             mode = 1 - mode;
@@ -576,7 +621,11 @@ void run_baseball_fetch() {
             if (ql < 46) { query[ql] = k; query[ql+1] = '\0'; changed = true; }
         } else if ((k == 8 || k == 127) && strlen(query) > 0) {
             query[strlen(query)-1] = '\0'; changed = true;
-        } else if ((k == 13 || tb.clicked) && strlen(query) > 0) {
+        } else if ((k == 13
+#ifndef DEVICE_TLORAPAGER
+                    || tb.clicked
+#endif
+                   ) && strlen(query) > 0) {
             drawFetchScreen(query, mode);
             fetchClearStatus();
 

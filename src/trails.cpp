@@ -43,17 +43,31 @@
 #include <FS.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#ifdef DEVICE_TLORAPAGER
+#include "pm_disp_tlorapager.h"
+#else
 #include <Arduino_GFX_Library.h>
+#endif
 #include "SdFat.h"
 #include <ArduinoJson.h>
 #include "touch.h"
 #include "trackball.h"
 #include "keyboard.h"
+#include "pm_input.h"
 #include "theme.h"
 #include "trails.h"
 #include "gemini_client.h"
 
+#ifdef DEVICE_TLORAPAGER
+extern PMDispTLoRaPager *gfx;
+static constexpr int DISP_W = 480;
+#elif defined(DEVICE_CARDPUTER_ADV)
 extern Arduino_GFX *gfx;
+static constexpr int DISP_W = 240;
+#else
+extern Arduino_GFX *gfx;
+static constexpr int DISP_W = 320;
+#endif
 extern SdFat sd;
 extern volatile bool wifi_in_use;
 
@@ -135,8 +149,8 @@ static int loadTrailIndex(const char* query) {
 //  HEADER
 // ─────────────────────────────────────────────
 static void drawTrailHeader(const char* title, bool showFetch = false) {
-    gfx->fillRect(0, 0, 320, 24, COL_HDR);
-    gfx->drawFastHLine(0, 23, 320, COL_ACCENT);
+    gfx->fillRect(0, 0, DISP_W, 24, COL_HDR);
+    gfx->drawFastHLine(0, 23, DISP_W, COL_ACCENT);
     gfx->setTextSize(1); gfx->setTextColor(COL_NAME);
     gfx->setCursor(8, 8); gfx->print(title);
     gfx->setTextColor(COL_DIM);
@@ -222,7 +236,7 @@ static void drawTrailCard(const char* entryId, int scrollY) {
 
     // Name plate
     { if (y+28>=28 && y<240) {
-        gfx->fillRect(0, y, 320, 26, 0x0820);
+        gfx->fillRect(0, y, DISP_W, 26, 0x0820);
         gfx->setTextSize(2); gfx->setTextColor(COL_NAME);
         gfx->setCursor(8, y+5);
         // Truncate long names
@@ -272,7 +286,7 @@ static void drawTrailCard(const char* entryId, int scrollY) {
     } y += 13; }
 
     // Divider
-    { if (y+4>=28 && y<240) gfx->drawFastHLine(0, y+2, 320, COL_ACCENT); y += 8; }
+    { if (y+4>=28 && y<240) gfx->drawFastHLine(0, y+2, DISP_W, COL_ACCENT); y += 8; }
 
     // Description
     { if (y+12>=28 && y<240) {
@@ -290,7 +304,7 @@ static void drawTrailCard(const char* entryId, int scrollY) {
     }
 
     // Waypoints
-    { if (y+4>=28 && y<240) gfx->drawFastHLine(0, y+2, 320, 0x2104); y += 8;
+    { if (y+4>=28 && y<240) gfx->drawFastHLine(0, y+2, DISP_W, 0x2104); y += 8;
       if (y+12>=28 && y<240) {
         gfx->setTextColor(COL_LABEL); gfx->setCursor(8, y+2); gfx->print("WAYPOINTS:");
       } y += 12;
@@ -305,7 +319,7 @@ static void drawTrailCard(const char* entryId, int scrollY) {
     }
 
     // Hazards
-    { if (y+4>=28 && y<240) gfx->drawFastHLine(0, y+2, 320, 0x2104); y += 8;
+    { if (y+4>=28 && y<240) gfx->drawFastHLine(0, y+2, DISP_W, 0x2104); y += 8;
       if (y+12>=28 && y<240) {
         gfx->setTextColor(COL_HAZARD); gfx->setCursor(8, y+2); gfx->print("HAZARDS:");
       } y += 12;
@@ -321,7 +335,7 @@ static void drawTrailCard(const char* entryId, int scrollY) {
     }
 
     // Emergency
-    { if (y+4>=28 && y<240) gfx->drawFastHLine(0, y+2, 320, 0x2104); y += 8;
+    { if (y+4>=28 && y<240) gfx->drawFastHLine(0, y+2, DISP_W, 0x2104); y += 8;
       if (y+12>=28 && y<240) {
         gfx->setTextColor(COL_HAZARD); gfx->setCursor(8, y+2); gfx->print("EMERGENCY:");
       } y += 12;
@@ -370,7 +384,7 @@ static bool updateTrailIndex(const char* id, const char* name,
     }
     if (doc["entries"].isNull()) {
         doc.to<JsonObject>();
-        doc["category"] = "trails"; doc["version"] = "1.0";
+        doc["category"] = "trails"; doc["version"] = "1.2.0";
         doc["entries"].to<JsonArray>();
     }
     JsonArray arr = doc["entries"].as<JsonArray>();
@@ -407,10 +421,16 @@ static void runTrailFetch() {
 
     char query[64] = "";
     bool fetching = false;
+    bool inputActive =
+#ifdef DEVICE_TLORAPAGER
+        false;
+#else
+        true;
+#endif
     int statusY = 70;
 
     auto status = [&](const char* msg, uint16_t col = COL_VALUE) {
-        gfx->fillRect(0, statusY, 320, 12, COL_BG);
+        gfx->fillRect(0, statusY, DISP_W, 12, COL_BG);
         gfx->setTextColor(col); gfx->setCursor(8, statusY); gfx->print(msg);
         statusY += 13; if (statusY > 220) statusY = 70;
     };
@@ -421,16 +441,39 @@ static void runTrailFetch() {
         int16_t tx, ty;
 
         if (get_touch(&tx, &ty) && ty < 40) { while(get_touch(&tx,&ty)){delay(10);} break; }
-        if (k == 'q' || k == 'Q') break;
+        if (pm_is_exit_key(k) &&
+#ifdef DEVICE_TLORAPAGER
+            !inputActive
+#else
+            true
+#endif
+        ) break;
+
+#ifdef DEVICE_TLORAPAGER
+        if (!fetching && tb.clicked) {
+            inputActive = !inputActive;
+            status(inputActive ? PM_TEXT_ACTIVE_COPY : PM_TEXT_COPY, COL_DIM);
+            delay(120); yield();
+            continue;
+        }
+        if (!fetching && !inputActive) {
+            delay(40); yield();
+            continue;
+        }
+#endif
 
         bool changed = false;
         if (!fetching) {
-            if (k >= 32 && k <= 126 && k != 'q' && k != 'Q') {
+            if (k >= 32 && k <= 126) {
                 int ql = strlen(query);
                 if (ql < 62) { query[ql] = k; query[ql+1] = '\0'; changed = true; }
             } else if ((k == 8 || k == 127) && strlen(query) > 0) {
                 query[strlen(query)-1] = '\0'; changed = true;
-            } else if ((k == 13 || tb.clicked) && strlen(query) > 0) {
+            } else if ((k == 13
+#ifndef DEVICE_TLORAPAGER
+                        || tb.clicked
+#endif
+                       ) && strlen(query) > 0) {
                 fetching = true;
                 status("Asking Gemini for trail data...", COL_ACCENT);
 
@@ -526,6 +569,12 @@ void run_trails() {
 
     bool inCard = false;
     int  cardScroll = 0;
+    bool searchActive =
+#ifdef DEVICE_TLORAPAGER
+        false;
+#else
+        true;
+#endif
 
     while (true) {
         char k = get_keypress();
@@ -544,7 +593,13 @@ void run_trails() {
             } else break;
             continue;
         }
-        if (k == 'q' || k == 'Q') {
+        if (pm_is_exit_key(k) &&
+#ifdef DEVICE_TLORAPAGER
+            (inCard || !searchActive)
+#else
+            true
+#endif
+        ) {
             if (inCard) { inCard=false; cardScroll=0; drawSearchScreen(query,resCount,selResult,resScroll); }
             else break;
             continue;
@@ -557,23 +612,33 @@ void run_trails() {
             if (tb.clicked || k==13) { inCard=false; cardScroll=0; drawSearchScreen(query,resCount,selResult,resScroll); }
             if (ch) drawTrailCard(results[selResult].id, cardScroll);
         } else {
-            if (k=='f'||k=='F') {
+            bool navEnabled = true;
+#ifdef DEVICE_TLORAPAGER
+            if (tb.clicked) {
+                searchActive = !searchActive;
+                drawSearchScreen(query,resCount,selResult,resScroll);
+                delay(120); yield();
+                continue;
+            }
+            navEnabled = !searchActive;
+#endif
+            if (navEnabled && (k=='f'||k=='F')) {
                 runTrailFetch();
                 resCount=loadTrailIndex(query); selResult=resScroll=0;
                 drawSearchScreen(query,resCount,selResult,resScroll);
                 continue;
             }
             bool qch = false;
-            if (k>='a'&&k<='z') { int l=strlen(query); if(l<30){query[l]=k;query[l+1]='\0';qch=true;} }
-            else if (k>='A'&&k<='Z') { int l=strlen(query); if(l<30){query[l]=k-'A'+'a';query[l+1]='\0';qch=true;} }
-            else if ((k==8||k==127)&&strlen(query)>0) { query[strlen(query)-1]='\0'; qch=true; }
+            if (searchActive && k>='a'&&k<='z') { int l=strlen(query); if(l<30){query[l]=k;query[l+1]='\0';qch=true;} }
+            else if (searchActive && k>='A'&&k<='Z') { int l=strlen(query); if(l<30){query[l]=k-'A'+'a';query[l+1]='\0';qch=true;} }
+            else if (searchActive && (k==8||k==127)&&strlen(query)>0) { query[strlen(query)-1]='\0'; qch=true; }
             if (qch) { resCount=loadTrailIndex(query); selResult=resScroll=0; drawSearchScreen(query,resCount,selResult,resScroll); }
 
             bool nav=false;
-            if (tb.y==-1&&selResult>0) { selResult--; if(selResult<resScroll)resScroll--; nav=true; }
-            if (tb.y== 1&&selResult<resCount-1) { selResult++; if(selResult>=resScroll+RESULTS_PER_PAGE)resScroll++; nav=true; }
+            if (navEnabled && tb.y==-1&&selResult>0) { selResult--; if(selResult<resScroll)resScroll--; nav=true; }
+            if (navEnabled && tb.y== 1&&selResult<resCount-1) { selResult++; if(selResult>=resScroll+RESULTS_PER_PAGE)resScroll++; nav=true; }
             if (nav) drawSearchScreen(query,resCount,selResult,resScroll);
-            if ((tb.clicked||k==13)&&resCount>0) { inCard=true; cardScroll=0; drawTrailCard(results[selResult].id,cardScroll); }
+            if (((navEnabled && tb.clicked) || (navEnabled && k==13))&&resCount>0) { inCard=true; cardScroll=0; drawTrailCard(results[selResult].id,cardScroll); }
         }
         delay(40); yield();
     }

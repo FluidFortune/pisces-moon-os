@@ -28,6 +28,7 @@
 #include "SdFat.h"
 #include <Arduino_GFX_Library.h>
 #include "elf_loader.h"
+#include "elf_sandbox.h"
 #include "gamepad.h"    // g_gamepad, GP_* masks, gamepad_poll()
 #include "trackball.h"  // update_trackball() for error screen dismiss
 #include "theme.h"      // C_BLACK, C_GREEN, C_WHITE, C_GREY, C_DARK, C_RED
@@ -40,6 +41,7 @@
 namespace _elf_internal {
     void*   psram_region      = nullptr;
     size_t  psram_region_size = 0;
+    char    current_elf_name[32] = "";  // Name of currently running ELF (for sandbox)
     bool    elf_running       = false;
 }
 
@@ -135,13 +137,13 @@ static int elf_sd_open_read(const char* path) {
     int h = _elf_sd::alloc_handle();
     if (h < 0) return ELF_SD_HANDLE_INVALID;
 
-    if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    if (xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
         _elf_sd::in_use[h] = false;
         return ELF_SD_HANDLE_INVALID;
     }
     _elf_sd::handles[h] = sd.open(path, O_READ);
     bool ok = (bool)_elf_sd::handles[h];
-    xSemaphoreGive(spi_mutex);
+    xSemaphoreGiveRecursive(spi_mutex);
 
     if (!ok) {
         _elf_sd::in_use[h] = false;
@@ -155,7 +157,7 @@ static int elf_sd_open_write(const char* path, bool append) {
     int h = _elf_sd::alloc_handle();
     if (h < 0) return ELF_SD_HANDLE_INVALID;
 
-    if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    if (xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
         _elf_sd::in_use[h] = false;
         return ELF_SD_HANDLE_INVALID;
     }
@@ -163,7 +165,7 @@ static int elf_sd_open_write(const char* path, bool append) {
                        : (O_WRITE | O_CREAT | O_TRUNC);
     _elf_sd::handles[h] = sd.open(path, flags);
     bool ok = (bool)_elf_sd::handles[h];
-    xSemaphoreGive(spi_mutex);
+    xSemaphoreGiveRecursive(spi_mutex);
 
     if (!ok) {
         _elf_sd::in_use[h] = false;
@@ -177,9 +179,9 @@ static int elf_sd_read(int handle, void* buf, int len) {
     if (!_elf_sd::in_use[handle] || !buf || len <= 0) return -1;
     if (!spi_mutex) return -1;
 
-    if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return -1;
+    if (xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return -1;
     int n = _elf_sd::handles[handle].read(buf, len);
-    xSemaphoreGive(spi_mutex);
+    xSemaphoreGiveRecursive(spi_mutex);
     return n;
 }
 
@@ -188,9 +190,9 @@ static int elf_sd_write(int handle, const void* buf, int len) {
     if (!_elf_sd::in_use[handle] || !buf || len <= 0) return -1;
     if (!spi_mutex) return -1;
 
-    if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return -1;
+    if (xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return -1;
     int n = _elf_sd::handles[handle].write((const uint8_t*)buf, len);
-    xSemaphoreGive(spi_mutex);
+    xSemaphoreGiveRecursive(spi_mutex);
     return n;
 }
 
@@ -199,40 +201,40 @@ static void elf_sd_close(int handle) {
     if (!_elf_sd::in_use[handle]) return;
 
     // close() flushes — needs the bus
-    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
         if (_elf_sd::handles[handle]) _elf_sd::handles[handle].close();
-        xSemaphoreGive(spi_mutex);
+        xSemaphoreGiveRecursive(spi_mutex);
     }
     _elf_sd::in_use[handle] = false;
 }
 
 static bool elf_sd_exists(const char* path) {
     if (!path || !spi_mutex) return false;
-    if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
+    if (xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
     bool ok = sd.exists(path);
-    xSemaphoreGive(spi_mutex);
+    xSemaphoreGiveRecursive(spi_mutex);
     return ok;
 }
 
 static bool elf_sd_mkdir(const char* path) {
     if (!path || !spi_mutex) return false;
-    if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
+    if (xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
     bool ok = sd.mkdir(path);
-    xSemaphoreGive(spi_mutex);
+    xSemaphoreGiveRecursive(spi_mutex);
     return ok;
 }
 
 static bool elf_sd_remove(const char* path) {
     if (!path || !spi_mutex) return false;
-    if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
+    if (xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
     bool ok = sd.remove(path);
-    xSemaphoreGive(spi_mutex);
+    xSemaphoreGiveRecursive(spi_mutex);
     return ok;
 }
 
 static int elf_sd_size(const char* path) {
     if (!path || !spi_mutex) return -1;
-    if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return -1;
+    if (xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return -1;
     int sz = -1;
     if (sd.exists(path)) {
         FsFile f = sd.open(path, O_READ);
@@ -241,7 +243,7 @@ static int elf_sd_size(const char* path) {
             f.close();
         }
     }
-    xSemaphoreGive(spi_mutex);
+    xSemaphoreGiveRecursive(spi_mutex);
     return sz;
 }
 
@@ -272,9 +274,9 @@ void elf_build_context(ElfContext* ctx, const char* rom_path) {
     ctx->sd       = &sd;
     ctx->gamepad  = &g_gamepad;  // global GamepadState from gamepad.h
 
-    // Display geometry — ST7789 on T-Deck Plus
-    ctx->screen_w = 320;
-    ctx->screen_h = 240;
+    // Display geometry — exported to ELFs so they can reflow per device.
+    ctx->screen_w = gfx ? gfx->width() : 320;
+    ctx->screen_h = gfx ? gfx->height() : 240;
 
     // SPI Bus Treaty flags
     ctx->wifi_in_use  = &wifi_in_use;
@@ -344,16 +346,16 @@ bool elf_load_manifest(const char* elf_filename, ElfManifest* out) {
             return false;
     }
 
-    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+    if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
         Serial.println("[ELF] manifest read: mutex timeout");
         return false;
     }
     FsFile f = sd.open(json_path, O_RDONLY);
-    if (!f) { if (spi_mutex) xSemaphoreGive(spi_mutex); return false; }
+    if (!f) { if (spi_mutex) xSemaphoreGiveRecursive(spi_mutex); return false; }
     char buf[512];
     size_t n = f.read(buf, sizeof(buf) - 1);
     f.close();
-    if (spi_mutex) xSemaphoreGive(spi_mutex);
+    if (spi_mutex) xSemaphoreGiveRecursive(spi_mutex);
     if (n == 0) return false;
     buf[n] = '\0';
 
@@ -452,13 +454,14 @@ bool elf_load_manifest(const char* elf_filename, ElfManifest* out) {
 int elf_scan_apps(ElfManifest* manifests, int max_count) {
     int found = 0;
 
-    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+    if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
         Serial.println("[ELF] elf_scan_apps: mutex timeout");
         return 0;
     }
     FsFile dir = sd.open("/apps");
     if (!dir || !dir.isDirectory()) {
         Serial.println("[ELF] /apps/ directory not found on SD");
+        if (spi_mutex) xSemaphoreGiveRecursive(spi_mutex);
         return 0;
     }
 
@@ -494,7 +497,7 @@ int elf_scan_apps(ElfManifest* manifests, int max_count) {
         entry.close();
     }
     dir.close();
-    if (spi_mutex) xSemaphoreGive(spi_mutex);
+    if (spi_mutex) xSemaphoreGiveRecursive(spi_mutex);
 
     Serial.printf("[ELF] Scan complete: %d ELF modules found in /apps/\n", found);
     return found;
@@ -527,13 +530,13 @@ int elf_scan_apps(ElfManifest* manifests, int max_count) {
 // ============================================================
 ElfLoadResult elf_execute(const char* elf_path, ElfContext* ctx) {
     // --- Open ELF file ---
-    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+    if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
         Serial.printf("[ELF] elf_execute: mutex timeout for %s\n", elf_path);
         return ELF_NOT_FOUND;
     }
     FsFile f = sd.open(elf_path, O_RDONLY);
     if (!f) {
-        if (spi_mutex) xSemaphoreGive(spi_mutex);
+        if (spi_mutex) xSemaphoreGiveRecursive(spi_mutex);
         Serial.printf("[ELF] File not found: %s\n", elf_path);
         return ELF_NOT_FOUND;
     }
@@ -542,6 +545,7 @@ ElfLoadResult elf_execute(const char* elf_path, ElfContext* ctx) {
     if (file_size < 52) {
         // Smaller than the minimum 32-bit ELF header
         f.close();
+        if (spi_mutex) xSemaphoreGiveRecursive(spi_mutex);
         Serial.printf("[ELF] File too small (%u bytes): %s\n", file_size, elf_path);
         return ELF_BAD_MAGIC;
     }
@@ -551,6 +555,7 @@ ElfLoadResult elf_execute(const char* elf_path, ElfContext* ctx) {
     f.read(magic, 4);
     if (magic[0] != 0x7F || magic[1] != 'E' || magic[2] != 'L' || magic[3] != 'F') {
         f.close();
+        if (spi_mutex) xSemaphoreGiveRecursive(spi_mutex);
         Serial.printf("[ELF] Bad magic bytes in: %s\n", elf_path);
         return ELF_BAD_MAGIC;
     }
@@ -562,12 +567,27 @@ ElfLoadResult elf_execute(const char* elf_path, ElfContext* ctx) {
     f.read(&e_entry_raw, sizeof(uint32_t));
     f.seek(0); // Rewind for full read
 
+#ifdef DEVICE_NO_PSRAM
+    // ─────────────────────────────────────────────────────────
+    //  No-PSRAM device (Cardputer ADV). ELF apps need PSRAM for
+    //  the load region; we don't fall back to internal SRAM
+    //  because real apps exceed the ~300KB free internal heap
+    //  budget. Fail fast with a clear error. The launcher hides
+    //  the ELF app category entirely on no-PSRAM builds.
+    // ─────────────────────────────────────────────────────────
+    (void)e_entry_raw;
+    f.close();
+    if (spi_mutex) xSemaphoreGiveRecursive(spi_mutex);
+    Serial.println("[ELF] No PSRAM on this device — ELF apps not supported");
+    return ELF_NO_PSRAM;
+#else
     // --- PSRAM allocation ---
     // CONFIG_SPIRAM_USE_MALLOC=1 routes ps_malloc to PSRAM automatically.
     // Add 16 bytes for alignment padding.
     void* region = ps_malloc(file_size + 16);
     if (!region) {
         f.close();
+        if (spi_mutex) xSemaphoreGiveRecursive(spi_mutex);
         Serial.printf("[ELF] ps_malloc(%u) failed — not enough PSRAM\n", file_size + 16);
         return ELF_NO_PSRAM;
     }
@@ -578,6 +598,15 @@ ElfLoadResult elf_execute(const char* elf_path, ElfContext* ctx) {
     // --- Load ELF into PSRAM ---
     size_t bytes_read = f.read((void*)base, file_size);
     f.close();
+
+    // SPI Treaty: release the bus now. The remainder of this function
+    // (ELF parsing, sandbox setup, actual user-code execution) does
+    // not touch SD or any other SPI peripheral. Holding the mutex
+    // through ELF execution would block all other SPI operations
+    // for the entire lifetime of the loaded module — potentially
+    // many seconds — and was the cause of the v1.2.0 elf_execute
+    // mutex leak (see SPI-TREATY-AUDIT.md Bug 1).
+    if (spi_mutex) xSemaphoreGiveRecursive(spi_mutex);
 
     if (bytes_read != file_size) {
         free(region);
@@ -607,17 +636,38 @@ ElfLoadResult elf_execute(const char* elf_path, ElfContext* ctx) {
     Serial.printf("[ELF] Loaded %u bytes to PSRAM @ 0x%08X, entry @ 0x%08X\n",
                   file_size, (unsigned)base, (unsigned)entry);
 
-    // --- Execute ---
+    // Store PSRAM region in context for sandbox triage
+    ctx->psram_base = (void*)base;
+    ctx->psram_size = file_size;
+
+    // --- Execute via sandbox ---
     _elf_internal::elf_running = true;
-    int result = entry((void*)ctx);
+
+    // Try hardware sandbox first (ESP32-S3 PMS + exception handler)
+    // Falls back to direct call on non-S3 hardware
+    SandboxResult sr = elf_sandbox_run(ctx, entry, _elf_internal::current_elf_name);
+
     _elf_internal::elf_running = false;
 
-    Serial.printf("[ELF] Module exited with code %d\n", result);
+    if (sr == SANDBOX_FAULT) {
+        elf_sandbox_print_fault();
+        Serial.println("[ELF] Module killed by sandbox — OS is safe, Ghost Engine unaffected");
+        elf_free_psram();
+        return ELF_EXEC_ERROR;
+    }
+
+    int result = elf_last_fault.exit_code;
+    Serial.printf("[ELF] Module exited with code %d (sandbox: %s)\n",
+                  result,
+                  sr == SANDBOX_OK    ? "clean" :
+                  sr == SANDBOX_NO_HW ? "unsandboxed" :
+                  sr == SANDBOX_TIMEOUT ? "timeout" : "unknown");
 
     // --- Cleanup ---
     elf_free_psram();
 
     return (result == 0) ? ELF_OK : ELF_EXEC_ERROR;
+#endif // DEVICE_NO_PSRAM
 }
 
 // ============================================================
@@ -684,7 +734,8 @@ ElfLoadResult elf_launch_from_browser(const char* full_sd_path) {
     // --- Loading screen ---
     // Matches the OS header-bar convention: 24px header, content below
     gfx->fillScreen(C_BLACK);
-    gfx->fillRect(0, 0, 320, 24, C_DARK);
+    int screenW = gfx ? gfx->width() : 320;
+    gfx->fillRect(0, 0, screenW, 24, C_DARK);
     gfx->setTextColor(C_GREEN);
     gfx->setTextSize(1);
     gfx->setCursor(6, 7);
@@ -738,7 +789,7 @@ ElfLoadResult elf_launch_from_browser(const char* full_sd_path) {
     // --- Error screen ---
     if (result != ELF_OK) {
         gfx->fillScreen(C_BLACK);
-        gfx->fillRect(0, 0, 320, 24, C_DARK);
+        gfx->fillRect(0, 0, screenW, 24, C_DARK);
         gfx->setTextColor(C_RED);
         gfx->setTextSize(1);
         gfx->setCursor(6, 7);

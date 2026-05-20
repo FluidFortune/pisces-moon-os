@@ -13,36 +13,54 @@
  *
  * Controls:
  *   Trackball LEFT/RIGHT = move ship
- *   Trackball CLICK      = fire
- *   WASD A/D             = move ship
- *   SPACE                = fire
- *   Q / header tap       = quit
+ *   Trackball CLICK      = A/fire
+ *   NES keys             = A-left, W-up, D-right, Z-down
+ *   NES buttons          = O-A, K-B, B-Start/pause, V-Select
+ *   Q                    = quit
  */
 
 #include <Arduino.h>
+#ifdef DEVICE_TLORAPAGER
+#include "pm_disp_tlorapager.h"
+#else
 #include <Arduino_GFX_Library.h>
+#endif
 #include <SdFat.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
-#include "touch.h"
 #include "trackball.h"
-#include "keyboard.h"
+#include "game_input.h"
 #include "theme.h"
-#include "gamepad.h"
 #include "galaga.h"
 
 extern SemaphoreHandle_t spi_mutex;
 
+#ifdef DEVICE_TLORAPAGER
+extern PMDispTLoRaPager *gfx;
+#else
 extern Arduino_GFX *gfx;
+#endif
 extern SdFat sd;
 
 // ─────────────────────────────────────────────
 //  CONSTANTS
 // ─────────────────────────────────────────────
+#ifdef DEVICE_TLORAPAGER
+#define SCREEN_W        480
+#define SCREEN_H        222
+#elif defined(DEVICE_CARDPUTER_ADV)
+#define SCREEN_W        240
+#define SCREEN_H        135
+#else
 #define SCREEN_W        320
 #define SCREEN_H        240
-#define PLAY_W          280   // Play area (left margin 20, right margin 20)
-#define PLAY_X          20
+#endif
+#ifdef DEVICE_CARDPUTER_ADV
+#define PLAY_W          220
+#else
+#define PLAY_W          280   // Play area inside the centered viewport
+#endif
+#define PLAY_X          ((SCREEN_W - PLAY_W) / 2)
 #define HUD_H           18
 #define PLAY_BOTTOM     (SCREEN_H - 20)
 
@@ -221,7 +239,7 @@ static void buildFormation() {
     int idx = 0;
     // Row positions relative to formation anchor
     // Formation anchor: top-left at approximately (60, 40)
-    const int FORM_LEFT  = 65;
+    const int FORM_LEFT  = PLAY_X + 45;
     const int FORM_TOP   = 45;
     const int COL_GAP    = 20;
     const int ROW_GAP    = 18;
@@ -460,17 +478,46 @@ static void drawHUD() {
     gfx->fillRect(0, 0, SCREEN_W, HUD_H, COL_BG);
     gfx->setTextSize(1);
     gfx->setTextColor(COL_HUD);
-    gfx->setCursor(2, 4);
+    gfx->setCursor(PLAY_X, 4);
     gfx->printf("SC:%d", score);
-    gfx->setCursor(100, 4);
+    gfx->setCursor(PLAY_X + 98, 4);
     gfx->printf("HI:%d", highScore);
-    gfx->setCursor(200, 4);
+    gfx->setCursor(PLAY_X + 198, 4);
     gfx->printf("STG:%d", stage);
     // Lives
     for (int i = 0; i < lives && i < 5; i++) {
-        gfx->fillTriangle(260 + i*11, SHIP_Y/4 - 3,
-                          256 + i*11, SHIP_Y/4 + 3,
-                          264 + i*11, SHIP_Y/4 + 3, COL_SHIP);
+        int lx = PLAY_X + 240 + i * 11;
+        gfx->fillTriangle(lx, SHIP_Y/4 - 3,
+                          lx - 4, SHIP_Y/4 + 3,
+                          lx + 4, SHIP_Y/4 + 3, COL_SHIP);
+    }
+}
+
+static bool waitForGalagaResume() {
+    const int boxW = 156, boxH = 54;
+    const int boxX = (SCREEN_W - boxW) / 2;
+    const int boxY = (SCREEN_H - boxH) / 2;
+    gfx->fillRect(boxX, boxY, boxW, boxH, C_DARK);
+    gfx->drawRect(boxX, boxY, boxW, boxH, COL_HUD);
+    gfx->setTextSize(1);
+    gfx->setTextColor(COL_HUD);
+    gfx->setCursor(boxX + 48, boxY + 12);
+    gfx->print("PAUSED");
+    gfx->setTextColor(0xFFE0);
+    gfx->setCursor(boxX + 20, boxY + 32);
+    gfx->print("B START / Q QUIT");
+
+    while (true) {
+        PMNesInput input = pm_read_nes_input(true);
+        if (input.quit) return false;
+        if (input.start) {
+            gfx->fillRect(boxX, boxY, boxW, boxH, COL_BG);
+            lastHudScore = lastHudLives = lastHudStage = -1;
+            drawHUD();
+            return true;
+        }
+        delay(30);
+        yield();
     }
 }
 
@@ -501,7 +548,7 @@ static void drawExplosion(int x, int y) {
 // ─────────────────────────────────────────────
 static int loadHS() {
     int score = 0;
-    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+    if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
         if (sd.exists(HS_PATH)) {
             FsFile f = sd.open(HS_PATH, O_READ);
             if (f) {
@@ -511,18 +558,18 @@ static int loadHS() {
                 score = atoi(buf);
             }
         }
-        xSemaphoreGive(spi_mutex);
+        xSemaphoreGiveRecursive(spi_mutex);
     }
     return score;
 }
 static void saveHS(int hs) {
-    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+    if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
         FsFile f = sd.open(HS_PATH, O_WRITE | O_CREAT | O_TRUNC);
         if (f) {
             f.printf("%d", hs);
             f.close();
         }
-        xSemaphoreGive(spi_mutex);
+        xSemaphoreGiveRecursive(spi_mutex);
     }
 }
 
@@ -535,8 +582,8 @@ static void runChallengingStage() {
     gfx->fillScreen(COL_BG);
     gfx->setTextSize(2);
     gfx->setTextColor(COL_HUD);
-    gfx->setCursor(60, 100); gfx->print("CHALLENGING");
-    gfx->setCursor(90, 125); gfx->print("STAGE !!");
+    gfx->setCursor((SCREEN_W - 132) / 2, SCREEN_H / 2 - 20); gfx->print("CHALLENGING");
+    gfx->setCursor((SCREEN_W - 96) / 2, SCREEN_H / 2 + 5); gfx->print("STAGE !!");
     delay(2000);
     gfx->fillScreen(COL_BG);
     initStars();
@@ -585,19 +632,22 @@ static void runChallengingStage() {
         }
         if (!anyAlive) done = true;
 
+        PMNesInput input = pm_read_nes_input(true);
+        if (input.quit) { done = true; break; }
+        if (input.start) {
+            if (!waitForGalagaResume()) { done = true; break; }
+            continue;
+        }
+
         // Ship movement
-        char k = get_keypress();
-        TrackballState tb = update_trackball();
-        if (gamepad_poll()) { done = true; break; } // HOME
-        if (k == 'q' || k == 'Q') { done = true; break; }
-        if ((k == 'a' || k == 'A' || tb.x == -1 || gamepad_held(GP_LEFT)) && sx > PLAY_X + 8)
+        if (input.left && sx > PLAY_X + 8)
             sx -= SHIP_SPEED;
-        if ((k == 'd' || k == 'D' || tb.x == 1  || gamepad_held(GP_RIGHT)) && sx < PLAY_X + PLAY_W - 8)
+        if (input.right && sx < PLAY_X + PLAY_W - 8)
             sx += SHIP_SPEED;
 
         // Fire
         if (shotCooldown > 0) shotCooldown--;
-        if ((k == ' ' || tb.clicked || gamepad_pressed(GP_A)) && shotCooldown == 0) {
+        if ((input.a || input.b) && shotCooldown == 0) {
             for (int b = 0; b < MAX_BULLETS; b++) {
                 if (!pb[b].active) {
                     pb[b].x = (int16_t)sx; pb[b].y = SHIP_Y - 8;
@@ -634,18 +684,20 @@ static void runChallengingStage() {
     }
 
     // Result
-    gfx->fillRect(60, 90, 200, 60, C_DARK);
-    gfx->drawRect(60, 90, 200, 60, COL_HUD);
+    int resultX = (SCREEN_W - 200) / 2;
+    int resultY = (SCREEN_H - 60) / 2;
+    gfx->fillRect(resultX, resultY, 200, 60, C_DARK);
+    gfx->drawRect(resultX, resultY, 200, 60, COL_HUD);
     gfx->setTextSize(1);
     gfx->setTextColor(COL_HUD);
-    gfx->setCursor(80, 100);
+    gfx->setCursor(resultX + 20, resultY + 10);
     if (hit == 40) {
         score += 10000;
         gfx->print("PERFECT!! +10000");
     } else {
         gfx->printf("HIT %d/40  +%d", hit, hit * 100);
     }
-    gfx->setCursor(80, 120);
+    gfx->setCursor(resultX + 20, resultY + 30);
     gfx->printf("TOTAL: %d", score);
     delay(2500);
 }
@@ -699,47 +751,35 @@ static bool runStage() {
     // Show stage banner
     gfx->setTextSize(2);
     gfx->setTextColor(COL_HUD);
-    gfx->setCursor(100, 110);
+    gfx->setCursor((SCREEN_W - 84) / 2, SCREEN_H / 2 - 10);
     gfx->printf("STAGE %d", stage);
     delay(1500);
-    gfx->fillRect(80, 105, 160, 25, COL_BG);
+    gfx->fillRect((SCREEN_W - 160) / 2, SCREEN_H / 2 - 15, 160, 25, COL_BG);
 
     int  shotCooldown  = 0;
     int  diveTimer     = 60 + random(60);
     int  divingCount   = 0;
+    int8_t shipMoveDir = 0;  // -1 = left, 0 = stop, 1 = right
     bool quit          = false;
 
     while (true) {
         frameCount++;
 
         // ── INPUT ──
-        char k = get_keypress();
-        TrackballState tb = update_trackball();
-
-        if (gamepad_poll()) { quit = true; break; } // HOME
-        if (k == 'q' || k == 'Q') { quit = true; break; }
-        int16_t tx2, ty2;
-        if (get_touch(&tx2, &ty2) && ty2 < 40) {
-            while (get_touch(&tx2, &ty2)) { delay(10); }
-            quit = true; break;
+        PMNesInput input = pm_read_nes_input(true);
+        if (input.quit) { quit = true; break; }
+        if (input.start) {
+            if (!waitForGalagaResume()) { quit = true; break; }
+            continue;
         }
 
         // Ship movement — continuous while trackball direction is held
         // tb.x is edge-detect (fires once per roll click), so we maintain
         // a persistent direction that keeps moving until the player rolls
         // the opposite way or hits a wall.
-        static int8_t shipMoveDir = 0;  // -1 = left, 0 = stop, 1 = right
-
         eraseShip();
-        if (tb.x == -1 || gamepad_held(GP_LEFT))  shipMoveDir = -1;
-        if (tb.x ==  1 || gamepad_held(GP_RIGHT))  shipMoveDir =  1;
-        // Keyboard overrides
-        if (k == 'a' || k == 'A') shipMoveDir = -1;
-        if (k == 'd' || k == 'D') shipMoveDir =  1;
-        // Gamepad stop on release
-        if (!gamepad_held(GP_LEFT) && !gamepad_held(GP_RIGHT) &&
-            tb.x == 0 && k != 'a' && k != 'A' && k != 'd' && k != 'D')
-        { /* keep rolling */ }
+        if (input.left)  shipMoveDir = -1;
+        if (input.right) shipMoveDir =  1;
 
         if (shipMoveDir == -1 && ship.x > PLAY_X + 8)          ship.x -= SHIP_SPEED;
         if (shipMoveDir ==  1 && ship.x < PLAY_X + PLAY_W - 8) ship.x += SHIP_SPEED;
@@ -747,9 +787,9 @@ static bool runStage() {
         if (ship.x <= PLAY_X + 8)          { ship.x = PLAY_X + 8;          shipMoveDir = 0; }
         if (ship.x >= PLAY_X + PLAY_W - 8) { ship.x = PLAY_X + PLAY_W - 8; shipMoveDir = 0; }
 
-        // Fire — trackball click fires, keyboard space fires, GP_A fires
+        // Fire — O/K or physical A/B; trackball click remains an alternate A.
         if (shotCooldown > 0) shotCooldown--;
-        bool fire = (k == ' ' || tb.clicked || gamepad_pressed(GP_A));
+        bool fire = input.a || input.b;
         if (fire && shotCooldown == 0) {
             for (int b = 0; b < MAX_BULLETS; b++) {
                 if (!bullets[b].active) {
@@ -963,19 +1003,21 @@ static bool runStage() {
 //  GAME OVER SCREEN
 // ─────────────────────────────────────────────
 static void showGameOver() {
-    gfx->fillRect(70, 85, 180, 70, C_DARK);
-    gfx->drawRect(70, 85, 180, 70, COL_HUD);
+    int boxX = (SCREEN_W - 180) / 2;
+    int boxY = (SCREEN_H - 70) / 2;
+    gfx->fillRect(boxX, boxY, 180, 70, C_DARK);
+    gfx->drawRect(boxX, boxY, 180, 70, COL_HUD);
     gfx->setTextSize(2);
     gfx->setTextColor(C_RED);
-    gfx->setCursor(95, 95);
+    gfx->setCursor(boxX + 25, boxY + 10);
     gfx->print("GAME OVER");
     gfx->setTextSize(1);
     gfx->setTextColor(COL_HUD);
-    gfx->setCursor(95, 118);
+    gfx->setCursor(boxX + 25, boxY + 33);
     gfx->printf("SCORE: %d", score);
     if (score >= highScore && score > 0) {
         gfx->setTextColor(COL_BULLET);
-        gfx->setCursor(82, 133);
+        gfx->setCursor(boxX + 12, boxY + 48);
         gfx->print("** NEW HIGH SCORE! **");
     }
     delay(3000);
@@ -1009,7 +1051,7 @@ void run_galaga() {
         // Stage clear jingle
         gfx->setTextSize(2);
         gfx->setTextColor(COL_BULLET);
-        gfx->setCursor(90, 110);
+        gfx->setCursor((SCREEN_W - 144) / 2, SCREEN_H / 2 - 10);
         gfx->print("STAGE CLEAR!");
         delay(1500);
         stage++;

@@ -35,15 +35,24 @@
 #include <TinyGPSPlus.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#ifdef DEVICE_TLORAPAGER
+#include "pm_disp_tlorapager.h"
+#else
 #include <Arduino_GFX_Library.h>
+#endif
 #include "touch.h"
 #include "trackball.h"
 #include "keyboard.h"
+#include "pm_input.h"
 #include "theme.h"
 #include "wardrive.h"       // wardrive_set_mode(), wardrive_active, wardrive_mode
 #include "pm_promiscuous.h" // pm_stats_t, pm_promiscuous_get_stats()
 
-extern Arduino_GFX*      gfx;
+#ifdef DEVICE_TLORAPAGER
+extern PMDispTLoRaPager *gfx;
+#else
+extern Arduino_GFX *gfx;
+#endif
 extern SdFat             sd;
 extern TinyGPSPlus        gps;
 extern SemaphoreHandle_t spi_mutex;
@@ -53,8 +62,18 @@ extern SemaphoreHandle_t spi_mutex;
 // ─────────────────────────────────────────────
 #define HEADER_H      24
 #define FOOTER_H      25
+#ifdef DEVICE_TLORAPAGER
+#define PI_SCREEN_W   480
+#define PI_SCREEN_H   222
+#elif defined(DEVICE_CARDPUTER_ADV)
+#define PI_SCREEN_W   240
+#define PI_SCREEN_H   135
+#else
+#define PI_SCREEN_W   320
+#define PI_SCREEN_H   240
+#endif
 #define BODY_TOP      (HEADER_H + 2)
-#define BODY_BOT      (240 - FOOTER_H - 2)
+#define BODY_BOT      (PI_SCREEN_H - FOOTER_H - 2)
 #define ROW_H         16
 #define MAX_ROWS      ((BODY_BOT - BODY_TOP) / ROW_H)
 
@@ -94,8 +113,8 @@ static uint16_t rssi_color(int rssi) {
 }
 
 static void draw_header(const char* title, uint16_t accent) {
-    gfx->fillRect(0, 0, 320, HEADER_H, C_DARK);
-    gfx->drawFastHLine(0, HEADER_H, 320, accent);
+    gfx->fillRect(0, 0, PI_SCREEN_W, HEADER_H, C_DARK);
+    gfx->drawFastHLine(0, HEADER_H, PI_SCREEN_W, accent);
     gfx->setCursor(10, 7);
     gfx->setTextColor(accent);
     gfx->setTextSize(1);
@@ -103,8 +122,8 @@ static void draw_header(const char* title, uint16_t accent) {
 }
 
 static void draw_footer(const char* line, uint16_t col = C_GREEN) {
-    gfx->fillRect(0, 240 - FOOTER_H, 320, FOOTER_H, C_DARK);
-    gfx->setCursor(10, 240 - FOOTER_H + 8);
+    gfx->fillRect(0, PI_SCREEN_H - FOOTER_H, PI_SCREEN_W, FOOTER_H, C_DARK);
+    gfx->setCursor(10, PI_SCREEN_H - FOOTER_H + 8);
     gfx->setTextColor(col);
     gfx->print(line);
 }
@@ -121,8 +140,8 @@ static pi_mode_t draw_mode_select(pi_mode_t initial) {
         gfx->fillScreen(C_BLACK);
 
         // Title
-        gfx->fillRect(0, 0, 320, HEADER_H, C_DARK);
-        gfx->drawFastHLine(0, HEADER_H, 320, C_CYAN);
+        gfx->fillRect(0, 0, PI_SCREEN_W, HEADER_H, C_DARK);
+        gfx->drawFastHLine(0, HEADER_H, PI_SCREEN_W, C_CYAN);
         gfx->setCursor(10, 7);
         gfx->setTextColor(C_CYAN);
         gfx->setTextSize(1);
@@ -159,8 +178,8 @@ static pi_mode_t draw_mode_select(pi_mode_t initial) {
         gfx->print("Best for: host-driven sensor node.");
 
         // Footer
-        gfx->fillRect(0, 240 - FOOTER_H, 320, FOOTER_H, C_DARK);
-        gfx->setCursor(10, 240 - FOOTER_H + 8);
+        gfx->fillRect(0, PI_SCREEN_H - FOOTER_H, PI_SCREEN_W, FOOTER_H, C_DARK);
+        gfx->setCursor(10, PI_SCREEN_H - FOOTER_H + 8);
         gfx->setTextColor(C_GREEN);
         gfx->print("[TB] Select  [ENTER/CLK] Confirm  [Q] Back");
     };
@@ -176,7 +195,7 @@ static pi_mode_t draw_mode_select(pi_mode_t initial) {
         }
 
         char k = get_keypress();
-        if (k == 'q' || k == 'Q') return (pi_mode_t)-1;
+        if (pm_is_exit_key(k)) return (pi_mode_t)-1;
         if (k == '\n' || k == '\r') return (pi_mode_t)sel;
 
         TrackballState tb = update_trackball();
@@ -212,20 +231,20 @@ static void scan_open_log() {
         char path[32];
         snprintf(path, sizeof(path), "/probe_%04d.csv", n);
         bool exists = false;
-        if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        if (xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
             exists = sd.exists(path);
-            xSemaphoreGive(spi_mutex);
+            xSemaphoreGiveRecursive(spi_mutex);
         }
         if (!exists) {
             strncpy(scan_log_path, path, 31);
             // Write CSV header
-            if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            if (xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
                 FsFile f = sd.open(scan_log_path, O_WRITE | O_CREAT);
                 if (f) {
                     f.println("bssid,ssid,rssi,ch,enc,lat,lng");
                     f.close();
                 }
-                xSemaphoreGive(spi_mutex);
+                xSemaphoreGiveRecursive(spi_mutex);
             }
             return;
         }
@@ -244,7 +263,7 @@ static void scan_do_scan(bool& redraw_needed) {
     double lng = gps.location.isValid() ? gps.location.lng() : 0.0;
 
     // Now take mutex only for the SD write
-    bool got_mutex = (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE);
+    bool got_mutex = (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE);
     FsFile logfile;
     if (got_mutex && scan_log_path[0]) {
         logfile = sd.open(scan_log_path, O_WRITE | O_APPEND);
@@ -286,19 +305,19 @@ static void scan_do_scan(bool& redraw_needed) {
     }
 
     if (logfile) logfile.close();
-    if (got_mutex) xSemaphoreGive(spi_mutex);
+    if (got_mutex) xSemaphoreGiveRecursive(spi_mutex);
 
     WiFi.scanDelete();
     redraw_needed = true;
 }
 
 static void scan_draw_list() {
-    gfx->fillRect(0, BODY_TOP, 320, BODY_BOT - BODY_TOP, C_BLACK);
+    gfx->fillRect(0, BODY_TOP, PI_SCREEN_W, BODY_BOT - BODY_TOP, C_BLACK);
     int shown = 0;
     for (int i = scan_scroll; i < scan_net_count && shown < MAX_ROWS; i++, shown++) {
         int y   = BODY_TOP + shown * ROW_H;
         bool sel = (i == scan_cursor);
-        if (sel) gfx->fillRect(0, y, 320, ROW_H, C_DARK);
+        if (sel) gfx->fillRect(0, y, PI_SCREEN_W, ROW_H, C_DARK);
 
         // RSSI bar — 3px wide strip flush left
         int bar = max(0, min(30, (scan_nets[i].rssi + 100) * 30 / 60));
@@ -337,7 +356,7 @@ static void run_scan_mode() {
     scan_open_log();
 
     gfx->fillScreen(C_BLACK);
-    draw_header("SCAN MODE | TAP HEADER TO EXIT", C_GREEN);
+    draw_header("SCAN MODE | " PM_EXIT_COPY, C_GREEN);
     char footer_buf[64];
     snprintf(footer_buf, sizeof(footer_buf), "[S] Scan  [M] Mode  [Q] Exit | Log: %s",
              scan_log_path[0] ? scan_log_path : "none");
@@ -356,12 +375,12 @@ static void run_scan_mode() {
         }
 
         char k = get_keypress();
-        if (k == 'q' || k == 'Q') return;
         if (k == 'm' || k == 'M') {
             // Switch mode — caller sees the return and re-enters mode select
             // We signal this by returning normally and letting run_probe_intel re-run mode select
             return;
         }
+        if (pm_is_exit_key(k)) return;
         if (k == 's' || k == 'S') {
             scan_do_scan(redraw_needed);
         }
@@ -379,7 +398,7 @@ static void run_scan_mode() {
         }
 
         if (redraw_needed) {
-            draw_header("SCAN MODE | TAP HEADER TO EXIT", C_GREEN);
+            draw_header("SCAN MODE | " PM_EXIT_COPY, C_GREEN);
             scan_draw_list();
             redraw_needed = false;
         }
@@ -414,7 +433,7 @@ static void run_scan_mode() {
 #define PROW_DROPPED  (BODY_TOP + 5  * 26)
 
 static void promisc_draw_static() {
-    gfx->fillRect(0, BODY_TOP, 320, BODY_BOT - BODY_TOP, C_BLACK);
+    gfx->fillRect(0, BODY_TOP, PI_SCREEN_W, BODY_BOT - BODY_TOP, C_BLACK);
 
     const char* labels[] = { "Beacon:", "Probe-Req:", "Deauth:", "Auth:", "Other:", "Dropped:" };
     const uint16_t cols[] = { C_GREEN, C_CYAN, C_RED, 0xFFE0, C_GREY, C_GREY };
@@ -444,7 +463,7 @@ static void promisc_draw_values(const pm_stats_t& s, uint8_t ch) {
     }
 
     // Channel + fps
-    gfx->fillRect(0, BODY_BOT - 18, 320, 18, C_BLACK);
+    gfx->fillRect(0, BODY_BOT - 18, PI_SCREEN_W, 18, C_BLACK);
     gfx->setCursor(10, BODY_BOT - 14);
     gfx->setTextColor(C_GREY);
     gfx->setTextSize(1);
@@ -502,7 +521,7 @@ static void run_promiscuous_mode() {
         }
 
         char k = get_keypress();
-        if (k == 'q' || k == 'Q') break;
+        if (pm_is_exit_key(k)) break;
         if (k == 'm' || k == 'M') break;  // back to mode select
 
         // Refresh stats every 500ms

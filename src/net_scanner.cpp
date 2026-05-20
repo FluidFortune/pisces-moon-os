@@ -349,7 +349,7 @@ void run_net_scanner() {
 
             // Check for header tap to abort
             int16_t tx, ty;
-            if (get_touch(&tx, &ty) && ty < 40) {
+            if (get_touch(&tx, &ty) && ty < 24) {
                 while(get_touch(&tx,&ty)){delay(5);}
                 wifi_in_use = false;
                 gfx->fillScreen(COL_BG); return;
@@ -389,7 +389,7 @@ void run_net_scanner() {
         TrackballState tb = update_trackball();
         int16_t tx, ty;
 
-        if (get_touch(&tx, &ty) && ty < 40) {
+        if (get_touch(&tx, &ty) && ty < 24) {
             while(get_touch(&tx,&ty)){delay(10);}
             if (inPortScan) {
                 inPortScan = false;

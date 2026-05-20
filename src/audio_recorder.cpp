@@ -42,15 +42,24 @@
 
 #include <Arduino.h>
 #include <FS.h>
+#ifdef DEVICE_TLORAPAGER
+#include "pm_disp_tlorapager.h"
+#else
 #include <Arduino_GFX_Library.h>
+#endif
 #include "SdFat.h"
 #include <driver/i2s.h>
 #include "touch.h"
 #include "trackball.h"
 #include "keyboard.h"
+#include "pm_input.h"
 #include "theme.h"
 
+#ifdef DEVICE_TLORAPAGER
+extern PMDispTLoRaPager *gfx;
+#else
 extern Arduino_GFX *gfx;
+#endif
 extern SdFat sd;
 
 // ─────────────────────────────────────────────
@@ -118,7 +127,7 @@ static int       writeCount       = 0;
 
 // Recording list
 #define MAX_RECS  64
-static char recList[MAX_RECS][48];
+static char (*recList)[48] = nullptr;
 static int  recCount    = 0;
 static int  recScroll   = 0;
 static int  recSelected = 0;
@@ -129,6 +138,24 @@ static int  recSelected = 0;
 static uint16_t peakLevel  = 0;
 static uint16_t peakHold   = 0;
 static uint32_t peakHoldMs = 0;
+
+static bool ensureRecList() {
+    if (recList) return true;
+    recList = (char (*)[48])calloc(MAX_RECS, sizeof(*recList));
+    if (!recList) {
+        Serial.println("[REC] Recording list allocation failed");
+        return false;
+    }
+    return true;
+}
+
+static void freeRecList() {
+    free(recList);
+    recList = nullptr;
+    recCount = 0;
+    recScroll = 0;
+    recSelected = 0;
+}
 
 // ─────────────────────────────────────────────
 //  COLORS
@@ -231,6 +258,7 @@ static int getNextRecNumber() {
 
 static void scanRecordings() {
     recCount = 0;
+    if (!recList) return;
     if (!sd.exists(RECORD_DIR)) return;
     FsFile dir = sd.open(RECORD_DIR);
     if (!dir) return;
@@ -460,7 +488,7 @@ static void drawFull() {
 // ─────────────────────────────────────────────
 //  MAIN ENTRY
 // ─────────────────────────────────────────────
-void run_audio_recorder() {
+static void run_audio_recorder_inner() {
     // Allocate read buffer in PSRAM — keeps 4KB out of internal SRAM.
     // Must happen before initI2SMic() so the buffer is valid when
     // recording starts. Free on exit regardless of how we leave.
@@ -499,7 +527,7 @@ void run_audio_recorder() {
             int16_t tx, ty;
             if (get_touch(&tx,&ty) && ty<40) { while(get_touch(&tx,&ty)){delay(10);} break; }
             char k = get_keypress();
-            if (k=='q'||k=='Q') break;
+            if (pm_is_exit_key(k)) break;
             delay(50);
         }
         return;
@@ -577,7 +605,7 @@ void run_audio_recorder() {
         }
 
         // Q = quit
-        if (k == 'q' || k == 'Q') {
+        if (pm_is_exit_key(k)) {
             if (recording) stopRecording();
             running = false;
             continue;
@@ -615,4 +643,19 @@ void run_audio_recorder() {
     deinitI2SMic();
     free(readBuf); readBuf = nullptr;
     gfx->fillScreen(0x0000);
+}
+
+void run_audio_recorder() {
+    if (!ensureRecList()) {
+        gfx->fillScreen(0x0000);
+        drawHeader();
+        gfx->setTextColor(0xF800);
+        gfx->setTextSize(1);
+        gfx->setCursor(10, 50);
+        gfx->print("Recorder memory unavailable.");
+        delay(1200);
+        return;
+    }
+    run_audio_recorder_inner();
+    freeRecList();
 }

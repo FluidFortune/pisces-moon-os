@@ -10,22 +10,42 @@
 // fluidfortune.com
 
 #include <Arduino.h>
+#ifdef DEVICE_TLORAPAGER
+#include "pm_disp_tlorapager.h"
+#else
 #include <Arduino_GFX_Library.h>
+#endif
 #include "text_buffer.h"
 
+#ifdef DEVICE_TLORAPAGER
+extern PMDispTLoRaPager *gfx;
+#else
 extern Arduino_GFX *gfx;
+#endif
 
 // ─────────────────────────────────────────────
 //  LIFECYCLE
 // ─────────────────────────────────────────────
 bool TextBuffer::init() {
     if (lines) return true;  // Already initialized
-    lines = (TextLine*)ps_malloc(TB_MAX_LINES * sizeof(TextLine));
+
+    size_t sz = TB_MAX_LINES * sizeof(TextLine);
+
+    // Prefer PSRAM if available. On no-PSRAM devices (Cardputer ADV)
+    // ps_malloc returns NULL — fall back to internal SRAM. The buffer
+    // is small (~11.6 KB for default TB_MAX_LINES=200, TB_LINE_WIDTH=56)
+    // and fits comfortably in internal heap.
+    lines = (TextLine*)ps_malloc(sz);
     if (!lines) {
-        Serial.println("[TextBuffer] ps_malloc failed");
-        return false;
+        lines = (TextLine*)malloc(sz);
+        if (!lines) {
+            Serial.println("[TextBuffer] malloc failed (both PSRAM and SRAM)");
+            return false;
+        }
+        Serial.println("[TextBuffer] PSRAM unavailable — using internal SRAM");
     }
-    memset(lines, 0, TB_MAX_LINES * sizeof(TextLine));
+
+    memset(lines, 0, sz);
     count = scroll = 0;
     return true;
 }

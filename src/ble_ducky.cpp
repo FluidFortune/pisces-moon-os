@@ -54,7 +54,11 @@
  */
 
 #include <Arduino.h>
+#ifdef DEVICE_TLORAPAGER
+#include "pm_disp_tlorapager.h"
+#else
 #include <Arduino_GFX_Library.h>
+#endif
 #include <NimBLEDevice.h>
 #include <NimBLEServer.h>
 #include <NimBLECharacteristic.h>
@@ -63,11 +67,16 @@
 #include "touch.h"
 #include "trackball.h"
 #include "keyboard.h"
+#include "pm_input.h"
 #include "theme.h"
 #include "wardrive.h"
 #include "ble_ducky.h"
 
+#ifdef DEVICE_TLORAPAGER
+extern PMDispTLoRaPager *gfx;
+#else
 extern Arduino_GFX *gfx;
+#endif
 extern SdFat sd;
 
 // ─────────────────────────────────────────────
@@ -604,21 +613,24 @@ static void bdDrawStatus(const char* msg, uint16_t col = BD_DIM) {
 
 static void bdProgressStatus(const char* lineText, int lineNum, int total) {
     // Called during execution — update the status bar
-    gfx->fillRect(0, 198, 320, 42, 0x1000);
-    gfx->drawFastHLine(0, 198, 320, BD_RED);
+    const int w = gfx->width();
+    const int y = max(0, gfx->height() - 42);
+    gfx->fillRect(0, y, w, gfx->height() - y, 0x1000);
+    gfx->drawFastHLine(0, y, w, BD_RED);
     gfx->setTextSize(1);
     gfx->setTextColor(BD_DIM);
-    gfx->setCursor(4, 202);
+    gfx->setCursor(4, y + 4);
     gfx->printf("Line %d/%d", lineNum, total);
     // Progress bar
     if (total > 0) {
-        int bw = (298 * lineNum) / total;
-        gfx->fillRect(4, 213, 298, 6, 0x0821);
-        gfx->fillRect(4, 213, bw,  6, BD_RED);
+        int barW = min(298, w - 8);
+        int bw = (barW * lineNum) / total;
+        gfx->fillRect(4, y + 15, barW, 6, 0x0821);
+        gfx->fillRect(4, y + 15, bw,   6, BD_RED);
     }
     // Current line
     gfx->setTextColor(BD_ORANGE);
-    gfx->setCursor(4, 222);
+    gfx->setCursor(4, min(y + 24, gfx->height() - 9));
     char buf[44]; strncpy(buf, lineText, 43); buf[43]='\0';
     gfx->print(buf);
 }
@@ -684,7 +696,7 @@ void run_ble_ducky() {
         int16_t tx, ty;
 
         if (get_touch(&tx, &ty) && ty < 40) { while(get_touch(&tx,&ty)){delay(10);} break; }
-        if (k == 'q' || k == 'Q') break;
+        if (pm_is_exit_key(k)) break;
 
         // Update connection indicator
         static bool lastConn = false;
@@ -712,13 +724,13 @@ void run_ble_ducky() {
                 const char* slash = strrchr(bdPayloads[selected], '/');
                 gfx->printf("INJECTING: %s", slash ? slash+1 : bdPayloads[selected]);
                 gfx->setTextColor(BD_DIM);
-                gfx->setCursor(6, 44); gfx->print("Q or tap header to abort.");
+                gfx->setCursor(6, 44); gfx->print(PM_ABORT_COPY);
 
                 bdExecutePayload(bdPayloads[selected], [](const char* line, int n, int tot){
                     bdProgressStatus(line, n, tot);
                     // Check for abort keypress during execution
                     char k = get_keypress();
-                    if (k == 'q' || k == 'Q') bdAbort = true;
+                    if (pm_is_exit_key(k)) bdAbort = true;
                     int16_t tx2, ty2;
                     if (get_touch(&tx2, &ty2) && ty2 < 24) bdAbort = true;
                 });

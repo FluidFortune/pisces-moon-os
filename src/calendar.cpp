@@ -1,33 +1,43 @@
 // Pisces Moon OS
 // Copyright (C) 2026 Eric Becker / Fluid Fortune
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//
-// This program is free software: you can redistribute it
-// and/or modify it under the terms of the GNU Affero General
-// Public License as published by the Free Software Foundation,
-// either version 3 of the License, or any later version.
-//
 // fluidfortune.com
+// REWRITTEN for width-aware rendering (480x240 T-LoRa Pager / 320x240 T-Deck Plus)
 
 #include <Arduino.h>
 #include <WiFi.h>
+#ifdef DEVICE_TLORAPAGER
+#include "pm_disp_tlorapager.h"
+#else
 #include <Arduino_GFX_Library.h>
+#endif
 #include "touch.h"
 #include "theme.h"
 #include "keyboard.h"
+#include "pm_input.h"
 #include "trackball.h"
 #include "time.h"
 
+#ifdef DEVICE_TLORAPAGER
+extern PMDispTLoRaPager *gfx;
+static constexpr int DISP_W = 480;
+static constexpr int DISP_H = 222;
+#elif defined(DEVICE_CARDPUTER_ADV)
 extern Arduino_GFX *gfx;
+static constexpr int DISP_W = 240;
+static constexpr int DISP_H = 135;
+#else
+extern Arduino_GFX *gfx;
+static constexpr int DISP_W = 320;
+static constexpr int DISP_H = 240;
+#endif
 
 static bool calSyncNTP() {
     if (WiFi.status() != WL_CONNECTED) return false;
     if (time(nullptr) > 100000UL) return true;
     configTime(0, 0, "pool.ntp.org", "time.google.com");
     unsigned long t0 = millis();
-    while (time(nullptr) < 100000UL && millis() - t0 < 5000) {
-        delay(200); yield();
-    }
+    while (time(nullptr) < 100000UL && millis() - t0 < 5000) { delay(200); yield(); }
     return time(nullptr) > 100000UL;
 }
 
@@ -37,10 +47,8 @@ static int daysInMonth(int month, int year) {
     return days[month];
 }
 
-// Day of week for 1st of month (0=Sun) via Zeller
 static int firstDayOfMonth(int month, int year) {
-    int m = month + 1;
-    int y = year;
+    int m = month + 1, y = year;
     if (m < 3) { m += 12; y--; }
     int k = y % 100, j = y / 100;
     int h = (1 + (13*(m+1)/5) + k + k/4 + j/4 + 5*j) % 7;
@@ -54,28 +62,35 @@ static const char* MONTH_NAMES[] = {
 
 static void calDraw(int month, int year, int td, int tm_, int ty_) {
     gfx->fillScreen(C_BLACK);
-    gfx->fillRect(0, 0, 320, 24, C_DARK);
-    gfx->drawFastHLine(0, 24, 320, C_GREEN);
+    gfx->fillRect(0, 0, DISP_W, 24, C_DARK);
+    gfx->drawFastHLine(0, 24, DISP_W, C_GREEN);
     gfx->setTextSize(1); gfx->setTextColor(C_GREEN);
     gfx->setCursor(10, 7);
+#ifdef DEVICE_TLORAPAGER
+    gfx->print("CALENDAR | < > MONTH | Q EXIT");
+#else
     gfx->print("CALENDAR | < > MONTH | Q/HDR=EXIT");
+#endif
 
-    // Month + year centred
     char title[32];
     snprintf(title, sizeof(title), "%s %d", MONTH_NAMES[month], year);
     gfx->setTextSize(1); gfx->setTextColor(C_WHITE);
-    gfx->setCursor((320 - (int)strlen(title)*6) / 2, 30);
+    gfx->setCursor((DISP_W - (int)strlen(title) * 6) / 2, 30);
     gfx->print(title);
 
-    // Day headers
     const char* days[] = {"SU","MO","TU","WE","TH","FR","SA"};
-    int colW = 45;
+    // Grid uses full available width
+    const int gridLeft  = 4;
+    const int gridRight = DISP_W - 4;
+    const int colW = (gridRight - gridLeft) / 7;
+
     gfx->setTextColor(C_GREY);
     for (int i = 0; i < 7; i++) {
-        gfx->setCursor(i * colW + 16, 44);
+        // Center "SU"/"MO" (2 chars * 6px = 12px) in colW
+        gfx->setCursor(gridLeft + i * colW + (colW - 12) / 2, 44);
         gfx->print(days[i]);
     }
-    gfx->drawFastHLine(0, 54, 320, C_DARK);
+    gfx->drawFastHLine(0, 54, DISP_W, C_DARK);
 
     int startFd = firstDayOfMonth(month, year);
     int numDays = daysInMonth(month, year);
@@ -83,31 +98,31 @@ static void calDraw(int month, int year, int td, int tm_, int ty_) {
     int col = startFd, row = 0;
 
     for (int d = 1; d <= numDays; d++) {
-        int x = col * colW + 14;
-        int y = startY + row * rowH;
+        int cellX = gridLeft + col * colW;
+        int cellY = startY + row * rowH;
         bool isToday = (d == td && month == tm_ && year == ty_);
         if (isToday) {
-            gfx->fillRoundRect(col*colW+2, y-1, colW-4, rowH-2, 4, C_GREEN);
+            gfx->fillRoundRect(cellX + 2, cellY - 1, colW - 4, rowH - 2, 4, C_GREEN);
             gfx->setTextColor(C_BLACK);
         } else {
             gfx->setTextColor(col == 0 ? 0xF800 : C_WHITE);
         }
         gfx->setTextSize(1);
-        gfx->setCursor(x, y + 7);
-        if (d < 10) { gfx->print(" "); gfx->print(d); }
-        else gfx->print(d);
+        // Center 2-digit day number in cell
+        gfx->setCursor(cellX + (colW - 12) / 2, cellY + 7);
+        if (d < 10) { gfx->print(" "); gfx->print(d); } else gfx->print(d);
         col++;
         if (col == 7) { col = 0; row++; }
     }
 
     gfx->setTextColor(C_GREY); gfx->setTextSize(1);
-    gfx->setCursor(10, 226);
+    gfx->setCursor(10, DISP_H - 14);
     gfx->print("< or , = prev    T = today    > or . = next");
 }
 
 void run_calendar() {
     gfx->fillScreen(C_BLACK);
-    gfx->fillRect(0, 0, 320, 24, C_DARK);
+    gfx->fillRect(0, 0, DISP_W, 24, C_DARK);
     gfx->setTextColor(C_GREEN); gfx->setTextSize(1);
     gfx->setCursor(10, 7); gfx->print("CALENDAR");
     gfx->setTextColor(C_GREY); gfx->setCursor(10, 40);
@@ -134,7 +149,7 @@ void run_calendar() {
         }
         char k = get_keypress();
         TrackballState tb = update_trackball();
-        if (k == 'q' || k == 'Q') break;
+        if (pm_is_exit_key(k)) break;
         if (k == 't' || k == 'T') {
             viewMonth = todayMonth; viewYear = todayYear;
             calDraw(viewMonth, viewYear, todayDay, todayMonth, todayYear);

@@ -14,6 +14,39 @@
  * IRC-style multi-channel LoRa messenger
  * Meshtastic-compatible packet format
  *
+ * Meshtastic attribution:
+ *   This file implements interoperability logic for the Meshtastic
+ *   LongFast RF lane and packet/protobuf layout. Protocol constants,
+ *   field names, packet framing, and protobuf field semantics are based
+ *   on public Meshtastic documentation and the upstream Meshtastic
+ *   firmware/protobuf repositories:
+ *
+ *     https://github.com/meshtastic/firmware
+ *     https://github.com/meshtastic/protobufs
+ *
+ *   Meshtastic firmware and protobuf definitions are licensed upstream
+ *   under GPL-3.0. Pisces Moon OS is licensed under AGPL-3.0-or-later.
+ *   No upstream Meshtastic source file is vendored here; if future work
+ *   imports or adapts Meshtastic implementation code directly, preserve
+ *   the upstream copyright notices and GPL-3.0 license terms alongside
+ *   this project's AGPL notice.
+ *
+ * v1.1 — reliable same-channel receive
+ *   TX now encodes the active app channel into the header's hop_start
+ *   hint instead of duplicating hop_limit there. RX already uses this
+ *   field as the display-channel hint, so the old encoding made every
+ *   message appear on channel MESH_HOP_LIMIT (#pisces).
+ *
+ *   RX is interrupt-driven now: DIO1 sets a flag, the UI loop reads
+ *   packets with readData() only when one is actually present, then
+ *   returns the radio to continuous receive. This avoids holding the
+ *   shared SPI mutex inside RadioLib's blocking receive() timeout.
+ *
+ * v1.2 — MicroSD transcript
+ *   Sent and received messages are appended to /mesh_logs/messages.csv
+ *   with an immediate close after every row. This keeps the on-screen
+ *   ring buffer light while preserving a durable transcript on SD.
+ *
  * T-Deck Plus SX1262 pins:
  *   CS   = GPIO9   RST  = GPIO17
  *   DIO1 = GPIO45  BUSY = GPIO13
@@ -23,7 +56,7 @@
  *   Freq:  906.875 MHz (US) / 869.525 MHz (EU — change LORA_FREQ)
  *   BW:    250 kHz
  *   SF:    11
- *   CR:    4/8
+ *   CR:    4/5
  *   Sync:  0x2B   (Meshtastic network ID)
  *   Preamble: 16 symbols
  *
@@ -31,16 +64,19 @@
  *   [0..3]  dest    uint32_le  destination node ID (0xFFFFFFFF = broadcast)
  *   [4..7]  from    uint32_le  sender node ID
  *   [8..11] id      uint32_le  unique packet ID
- *   [12..15] flags  uint32_le  hop_limit(3b) | want_ack(1b) | hop_start(3b) | ...
+ *   [12]    flags   uint8      hop_limit(3b) | want_ack(1b) | via_mqtt(1b) | hop_start(3b)
+ *   [13]    channel uint8      Meshtastic channel hash
+ *   [14]    next    uint8      next-hop low byte
+ *   [15]    relay   uint8      relay-node low byte
  *   [16..]  payload             protobuf-encoded Data message (unencrypted default channel)
  *
  * Data protobuf (TEXT_MESSAGE_APP, portnum=1):
  *   0x08 0x01               field 1 (portnum) = 1
  *   0x12 <len> <text bytes> field 2 (payload) = UTF-8 text
  *
- * Channels: mapped to Meshtastic channel index 0-7
- *   Channel 0 = LongFast default (most Meshtastic nodes)
- *   Channels 1-7 = custom secondary channels
+ * Channels:
+ *   Channel 0 = LongFast default RF lane (most Meshtastic nodes)
+ *   Channels 1-3 = Pisces private offset lanes
  *
  * Node ID: derived from ESP32 MAC address (lower 4 bytes)
  *
@@ -55,22 +91,38 @@
 #include <SPI.h>
 #include <RadioLib.h>
 #include <Arduino_GFX_Library.h>
+#include "SdFat.h"
 #include "touch.h"
 #include "trackball.h"
 #include "keyboard.h"
 #include "theme.h"
 #include "mesh_messenger.h"
+#include "pm_lora_pins.h"
+
+// Forward declaration: cardputerSdSPI lives in main.cpp and is the
+// HSPI instance on Cardputer's peripheral SPI bus (pins 14/39/40),
+// shared by SD card AND the Cap LoRa SX1262. On Cardputer the
+// default `SPI` instance is bound to the LCD pins (35/36) and
+// cannot reach the radio. See main.cpp for the routing comment.
+#ifdef DEVICE_CARDPUTER_ADV
+extern SPIClass cardputerSdSPI;
+#endif
+extern volatile bool wardrive_bridge_streaming;
+#include <TinyGPSPlus.h>
+extern TinyGPSPlus gps;
 
 extern Arduino_GFX *gfx;
 extern SemaphoreHandle_t spi_mutex;
+extern SdFat sd;
+extern volatile bool g_sd_ready;
 
 // ─────────────────────────────────────────────
 //  SX1262 HARDWARE PINS
 // ─────────────────────────────────────────────
-#define LORA_CS    9
-#define LORA_RST   17
-#define LORA_DIO1  45
-#define LORA_BUSY  13
+#define MESH_LORA_CS    PM_LORA_CS
+#define MESH_LORA_RST   PM_LORA_RST
+#define MESH_LORA_DIO1  PM_LORA_IRQ
+#define MESH_LORA_BUSY  PM_LORA_BUSY
 
 // ─────────────────────────────────────────────
 //  RADIO SETTINGS — Meshtastic LongFast US
@@ -79,7 +131,7 @@ extern SemaphoreHandle_t spi_mutex;
 #define LORA_FREQ       906.875f   // MHz — US LongFast ch 0
 #define LORA_BW         250.0f     // kHz
 #define LORA_SF         11
-#define LORA_CR         8          // 4/8
+#define LORA_CR         5          // 4/5 — Meshtastic LongFast
 #define LORA_SYNC       0x2B       // Meshtastic sync word
 #define LORA_PREAMBLE   16
 #define LORA_POWER      22         // dBm — max legal for SX1262
@@ -87,13 +139,14 @@ extern SemaphoreHandle_t spi_mutex;
 // Meshtastic broadcast address
 #define MESH_BROADCAST  0xFFFFFFFF
 #define MESH_HOP_LIMIT  3
+#define MESH_LONGFAST_CHANNEL_HASH 0x02
 
 // ─────────────────────────────────────────────
 //  CHANNELS
 // ─────────────────────────────────────────────
 #define MAX_CHANNELS    4
 static const char* CHANNEL_NAMES[MAX_CHANNELS] = {
-    "#general",     // ch 0 — Meshtastic default
+    "#LongFast",    // ch 0 — Meshtastic default RF lane
     "#local",       // ch 1
     "#emergency",   // ch 2
     "#pisces",      // ch 3 — our own channel
@@ -114,7 +167,7 @@ struct MeshMsg {
     bool      valid;
 };
 
-static MeshMsg msgStore[MAX_CHANNELS][MAX_MSGS_PER_CH];
+static MeshMsg (*msgStore)[MAX_MSGS_PER_CH] = nullptr;
 static int     msgCount[MAX_CHANNELS] = {0};
 static int     msgScroll[MAX_CHANNELS] = {0};
 
@@ -130,11 +183,53 @@ static bool     transmitting   = false;
 static uint32_t lastStatusMs   = 0;
 static char     statusMsg[48]  = "";
 static uint16_t statusColor    = 0xFFFF;
+static volatile bool rxFlag     = false;
+static uint32_t meshLogLastWarnMs = 0;
+
+struct HeardNode {
+    uint32_t nodeId;
+    uint8_t  channelHash;
+    float    rssi;
+    float    snr;
+    uint32_t lastSeenMs;
+    uint32_t lastAnnounceMs;
+    bool     valid;
+};
+
+#define HEARD_NODES_SIZE 16
+#define HEARD_NODE_ANNOUNCE_MS 60000UL
+static HeardNode heardNodes[HEARD_NODES_SIZE];
+static int heardNodeReplaceIdx = 0;
+
+#define MESH_LOG_DIR   "/mesh_logs"
+#define MESH_LOG_PATH  "/mesh_logs/messages.csv"
 
 // Seen packet IDs for dedup (rolling 16-entry cache)
 #define SEEN_IDS_SIZE  16
 static uint32_t seenIds[SEEN_IDS_SIZE] = {0};
 static int      seenIdx = 0;
+
+static bool ensureMsgStore() {
+    if (msgStore) return true;
+    msgStore = (MeshMsg (*)[MAX_MSGS_PER_CH])calloc(MAX_CHANNELS, sizeof(*msgStore));
+    if (!msgStore) {
+        Serial.println("[MESH] Message store allocation failed");
+        return false;
+    }
+    memset(msgCount, 0, sizeof(msgCount));
+    memset(msgScroll, 0, sizeof(msgScroll));
+    return true;
+}
+
+static void freeMsgStore() {
+    if (!msgStore) return;
+    free(msgStore);
+    msgStore = nullptr;
+    memset(msgCount, 0, sizeof(msgCount));
+    memset(msgScroll, 0, sizeof(msgScroll));
+    memset(heardNodes, 0, sizeof(heardNodes));
+    heardNodeReplaceIdx = 0;
+}
 
 // ─────────────────────────────────────────────
 //  COLORS (cyberpunk theme)
@@ -158,16 +253,44 @@ static int      seenIdx = 0;
 // ─────────────────────────────────────────────
 //  LAYOUT
 // ─────────────────────────────────────────────
-// Channel tab bar: y=0..22
-// Message area:   y=23..208
-// Input bar:      y=209..239
-#define HDR_H       23
-#define INPUT_Y     209
-#define INPUT_H     31
-#define MSG_Y       HDR_H
-#define MSG_H       (INPUT_Y - HDR_H)
-#define MSG_ROW_H   12
-#define MSG_ROWS    ((MSG_H - 2) / MSG_ROW_H)
+// Layout is derived from the active display at runtime:
+//   T-Deck Plus:    320x240
+//   T-LoRa Pager:   480x222
+//   Cardputer ADV:  240x135
+static constexpr int MESH_HDR_H     = 23;
+static constexpr int MESH_MSG_ROW_H = 12;
+
+static int meshDispW() {
+    return gfx ? gfx->width() : 320;
+}
+
+static int meshDispH() {
+    return gfx ? gfx->height() : 240;
+}
+
+static int meshInputH() {
+    return (meshDispH() <= 135) ? 32 : 31;
+}
+
+static int meshInputY() {
+    return max(MESH_HDR_H + MESH_MSG_ROW_H, meshDispH() - meshInputH());
+}
+
+static int meshMsgY() {
+    return MESH_HDR_H;
+}
+
+static int meshMsgH() {
+    return max(MESH_MSG_ROW_H, meshInputY() - meshMsgY());
+}
+
+static int meshRows() {
+    return max(1, (meshMsgH() - 2) / MESH_MSG_ROW_H);
+}
+
+static int meshTabW() {
+    return max(1, meshDispW() / MAX_CHANNELS);
+}
 
 // ─────────────────────────────────────────────
 //  RADIOLIB INSTANCE
@@ -181,6 +304,10 @@ static SPISettings lspSettings(2000000, MSBFIRST, SPI_MODE0);
 
 static Module*  loraModule = nullptr;
 static SX1262*  radio      = nullptr;
+
+static void IRAM_ATTR meshRxISR() {
+    rxFlag = true;
+}
 
 // ─────────────────────────────────────────────
 //  NODE ID
@@ -283,13 +410,21 @@ struct __attribute__((packed)) MeshHeader {
     uint32_t dest;
     uint32_t from;
     uint32_t id;
-    uint32_t flags;    // bits[2:0]=hop_limit, bit[3]=want_ack, bits[6:4]=hop_start
+    uint8_t  flags;       // bits[2:0]=hop_limit, bit[3]=want_ack, bit[4]=via_mqtt, bits[7:5]=hop_start
+    uint8_t  channel;     // Meshtastic channel hash
+    uint8_t  nextHop;     // next-hop node-id low byte, or 0
+    uint8_t  relayNode;   // relay-node node-id low byte, or 0
 };
 
-static uint32_t makeFlags(int hopLimit, bool wantAck, int hopStart) {
-    return ((uint32_t)(hopLimit & 0x07)) |
-           ((uint32_t)(wantAck ? 1 : 0) << 3) |
-           ((uint32_t)(hopStart & 0x07) << 4);
+static uint8_t makeFlags(int hopLimit, bool wantAck, int hopStart, bool viaMqtt = false) {
+    return (uint8_t)(((hopLimit & 0x07)) |
+                     ((wantAck ? 1 : 0) << 3) |
+                     ((viaMqtt ? 1 : 0) << 4) |
+                     ((hopStart & 0x07) << 5));
+}
+
+static uint8_t meshChannelHashForAppChannel(int ch) {
+    return (ch == 0) ? MESH_LONGFAST_CHANNEL_HASH : (uint8_t)(0x80 | (ch & 0x7F));
 }
 
 static bool alreadySeen(uint32_t id) {
@@ -315,6 +450,29 @@ static float channelFreq(int ch) {
     return LORA_FREQ + (ch * 3.125f);
 }
 
+static int armReceiveLocked(int ch) {
+    if (!radio) return RADIOLIB_ERR_UNKNOWN;
+    int state = radio->setFrequency(channelFreq(ch));
+    if (state != RADIOLIB_ERR_NONE) return state;
+    rxFlag = false;
+    return radio->startReceive();
+}
+
+static bool armReceive(int ch, uint32_t wait_ms = 500) {
+    if (!radio || !radioReady) return false;
+    if (!spi_mutex || xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(wait_ms)) != pdTRUE) {
+        Serial.println("[MESH] RX arm: SPI mutex timeout");
+        return false;
+    }
+    int state = armReceiveLocked(ch);
+    xSemaphoreGiveRecursive(spi_mutex);
+    if (state != RADIOLIB_ERR_NONE) {
+        Serial.printf("[MESH] RX arm failed: %d\n", state);
+        return false;
+    }
+    return true;
+}
+
 // ─────────────────────────────────────────────
 //  STATUS BAR
 // ─────────────────────────────────────────────
@@ -330,6 +488,7 @@ static void setStatus(const char* msg, uint16_t col = COL_ACCENT) {
 static void addMsg(int ch, const char* sender, const char* text,
                    uint32_t nodeId, bool outgoing) {
     if (ch < 0 || ch >= MAX_CHANNELS) return;
+    if (!ensureMsgStore()) return;
     int idx = msgCount[ch] % MAX_MSGS_PER_CH;
     MeshMsg& m = msgStore[ch][idx];
     strncpy(m.sender, sender, MAX_SENDER_LEN-1);
@@ -342,20 +501,166 @@ static void addMsg(int ch, const char* sender, const char* text,
     msgCount[ch]++;
     // Auto-scroll to bottom
     int total = min(msgCount[ch], MAX_MSGS_PER_CH);
-    msgScroll[ch] = max(0, total - MSG_ROWS);
+    msgScroll[ch] = max(0, total - meshRows());
+}
+
+static bool appendMeshTranscript(int ch, int headerCh, const char* sender,
+                                 const char* text, uint32_t nodeId,
+                                 bool outgoing, float rssi, float snr);
+
+static int meshtasticHashToDisplayChannel(uint8_t channelHash) {
+    if (channelHash == MESH_LONGFAST_CHANNEL_HASH) return 0;
+    if ((channelHash & 0x80) != 0) {
+        int ch = channelHash & 0x7F;
+        if (ch > 0 && ch < MAX_CHANNELS) return ch;
+    }
+    return currentCh;
+}
+
+static void noteHeardNode(uint32_t nodeId, uint8_t channelHash, float rssi, float snr,
+                          bool decodedText, size_t payloadLen) {
+    if (nodeId == 0 || nodeId == myNodeId) return;
+
+    uint32_t now = millis();
+    int idx = -1;
+    for (int i = 0; i < HEARD_NODES_SIZE; i++) {
+        if (heardNodes[i].valid && heardNodes[i].nodeId == nodeId) {
+            idx = i;
+            break;
+        }
+    }
+
+    bool isNew = false;
+    if (idx < 0) {
+        idx = heardNodeReplaceIdx;
+        heardNodeReplaceIdx = (heardNodeReplaceIdx + 1) % HEARD_NODES_SIZE;
+        heardNodes[idx].valid = true;
+        heardNodes[idx].nodeId = nodeId;
+        heardNodes[idx].lastAnnounceMs = 0;
+        isNew = true;
+    }
+
+    HeardNode& n = heardNodes[idx];
+    n.channelHash = channelHash;
+    n.rssi = rssi;
+    n.snr = snr;
+    n.lastSeenMs = now;
+
+    if (decodedText && !isNew) return;
+    if (!isNew && now - n.lastAnnounceMs < HEARD_NODE_ANNOUNCE_MS) return;
+    n.lastAnnounceMs = now;
+
+    char senderStr[MAX_SENDER_LEN];
+    snprintf(senderStr, sizeof(senderStr), "!%06x", (unsigned)(nodeId & 0xFFFFFF));
+
+    char msg[96];
+    snprintf(msg, sizeof(msg), "heard %s %s h=%02X len=%u r=%.0f s=%.1f",
+             senderStr,
+             decodedText ? "text" : "raw/enc",
+             channelHash,
+             (unsigned)payloadLen,
+             rssi,
+             snr);
+
+    int ch = meshtasticHashToDisplayChannel(channelHash);
+    addMsg(ch, "~node", msg, nodeId, false);
+    appendMeshTranscript(ch, ch, "~node", msg, nodeId, false, rssi, snr);
+}
+
+static void csvPrintEscaped(FsFile& file, const char* text) {
+    file.print('"');
+    for (const char* p = text; p && *p; ++p) {
+        if (*p == '"') {
+            file.print("\"\"");
+        } else if (*p == '\r' || *p == '\n') {
+            file.print(' ');
+        } else {
+            file.print(*p);
+        }
+    }
+    file.print('"');
+}
+
+static bool appendMeshTranscript(int ch, int headerCh, const char* sender,
+                                 const char* text, uint32_t nodeId,
+                                 bool outgoing, float rssi, float snr) {
+    if (!g_sd_ready) return false;
+    if (!spi_mutex || xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(250)) != pdTRUE) {
+        return false;
+    }
+
+    bool ok = false;
+    bool existed = sd.exists(MESH_LOG_PATH);
+    if (!sd.exists(MESH_LOG_DIR)) {
+        sd.mkdir(MESH_LOG_DIR);
+    }
+
+    FsFile file = sd.open(MESH_LOG_PATH, O_WRITE | O_CREAT | O_APPEND);
+    if (file) {
+        if (!existed || file.size() == 0) {
+            file.println("millis,direction,channel,header_channel,node_id,sender,rssi,snr,text");
+        }
+
+        file.print(millis());
+        file.print(',');
+        file.print(outgoing ? "tx" : "rx");
+        file.print(',');
+        file.print(ch);
+        file.print(',');
+        file.print(headerCh);
+        file.print(',');
+        file.print("0x");
+        file.print(nodeId, HEX);
+        file.print(',');
+        csvPrintEscaped(file, sender);
+        file.print(',');
+        if (outgoing) {
+            file.print(',');
+        } else {
+            file.print(rssi, 0);
+            file.print(',');
+            file.print(snr, 1);
+        }
+        file.print(',');
+        csvPrintEscaped(file, text);
+        file.println();
+        file.sync();
+        file.close();
+        ok = true;
+    }
+
+    xSemaphoreGiveRecursive(spi_mutex);
+
+    if (!ok && millis() - meshLogLastWarnMs > 5000) {
+        Serial.println("[MESH] SD transcript write failed");
+        meshLogLastWarnMs = millis();
+    }
+    return ok;
 }
 
 // ─────────────────────────────────────────────
 //  RADIO INIT
 // ─────────────────────────────────────────────
 static bool initRadio() {
-    // SPI bus already running from main.cpp — just reference it
-    loraModule = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY,
+    // SPI bus selection per device:
+    //   Cardputer: SX1262 lives on HSPI (peripheral bus 14/39/40)
+    //   T-Deck / Pager: SX1262 shares the same FSPI bus as TFT/SD
+    //
+    // On Cardputer, the default `SPI` instance was bound to the LCD
+    // pins (35/36) during display init — talking to SX1262 through
+    // that bus reaches no one. The Cap is on the HSPI bus alongside
+    // SD; both share via SPI Bus Treaty mutex with different CS.
+#ifdef DEVICE_CARDPUTER_ADV
+    loraModule = new Module(MESH_LORA_CS, MESH_LORA_DIO1, MESH_LORA_RST, MESH_LORA_BUSY,
+                            cardputerSdSPI, lspSettings);
+#else
+    loraModule = new Module(MESH_LORA_CS, MESH_LORA_DIO1, MESH_LORA_RST, MESH_LORA_BUSY,
                             SPI, lspSettings);
+#endif
     radio = new SX1262(loraModule);
 
     // SPI Bus Treaty: Take mutex during full radio initialization
-    if (!spi_mutex || xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+    if (!spi_mutex || xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
         Serial.println("[MESH] initRadio: SPI mutex timeout");
         delete radio; radio = nullptr;
         delete loraModule; loraModule = nullptr;
@@ -373,8 +678,19 @@ static bool initRadio() {
     );
 
     if (state != RADIOLIB_ERR_NONE) {
-        xSemaphoreGive(spi_mutex);
+        xSemaphoreGiveRecursive(spi_mutex);
         Serial.printf("[MESH] Radio init failed: %d\n", state);
+        // Tear down both radio and module so the exit path doesn't
+        // try to standby()/delete a half-initialized SX1262 object.
+        // Without this, exiting Mesh Messenger after a failed init
+        // calls radio->standby() on a chip that never completed
+        // begin(), which can hang an SPI transaction or dereference
+        // an internal field that init never populated. Setting both
+        // pointers to nullptr makes the cleanup at end of loop into
+        // a no-op, and any later code that null-checks `radio` will
+        // skip its work cleanly.
+        delete radio;       radio = nullptr;
+        delete loraModule;  loraModule = nullptr;
         return false;
     }
 
@@ -384,8 +700,10 @@ static bool initRadio() {
     radio->setCurrentLimit(140.0f);
     // Set RX boosted gain
     radio->setRxBoostedGainMode(true);
+    radio->setPacketReceivedAction(meshRxISR);
+    rxFlag = false;
 
-    xSemaphoreGive(spi_mutex);
+    xSemaphoreGiveRecursive(spi_mutex);
 
     Serial.printf("[MESH] Radio ready. NodeID: %08x  Freq: %.3f MHz\n",
                   (unsigned)myNodeId, LORA_FREQ);
@@ -394,6 +712,8 @@ static bool initRadio() {
 
 static void deinitRadio() {
     if (radio) {
+        radio->clearPacketReceivedAction();
+        rxFlag = false;
         radio->standby();
         delete radio;
         radio = nullptr;
@@ -423,30 +743,48 @@ static bool sendText(int ch, const char* text) {
     hdr->from  = myNodeId;
     hdr->id    = (uint32_t)(esp_random());
     hdr->flags = makeFlags(MESH_HOP_LIMIT, false, MESH_HOP_LIMIT);
+    hdr->channel = meshChannelHashForAppChannel(ch);
+    hdr->nextHop = 0;
+    hdr->relayNode = 0;
 
     memcpy(pkt + sizeof(MeshHeader), payload, payloadLen);
     int totalLen = sizeof(MeshHeader) + payloadLen;
 
     // SPI Bus Treaty: Take mutex before LoRa SPI access
-    if (!spi_mutex || xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    if (!spi_mutex || xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
         Serial.println("[MESH] TX: SPI mutex timeout");
         return false;
     }
 
     // Tune to channel frequency
-    radio->setFrequency(channelFreq(ch));
+    int tuneState = radio->setFrequency(channelFreq(ch));
+    if (tuneState != RADIOLIB_ERR_NONE) {
+        armReceiveLocked(currentCh);
+        xSemaphoreGiveRecursive(spi_mutex);
+        Serial.printf("[MESH] TX tune failed: %d\n", tuneState);
+        return false;
+    }
 
+    rxFlag = false;
     transmitting = true;
     int state = radio->transmit(pkt, totalLen);
     transmitting = false;
+    rxFlag = false;
 
-    xSemaphoreGive(spi_mutex);
+    int rxState = armReceiveLocked(currentCh);
+
+    xSemaphoreGiveRecursive(spi_mutex);
+
+    if (rxState != RADIOLIB_ERR_NONE) {
+        Serial.printf("[MESH] RX re-arm after TX failed: %d\n", rxState);
+    }
 
     if (state == RADIOLIB_ERR_NONE) {
         markSeen(hdr->id);
         char senderStr[MAX_SENDER_LEN];
         snprintf(senderStr, sizeof(senderStr), "~me");
         addMsg(ch, senderStr, text, myNodeId, true);
+        appendMeshTranscript(ch, ch, senderStr, text, myNodeId, true, 0.0f, 0.0f);
         Serial.printf("[MESH] TX ch%d id=%08x: %s\n", ch, (unsigned)hdr->id, text);
         return true;
     } else {
@@ -456,37 +794,59 @@ static bool sendText(int ch, const char* text) {
 }
 
 // ─────────────────────────────────────────────
-//  RECEIVE — non-blocking poll
+//  RECEIVE — interrupt flag + non-blocking read
 // ─────────────────────────────────────────────
-static void pollReceive() {
-    if (!radio || transmitting) return;
+static int pollReceive() {
+    if (!radio || transmitting || !rxFlag) return 0;
+    rxFlag = false;
 
-    // SPI Bus Treaty: try mutex non-blocking. Skip if busy.
-    if (!spi_mutex || xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
+    // SPI Bus Treaty: try mutex non-blocking. If the bus is busy,
+    // keep the flag set so the next loop can drain the packet.
+    if (!spi_mutex || xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        rxFlag = true;
+        return 0;
+    }
 
     uint8_t buf[256];
-    int state = radio->receive(buf, sizeof(buf));
+    size_t rxLen = radio->getPacketLength();
+    size_t readLen = (rxLen > 0) ? min(rxLen, sizeof(buf)) : sizeof(buf);
+    int state = radio->readData(buf, readLen);
+    float snr = 0.0f;
+    float rssi = 0.0f;
+    if (state == RADIOLIB_ERR_NONE || state == RADIOLIB_ERR_CRC_MISMATCH) {
+        rssi = radio->getRSSI();
+        snr  = radio->getSNR();
+    }
+    int rxState = armReceiveLocked(currentCh);
 
-    xSemaphoreGive(spi_mutex);
+    xSemaphoreGiveRecursive(spi_mutex);
+
+    if (rxState != RADIOLIB_ERR_NONE) {
+        Serial.printf("[MESH] RX re-arm failed: %d\n", rxState);
+    }
 
     if (state == RADIOLIB_ERR_NONE) {
-        int rxLen = radio->getPacketLength();
-        if (rxLen <= (int)sizeof(MeshHeader)) return;
+        if (rxLen > sizeof(buf)) {
+            Serial.printf("[MESH] RX packet too large: %u\n", (unsigned)rxLen);
+            return 0;
+        }
+        if (rxLen <= (int)sizeof(MeshHeader)) return 0;
 
         MeshHeader* hdr = (MeshHeader*)buf;
         uint32_t destId = hdr->dest;
         uint32_t fromId = hdr->from;
         uint32_t pktId  = hdr->id;
+        uint8_t channelHash = hdr->channel;
 
         // Ignore our own packets
-        if (fromId == myNodeId) return;
+        if (fromId == myNodeId) return 0;
 
         // Deduplicate
-        if (alreadySeen(pktId)) return;
+        if (alreadySeen(pktId)) return 0;
         markSeen(pktId);
 
         // Only show broadcast or packets destined for us
-        if (destId != MESH_BROADCAST && destId != myNodeId) return;
+        if (destId != MESH_BROADCAST && destId != myNodeId) return 0;
 
         uint8_t* payload = buf + sizeof(MeshHeader);
         int payloadLen   = rxLen - sizeof(MeshHeader);
@@ -496,30 +856,55 @@ static void pollReceive() {
         bool hasText = decodeTextPayload(payload, payloadLen,
                                           textBuf, sizeof(textBuf), &portnum);
 
-        if (!hasText || portnum != 1) return;  // Only TEXT_MESSAGE_APP
+        bool isText = hasText && portnum == 1;
+        noteHeardNode(fromId, channelHash, rssi, snr, isText, payloadLen);
+        if (!isText) {
+            Serial.printf("[MESH] RX raw/enc hash=%02X from !%06x len=%d RSSI=%.0f SNR=%.1f\n",
+                          channelHash, (unsigned)(fromId & 0xFFFFFF), payloadLen, rssi, snr);
+            return 2;
+        }
 
-        // Determine which channel to show on based on flags channel bits
-        // Meshtastic uses a channel hash — we simplify to hop_start as channel hint
-        int hopStart = (hdr->flags >> 4) & 0x07;
-        int rxCh = min(hopStart, MAX_CHANNELS - 1);
+        // We can only receive on the frequency the radio is currently tuned to,
+        // so display on currentCh. The Meshtastic channel hash is logged as
+        // the network-layer diagnostic; channel 0 should be LongFast hash 0x02.
+        int hopStart = (hdr->flags >> 5) & 0x07;
+        int headerCh = meshtasticHashToDisplayChannel(channelHash);
+        int rxCh = currentCh;
 
         char senderStr[MAX_SENDER_LEN];
         snprintf(senderStr, sizeof(senderStr), "!%06x",
                  (unsigned)(fromId & 0xFFFFFF));
 
-        float snr  = radio->getSNR();
-        float rssi = radio->getRSSI();
-
         addMsg(rxCh, senderStr, textBuf, fromId, false);
-        Serial.printf("[MESH] RX ch%d from %s: %s  RSSI=%.0f SNR=%.1f\n",
-                      rxCh, senderStr, textBuf, rssi, snr);
+        appendMeshTranscript(rxCh, headerCh, senderStr, textBuf, fromId, false, rssi, snr);
+        Serial.printf("[MESH] RX ch%d hash=%02X hop=%d from %s: %s  RSSI=%.0f SNR=%.1f\n",
+                      rxCh, channelHash, hopStart, senderStr, textBuf, rssi, snr);
 
-        // Brief notification if we're on a different channel
-        if (rxCh != currentCh) {
-            char notif[48];
-            snprintf(notif, sizeof(notif), "New msg in %s", CHANNEL_NAMES[rxCh]);
-            setStatus(notif, COL_YELLOW);
+        // ── Bridge streaming hook ─────────────────────────────────────
+        // Emit mesh_link JSON so pm_bridge.py can log to lora_*.csv
+        // and The Clinician can receive live LoRa topology data.
+        if (wardrive_bridge_streaming) {
+            // Our node ID — last 6 hex chars of MAC
+            char myNodeStr[12];
+            snprintf(myNodeStr, sizeof(myNodeStr), "!%06x",
+                     (unsigned)(getNodeId() & 0xFFFFFF));
+            // Get frequency from radio config
+            float freq_mhz = 915.0f;  // default; override if radio exposes it
+            Serial.printf(
+                "{\"event\":\"mesh_link\","
+                "\"from\":\"%s\",\"to\":\"%s\","
+                "\"rssi\":%.0f,\"snr\":%.1f,"
+                "\"freq\":%.1f,\"sf\":7,\"bw\":125,"
+                "\"quality\":%d,"
+                "\"lat\":%.6f,\"lng\":%.6f}\n",
+                senderStr, myNodeStr,
+                rssi, snr, freq_mhz,
+                (int)max(0.0f, min(100.0f, (rssi + 120.0f) * 100.0f / 80.0f)),
+                gps.location.isValid() ? gps.location.lat() : 0.0,
+                gps.location.isValid() ? gps.location.lng() : 0.0);
         }
+
+        return 2;
 
     } else if (state != RADIOLIB_ERR_RX_TIMEOUT &&
                state != RADIOLIB_ERR_CRC_MISMATCH) {
@@ -528,34 +913,40 @@ static void pollReceive() {
     }
 
     // No retune needed — pollReceive doesn't change channel
+    return 0;
 }
 
 // ─────────────────────────────────────────────
 //  DRAWING
 // ─────────────────────────────────────────────
 static void drawHeader() {
-    gfx->fillRect(0, 0, 320, HDR_H, COL_HDR);
-    gfx->drawFastHLine(0, HDR_H-1, 320, COL_ACCENT);
+    const int w = meshDispW();
+    const int tabW = meshTabW();
+    gfx->fillRect(0, 0, w, MESH_HDR_H, COL_HDR);
+    gfx->drawFastHLine(0, MESH_HDR_H - 1, w, COL_ACCENT);
 
     // Channel tabs
-    int tabW = 80;
     for (int i = 0; i < MAX_CHANNELS; i++) {
         int tx = i * tabW;
         bool active = (i == currentCh);
-        gfx->fillRect(tx, 0, tabW-1, HDR_H-1, active ? 0x0020 : COL_HDR);
-        if (active) gfx->drawFastHLine(tx, HDR_H-1, tabW-1, COL_ACCENT);
+        int tabRight = (i == MAX_CHANNELS - 1) ? w : tx + tabW;
+        int tabPixels = max(1, tabRight - tx);
+        gfx->fillRect(tx, 0, tabPixels - 1, MESH_HDR_H - 1, active ? 0x0020 : COL_HDR);
+        if (active) gfx->drawFastHLine(tx, MESH_HDR_H - 1, tabPixels - 1, COL_ACCENT);
         gfx->setTextSize(1);
         gfx->setTextColor(active ? COL_CH_ACTIVE : COL_CH_INACTIVE);
         gfx->setCursor(tx+4, 7);
         // Short name for tab
         const char* name = CHANNEL_NAMES[i] + 1; // skip '#'
-        char shortName[8];
-        strncpy(shortName, name, 7); shortName[7] = '\0';
+        char shortName[16];
+        int maxChars = min((int)sizeof(shortName) - 1, max(1, (tabPixels - 12) / 6));
+        strncpy(shortName, name, maxChars);
+        shortName[maxChars] = '\0';
         gfx->print(shortName);
 
         // Unread dot
         if (!active && msgCount[i] > 0) {
-            gfx->fillCircle(tx + tabW - 6, 5, 3, COL_YELLOW);
+            gfx->fillCircle(tabRight - 6, 5, 3, COL_YELLOW);
         }
     }
 
@@ -564,22 +955,26 @@ static void drawHeader() {
 }
 
 static void drawMessages() {
-    gfx->fillRect(0, MSG_Y, 320, MSG_H, COL_BG);
+    const int w = meshDispW();
+    const int msgY = meshMsgY();
+    const int msgH = meshMsgH();
+    const int inputY = meshInputY();
+    gfx->fillRect(0, msgY, w, msgH, COL_BG);
 
     int ch = currentCh;
     int total = min(msgCount[ch], MAX_MSGS_PER_CH);
     if (total == 0) {
         gfx->setTextSize(1); gfx->setTextColor(COL_DIM);
-        gfx->setCursor(8, MSG_Y + MSG_H/2 - 6);
+        gfx->setCursor(8, msgY + msgH / 2 - 6);
         gfx->print("No messages. Type below and press ENTER.");
         return;
     }
 
     // Draw from scroll position
     int startIdx = msgScroll[ch];
-    int y = MSG_Y + 2;
+    int y = msgY + 2;
 
-    for (int i = startIdx; i < total && y < INPUT_Y - MSG_ROW_H; i++) {
+    for (int i = startIdx; i < total && y < inputY - MESH_MSG_ROW_H; i++) {
         MeshMsg& m = msgStore[ch][i % MAX_MSGS_PER_CH];
         if (!m.valid) continue;
 
@@ -599,33 +994,73 @@ static void drawMessages() {
         gfx->setCursor(2 + senderPixels, y);
 
         // Simple truncation to fit on one line
-        int maxChars = (318 - senderPixels) / 6;
+        int maxChars = max(1, (w - 4 - senderPixels) / 6);
         char display[64];
         strncpy(display, m.text, min(maxChars, 63));
         display[min(maxChars, 63)] = '\0';
         gfx->print(display);
 
-        y += MSG_ROW_H;
+        y += MESH_MSG_ROW_H;
     }
 
     // Scroll indicator
-    if (total > MSG_ROWS) {
+    if (total > meshRows()) {
+        int indicatorX = max(0, w - 10);
         gfx->setTextColor(COL_DIM);
-        gfx->setCursor(310, MSG_Y + 2);
+        gfx->setCursor(indicatorX, msgY + 2);
         gfx->print("^");
-        gfx->setCursor(310, INPUT_Y - 10);
+        gfx->setCursor(indicatorX, inputY - 10);
         gfx->print("v");
     }
 }
 
 static void drawInput() {
-    gfx->fillRect(0, INPUT_Y, 320, INPUT_H, COL_INPUT_BG);
-    gfx->drawFastHLine(0, INPUT_Y, 320, COL_ACCENT);
+    const int w = meshDispW();
+    const int inputY = meshInputY();
+    const int inputH = meshInputH();
+    gfx->fillRect(0, inputY, w, inputH, COL_INPUT_BG);
+    gfx->drawFastHLine(0, inputY, w, COL_ACCENT);
+
+    if (w <= 240) {
+        gfx->setTextSize(1);
+        gfx->setTextColor(COL_ACCENT);
+        gfx->setCursor(2, inputY + 3);
+        gfx->print(CHANNEL_NAMES[currentCh]);
+        gfx->print(">");
+
+        if (millis() - lastStatusMs < 3000) {
+            int statusChars = min((int)strlen(statusMsg), max(0, (w - 92) / 6));
+            if (statusChars > 0) {
+                char compactStatus[16];
+                strncpy(compactStatus, statusMsg, min(statusChars, (int)sizeof(compactStatus) - 1));
+                compactStatus[min(statusChars, (int)sizeof(compactStatus) - 1)] = '\0';
+                gfx->setTextColor(statusColor);
+                gfx->setCursor(w - (int)strlen(compactStatus) * 6 - 4, inputY + 3);
+                gfx->print(compactStatus);
+            }
+        }
+
+        gfx->setCursor(2, inputY + 17);
+        if (inputLen > 0) {
+            int maxChars = max(2, (w - 6) / 6 - 1); // leave room for cursor
+            bool clipped = inputLen > maxChars;
+            int shownChars = clipped ? maxChars - 1 : maxChars;
+            int start = max(0, inputLen - shownChars);
+            gfx->setTextColor(COL_INPUT_FG);
+            if (clipped) gfx->print("<");
+            gfx->print(inputBuf + start);
+            gfx->print("_");
+        } else {
+            gfx->setTextColor(COL_DIM);
+            gfx->print("type message...");
+        }
+        return;
+    }
 
     // Channel prefix
     gfx->setTextSize(1);
     gfx->setTextColor(COL_ACCENT);
-    gfx->setCursor(2, INPUT_Y + 10);
+    gfx->setCursor(2, inputY + 10);
     gfx->print(CHANNEL_NAMES[currentCh]);
     gfx->print(">");
 
@@ -633,10 +1068,11 @@ static void drawInput() {
 
     // Input text
     gfx->setTextColor(COL_INPUT_FG);
-    gfx->setCursor(prefixW + 2, INPUT_Y + 10);
+    gfx->setCursor(prefixW + 2, inputY + 10);
     if (inputLen > 0) {
         // Show last N chars that fit
-        int maxChars = (318 - prefixW) / 6 - 1;
+        int reserve = (w >= 300) ? 82 : 4;
+        int maxChars = max(1, (w - prefixW - reserve) / 6 - 1);
         int start = max(0, inputLen - maxChars);
         gfx->print(inputBuf + start);
         // Cursor blink approximation
@@ -647,18 +1083,20 @@ static void drawInput() {
     }
 
     // Status bar (right side of input)
-    if (millis() - lastStatusMs < 3000) {
-        gfx->setTextColor(statusColor);
-        gfx->setCursor(200, INPUT_Y + 10);
-        gfx->print(statusMsg);
-    } else if (!radioReady) {
-        gfx->setTextColor(COL_RED);
-        gfx->setCursor(240, INPUT_Y + 10);
-        gfx->print("[NO RADIO]");
-    } else {
-        gfx->setTextColor(COL_DIM);
-        gfx->setCursor(260, INPUT_Y + 10);
-        gfx->print("[MESH]");
+    if (w >= 300) {
+        if (millis() - lastStatusMs < 3000) {
+            gfx->setTextColor(statusColor);
+            gfx->setCursor(max(prefixW + 48, w - 120), inputY + 10);
+            gfx->print(statusMsg);
+        } else if (!radioReady) {
+            gfx->setTextColor(COL_RED);
+            gfx->setCursor(max(prefixW + 48, w - 72), inputY + 10);
+            gfx->print("[NO RADIO]");
+        } else {
+            gfx->setTextColor(COL_DIM);
+            gfx->setCursor(max(prefixW + 48, w - 42), inputY + 10);
+            gfx->print("[MESH]");
+        }
     }
 }
 
@@ -674,15 +1112,34 @@ static void drawMessagesAndInput() {
     drawInput();
 }
 
+static void meshSwitchChannel(int delta) {
+    int next = (currentCh + delta + MAX_CHANNELS) % MAX_CHANNELS;
+    if (next == currentCh) return;
+    currentCh = next;
+    inputLen = 0;
+    inputBuf[0] = '\0';
+    armReceive(currentCh);
+    drawFull();
+}
+
 // ─────────────────────────────────────────────
 //  MAIN ENTRY
 // ─────────────────────────────────────────────
 void run_mesh_messenger() {
     myNodeId = getNodeId();
+    if (!ensureMsgStore()) {
+        gfx->fillScreen(COL_BG);
+        gfx->setTextSize(1);
+        gfx->setTextColor(COL_RED);
+        gfx->setCursor(8, 40);
+        gfx->print("Mesh message memory unavailable.");
+        delay(1200);
+        return;
+    }
 
     // Show init screen
     gfx->fillScreen(COL_BG);
-    gfx->fillRect(0, 0, 320, HDR_H, COL_HDR);
+    gfx->fillRect(0, 0, meshDispW(), MESH_HDR_H, COL_HDR);
     gfx->setTextSize(1); gfx->setTextColor(COL_ACCENT);
     gfx->setCursor(8, 7); gfx->print("MESH MESSENGER — INITIALIZING");
     gfx->setTextColor(0xFFFF);
@@ -704,7 +1161,7 @@ void run_mesh_messenger() {
         gfx->print("Tap header to exit.");
         while (true) {
             int16_t tx, ty;
-            if (get_touch(&tx,&ty) && ty<HDR_H) {
+            if (get_touch(&tx,&ty) && ty < MESH_HDR_H) {
                 while(get_touch(&tx,&ty)){delay(10);}
                 break;
             }
@@ -712,6 +1169,7 @@ void run_mesh_messenger() {
             if (k=='q'||k=='Q') break;
             delay(50);
         }
+        freeMsgStore();
         return;
     }
 
@@ -727,30 +1185,31 @@ void run_mesh_messenger() {
     char idMsg[64];
     snprintf(idMsg, sizeof(idMsg), "Your node ID: !%08x", (unsigned)myNodeId);
     addMsg(0, "~sys", idMsg, 0, false);
+    addMsg(0, "~sys",
+           g_sd_ready ? "SD transcript: /mesh_logs/messages.csv"
+                      : "SD not ready; transcript disabled this run.",
+           0, false);
+#ifdef DEVICE_TLORAPAGER
+    addMsg(0, "~sys", "WHEEL=switch channel  CLICK=send  Q=quit", 0, false);
+#elif defined(DEVICE_CARDPUTER_ADV)
     addMsg(0, "~sys", "TAB=switch channel  ENTER=send  Q=quit", 0, false);
+#else
+    addMsg(0, "~sys", "TAB=switch channel  ENTER=send  Q=quit", 0, false);
+#endif
 
     drawFull();
 
-    // Start async RX (with mutex)
-    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-        radio->startReceive();
-        xSemaphoreGive(spi_mutex);
-    }
+    armReceive(currentCh);
 
     bool running = true;
-    uint32_t lastRx    = millis();
     uint32_t lastDraw  = millis();
 
     while (running) {
 
-        // ── Poll for received packets ──
-        if (millis() - lastRx > 50) {
-            pollReceive();
-            if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                radio->startReceive();
-                xSemaphoreGive(spi_mutex);
-            }
-            lastRx = millis();
+        // ── Drain received packets only when DIO1 has fired ──
+        int meshUiUpdate = pollReceive();
+        if (meshUiUpdate == 2) {
+            drawMessagesAndInput();
         }
 
         // ── Periodic UI refresh ──
@@ -766,7 +1225,7 @@ void run_mesh_messenger() {
 
         // Header tap — top half = exit, bottom half = channel switch
         // Use ty < 40 for GT911 calibration tolerance
-        if (get_touch(&tx, &ty) && ty < 40) {
+        if (get_touch(&tx, &ty) && ty < MESH_HDR_H + 17) {
             while(get_touch(&tx,&ty)){delay(10);}
             // Top portion of header = exit
             if (ty < 20) {
@@ -774,15 +1233,11 @@ void run_mesh_messenger() {
                 continue;
             }
             // Bottom portion of header = channel tab switch
-            int tappedCh = tx / 80;
+            int tappedCh = tx / meshTabW();
             if (tappedCh >= 0 && tappedCh < MAX_CHANNELS && tappedCh != currentCh) {
                 currentCh = tappedCh;
                 inputLen = 0; inputBuf[0] = '\0';
-                if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-                    radio->setFrequency(channelFreq(currentCh));
-                    radio->startReceive();
-                    xSemaphoreGive(spi_mutex);
-                }
+                armReceive(currentCh);
                 drawFull();
             }
             continue;
@@ -796,18 +1251,22 @@ void run_mesh_messenger() {
 
         // Tab = switch channel
         if (k == 9) {
-            currentCh = (currentCh + 1) % MAX_CHANNELS;
-            inputLen = 0; inputBuf[0] = '\0';
-            if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-                radio->setFrequency(channelFreq(currentCh));
-                radio->startReceive();
-                xSemaphoreGive(spi_mutex);
-            }
-            drawFull();
+            meshSwitchChannel(1);
             continue;
         }
 
-        // Trackball scroll messages
+#ifdef DEVICE_TLORAPAGER
+        // Pager encoder: scroll up moves one tab left, scroll down moves one tab right.
+        if (tb.y == -1) {
+            meshSwitchChannel(-1);
+            continue;
+        }
+        if (tb.y == 1) {
+            meshSwitchChannel(1);
+            continue;
+        }
+#else
+        // T-Deck trackball: vertical movement scrolls the message history.
         if (tb.y == -1) {
             int total = min(msgCount[currentCh], MAX_MSGS_PER_CH);
             if (msgScroll[currentCh] > 0) {
@@ -817,11 +1276,12 @@ void run_mesh_messenger() {
         }
         if (tb.y == 1) {
             int total = min(msgCount[currentCh], MAX_MSGS_PER_CH);
-            if (msgScroll[currentCh] < total - MSG_ROWS) {
+            if (msgScroll[currentCh] < total - meshRows()) {
                 msgScroll[currentCh]++;
                 drawMessages();
             }
         }
+#endif
 
         // Enter / trackball click = send
         if ((k == 13 || tb.clicked) && inputLen > 0) {
@@ -839,10 +1299,6 @@ void run_mesh_messenger() {
             inputLen = 0;
             inputBuf[0] = '\0';
             drawMessagesAndInput();
-            if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-                radio->startReceive();
-                xSemaphoreGive(spi_mutex);
-            }
             continue;
         }
 
@@ -865,8 +1321,21 @@ void run_mesh_messenger() {
         yield();
     }
 
-    // Cleanup
-    if (radio) radio->standby();
+    // Cleanup.
+    // radio may be nullptr if initRadio() failed; deinitRadio() and the
+    // standby() call above must both null-check. (Pre-fix: standby() was
+    // called unconditionally and could crash on a half-initialized radio
+    // returning to the launcher after init_failed -2.)
+    if (radio && radioReady) {
+        // Take the SPI mutex briefly so standby() doesn't collide with
+        // any other Treaty participant (SD writes, display refresh on
+        // shared bus, etc).
+        if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            radio->standby();
+            xSemaphoreGiveRecursive(spi_mutex);
+        }
+    }
     deinitRadio();
+    freeMsgStore();
     gfx->fillScreen(COL_BG);
 }

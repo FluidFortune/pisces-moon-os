@@ -263,7 +263,7 @@ static int sshHostListScreen() {
 
     while (true) {
         int16_t tx, ty;
-        if (get_touch(&tx, &ty) && ty < 40) {
+        if (get_touch(&tx, &ty) && ty < 24) {
             while (get_touch(&tx, &ty)) delay(10);
             return -1;  // exit
         }
@@ -437,7 +437,7 @@ static void sshSession(const SSHHost& host) {
     // Passthrough loop (TCP only until SSH library installed)
     while (client.connected()) {
         int16_t tx, ty;
-        if (get_touch(&tx, &ty) && ty < 40) {
+        if (get_touch(&tx, &ty) && ty < 24) {
             while (get_touch(&tx, &ty)) delay(10);
             break;
         }

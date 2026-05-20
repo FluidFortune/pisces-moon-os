@@ -35,7 +35,10 @@
  * lora_voice.h, ssh_client.h, micropython_app.h
  */
 
+#if !defined(DEVICE_TLORAPAGER) && !defined(DEVICE_CARDPUTER_ADV)
+
 #include <Arduino.h>
+extern bool wardrive_active;  // Ghost Engine state — Core 0
 #include <Arduino_GFX_Library.h>
 #include <WiFi.h>
 #include <TinyGPSPlus.h>
@@ -48,6 +51,8 @@
 #include "audio_recorder.h"
 #include "pacman.h"
 #include "galaga.h"
+#include "tetris.h"
+#include "pole_position.h"
 #include "chess.h"
 #include "baseball.h"
 #include "pkt_sniffer.h"
@@ -275,7 +280,7 @@ static void drawCyberpunkHeader() {
     // Version tag far right
     gfx->setTextColor(C_TRACE);
     gfx->setCursor(262, 8);
-    gfx->print("v1.0.1");
+    gfx->print("v1.2.0");
 }
 
 // ─────────────────────────────────────────────
@@ -352,6 +357,8 @@ struct Category {
 
 // v1.0.1 — Bridge App
 #define APP_BRIDGE       48   // USB Serial JSON bridge for web emulator
+#define APP_TETRIS       49   // Native falling-block game
+#define APP_POLE         50   // Native pseudo-3D racer
 
 // ─────────────────────────────────────────────
 //  CATEGORY DEFINITIONS
@@ -404,11 +411,13 @@ static const Category categories[] = {
       {{"SNAKE",     APP_SNAKE},
        {"PAC-MAN",   APP_PACMAN},
        {"GALAGA",    APP_GALAGA},
+       {"TETRIS",    APP_TETRIS},
+       {"POLE",      APP_POLE},
        {"CHESS",     APP_CHESS},
        {"DOOM",      APP_DOOM},
        {"SIMCITY",   APP_SIMCITY},
        {"RETRO",     APP_RETRO}},
-      7 },
+      9 },
 
     { "INTEL", "I", 0x000F,
       {{"TERMINAL",  APP_TERMINAL},
@@ -447,6 +456,12 @@ static int  selectedCategory = -1;
 static int  openCategory     = -1;
 static int  selectedApp      = -1;
 static int  appPage          = 0;
+
+static int estimateBatteryPercent(float volts) {
+    if (volts >= 4.20f) return 100;
+    if (volts <= 3.30f) return 0;
+    return (int)((volts - 3.30f) * 100.0f / 0.90f);
+}
 
 // ─────────────────────────────────────────────
 //  GRID GEOMETRY
@@ -500,8 +515,14 @@ static void updateStatusBar() {
 
     // Battery
     gfx->setCursor(148, 226);
-    if (PMU.isBatteryConnect()) {
-        int bat = min((int)PMU.getBatteryPercent(), 100);
+    float vbat = PMU.getBattVoltage() / 1000.0f;
+    bool battVoltageLooksReal = (vbat >= 3.30f && vbat <= 4.35f);
+    if (PMU.isBatteryConnect() || battVoltageLooksReal) {
+        int bat = (int)PMU.getBatteryPercent();
+        if (bat < 0 || bat > 100 || (!PMU.isBatteryConnect() && battVoltageLooksReal)) {
+            bat = estimateBatteryPercent(vbat);
+        }
+        bat = min(max(bat, 0), 100);
         uint16_t batCol = bat > 50 ? C_MATRIX : bat > 20 ? 0xFD20 : C_APP_RED;
         gfx->setTextColor(batCol);
         gfx->printf("*BAT:%d%%", bat);
@@ -509,10 +530,23 @@ static void updateStatusBar() {
         gfx->setTextColor(0xFFE0); gfx->print("*USB");
     }
 
-    // Cyber warning
+    // Ghost Engine status indicator — always visible, auditable
+    gfx->setCursor(215, 226);
+    if (wardrive_active) {
+        // Blinking dot when actively collecting
+        bool blink = ((millis() / 600) & 1);
+        gfx->setTextColor(blink ? C_MATRIX : 0x03E0);
+        gfx->print("*GE:ON");
+    } else {
+        gfx->setTextColor(0x2104);
+        gfx->print(" GE:--");
+    }
+
+    // Cyber warning overlays GE status when in CYBER category
     if (openCategory >= 0 && strcmp(categories[openCategory].name, "CYBER") == 0) {
+        gfx->fillRect(215, 222, 105, 16, C_DARK);
         gfx->setTextColor(0xFD20);
-        gfx->setCursor(230, 226);
+        gfx->setCursor(215, 226);
         gfx->print("[AUTH ONLY]");
     }
 }
@@ -733,6 +767,8 @@ static void launchApp(int launchId) {
         case APP_SNAKE:        run_snake();                                 break;
         case APP_PACMAN:       run_pacman();                                break;
         case APP_GALAGA:       run_galaga();                                break;
+        case APP_TETRIS:       run_tetris();                                break;
+        case APP_POLE:         run_pole_position();                         break;
         case APP_CHESS:        run_chess();                                 break;
         case APP_DOOM:         run_doom();                                   break;
         case APP_SIMCITY:      run_simcity();                                break;
@@ -832,7 +868,7 @@ static void handleTouch() {
             int bx, by; getBoxPos(i, bx, by);
             if (tx >= bx && tx < bx + BOX_W && ty >= by && ty < by + BOX_H) {
                 if (doubleTap) { openFolder(i); return; }
-                if (selectedCategory != i) { selectedCategory = i; drawCategoryGrid(); }
+                if (selectedCategory != i) { selectedCategory = i; drawCategoryUI(); }
                 return;
             }
         }
@@ -848,7 +884,7 @@ static void handleTouch() {
             int bx, by; getBoxPos(slot, bx, by);
             if (tx >= bx && tx < bx + BOX_W && ty >= by && ty < by + BOX_H) {
                 if (doubleTap) { launchApp(cat.apps[appIdx].id); return; }
-                if (selectedApp != appIdx) { selectedApp = appIdx; drawAppGrid(); }
+                if (selectedApp != appIdx) { selectedApp = appIdx; drawAppUI(); }
                 return;
             }
         }
@@ -874,7 +910,7 @@ static void handleTrackball() {
             return;
         }
         if (selectedCategory == -1) {
-            selectedCategory = 0; drawCategoryGrid(); return;
+            selectedCategory = 0; drawCategoryUI(); return;
         }
         int col = selectedCategory % 3;
         int row = selectedCategory / 3;
@@ -885,7 +921,7 @@ static void handleTrackball() {
         else if (tb.y == -1 && row > 0) row--;
         int ns = row * 3 + col;
         if (ns < NUM_CATEGORIES && ns != selectedCategory) {
-            selectedCategory = ns; drawCategoryGrid();
+            selectedCategory = ns; drawCategoryUI();
         }
     } else {
         const Category& cat = categories[openCategory];
@@ -900,7 +936,7 @@ static void handleTrackball() {
         }
 
         if (selectedApp == -1) {
-            selectedApp = start; drawAppGrid(); return;
+            selectedApp = start; drawAppUI(); return;
         }
 
         int local = selectedApp - start;
@@ -920,7 +956,7 @@ static void handleTrackball() {
         int nlocal = row * 3 + col;
         int napp   = start + nlocal;
         if (napp < cat.appCount && napp != selectedApp) {
-            selectedApp = napp; drawAppGrid();
+            selectedApp = napp; drawAppUI();
         }
     }
 }
@@ -946,3 +982,463 @@ void run_launcher() {
         delay(50);
     }
 }
+
+#elif defined(DEVICE_TLORAPAGER)
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <TinyGPSPlus.h>
+#include "pm_disp_tlorapager.h"
+#include "apps.h"
+#include "ble_keymote.h"
+#include "bluetooth_app.h"
+#include "data_reader.h"
+#include "keyboard.h"
+#include "pm_input.h"
+#include "mesh_messenger.h"
+#include "pm_power.h"
+#include "theme.h"
+#include "trackball.h"
+#include "wardrive.h"
+
+extern PMDispTLoRaPager *gfx;
+extern TinyGPSPlus gps;
+extern bool exitApp;
+extern volatile bool g_sd_ready;
+extern bool wardrive_active;
+
+static constexpr int DISP_W = 480;
+static constexpr int DISP_H = 222;
+static constexpr int HEADER_H = 24;
+static constexpr int FOOTER_H = 18;
+static constexpr int BODY_TOP = HEADER_H + 8;
+static constexpr int BODY_BOTTOM = DISP_H - FOOTER_H - 4;
+static constexpr int GRID_COLS = 4;
+static constexpr int BOX_W = 96;
+static constexpr int BOX_H = 54;
+static constexpr int GAP_X = 16;
+static constexpr int GAP_Y = 14;
+static constexpr int GRID_X = 24;
+static constexpr int GRID_Y = BODY_TOP + 8;
+static constexpr int APPS_PER_PAGE = 8;
+static constexpr int BOOT_BTN_PIN = 0;
+
+static int estimateBatteryPercent(float volts) {
+    if (volts >= 4.20f) return 100;
+    if (volts <= 3.30f) return 0;
+    return (int)((volts - 3.30f) * 100.0f / 0.90f);
+}
+
+static bool readBQ27220Word(uint8_t reg, uint16_t &value) {
+    constexpr uint8_t BQ27220_ADDR = 0x55;
+    Wire.beginTransmission(BQ27220_ADDR);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom(BQ27220_ADDR, (uint8_t)2) != 2) return false;
+    uint8_t lo = Wire.read();
+    uint8_t hi = Wire.read();
+    value = (uint16_t)lo | ((uint16_t)hi << 8);
+    return true;
+}
+
+static bool readPagerBattery(int &percent, uint16_t &mv) {
+    uint16_t soc = 0;
+    mv = 0;
+    bool haveSoc = readBQ27220Word(0x2C, soc);
+    bool haveMv = readBQ27220Word(0x08, mv);
+    if (haveSoc && soc <= 100) {
+        percent = soc;
+        return true;
+    }
+    if (haveMv && mv >= 3300 && mv <= 4350) {
+        percent = estimateBatteryPercent(mv / 1000.0f);
+        return true;
+    }
+    return false;
+}
+
+struct TloraAppEntry {
+    const char *name;
+    void (*run)();
+};
+
+struct TloraCategory {
+    const char *name;
+    const char *icon;
+    uint16_t color;
+    const TloraAppEntry *apps;
+    int appCount;
+};
+
+static void run_ble_keymote();
+static void run_gemini_log();
+static void run_ref_med();
+static void run_ref_surv();
+static void run_sleep();
+
+static const TloraAppEntry APPS_COMMS[] = {
+    {"WIFI JOIN", run_wifi_connect},
+    {"GPS",       run_gps},
+    {"MESH",      run_mesh_messenger},
+    {"VOICE",     run_voice_terminal},
+    {"LORA PTT",  run_lora_voice},
+};
+static const TloraAppEntry APPS_CYBER[] = {
+    {"WARDRIVE",   run_wardrive},
+    {"BT RADAR",   runBluetoothApp},
+    {"PKT SNIFF",  run_pkt_sniffer},
+    {"BEACON",     run_beacon_spotter},
+    {"NET SCAN",   run_net_scanner},
+    {"HASH TOOL",  run_hash_tool},
+    {"GATT XPLR",  run_ble_gatt_explorer},
+    {"WPA HS",     run_wpa_handshake},
+    {"RF SPECTRM", run_rf_spectrum},
+    {"PROBE INTL", run_probe_intel},
+    {"PKT ANLYS",  run_offline_pkt_analysis},
+    {"BLE DUCKY",  run_ble_ducky},
+    {"USB DUCKY",  run_usb_ducky},
+    {"WIFI DUCKY", run_wifi_ducky},
+};
+static const TloraAppEntry APPS_TOOLS[] = {
+    {"JOURNAL",  run_notepad},
+    {"CALC",     run_calculator},
+    {"CLOCK",    run_clock},
+    {"CALENDAR", run_calendar},
+    {"ETCH",     run_etch},
+};
+static const TloraAppEntry APPS_GAMES[] = {
+    {"SNAKE",   run_snake},
+    {"PAC-MAN", run_pacman},
+    {"GALAGA",  run_galaga},
+    {"TETRIS",  run_tetris},
+    {"POLE",    run_pole_position},
+    {"CHESS",   run_chess},
+    {"DOOM",    run_doom},
+    {"SIMCITY", run_simcity},
+    {"RETRO",   run_retro_pack},
+};
+static const TloraAppEntry APPS_INTEL[] = {
+    {"TERMINAL",   run_terminal},
+    {"GEMINI LOG", run_gemini_log},
+    {"REF: MED",   run_ref_med},
+    {"REF: SURV",  run_ref_surv},
+    {"BASEBALL",   run_baseball},
+    {"TRAILS",     run_trails},
+    {"SSH",        run_ssh_client},
+};
+static const TloraAppEntry APPS_MEDIA[] = {
+    {"PLAYER",   run_audio_player},
+    {"RECORDER", run_audio_recorder},
+    {"KEYMOTE",  run_ble_keymote},
+};
+static const TloraAppEntry APPS_SYSTEM[] = {
+    {"FILES",    run_filesystem},
+    {"SD FILES", run_wifi_filemgr},
+    {"ABOUT",    run_about},
+    {"SYSTEM",   run_system},
+    {"uPY REPL", run_micropython},
+    {"ELF APPS", run_elf_browser},
+    {"GAMEPAD",  run_gamepad_setup},
+    {"BRIDGE",   run_bridge},
+    {"SLEEP",    run_sleep},
+};
+
+static const TloraCategory CATEGORIES[] = {
+    {"COMMS",  "C", 0x03EF, APPS_COMMS,  (int)(sizeof(APPS_COMMS)  / sizeof(APPS_COMMS[0]))},
+    {"CYBER",  "!", 0xF400, APPS_CYBER,  (int)(sizeof(APPS_CYBER)  / sizeof(APPS_CYBER[0]))},
+    {"TOOLS",  "T", 0xFD20, APPS_TOOLS,  (int)(sizeof(APPS_TOOLS)  / sizeof(APPS_TOOLS[0]))},
+    {"GAMES",  "G", 0x07E0, APPS_GAMES,  (int)(sizeof(APPS_GAMES)  / sizeof(APPS_GAMES[0]))},
+    {"INTEL",  "I", 0x001F, APPS_INTEL,  (int)(sizeof(APPS_INTEL)  / sizeof(APPS_INTEL[0]))},
+    {"MEDIA",  "M", 0xF81F, APPS_MEDIA,  (int)(sizeof(APPS_MEDIA)  / sizeof(APPS_MEDIA[0]))},
+    {"SYSTEM", "S", 0x8410, APPS_SYSTEM, (int)(sizeof(APPS_SYSTEM) / sizeof(APPS_SYSTEM[0]))},
+};
+static constexpr int NUM_CATEGORIES = (int)(sizeof(CATEGORIES) / sizeof(CATEGORIES[0]));
+
+static int level = 0;
+static int selectedCategory = 0;
+static int openCategory = 0;
+static int selectedApp = 0;
+static int appPage = 0;
+static uint32_t bootHoldStart = 0;
+
+static void run_ble_keymote() {
+    keymoteEnter();
+    while (!keymoteLoopOnce()) {
+        delay(10);
+        yield();
+    }
+    keymoteExit();
+}
+
+static void run_gemini_log() { run_data_reader("gemini", "GEMINI LOG"); }
+static void run_ref_med() { run_data_reader("medical", "MEDICAL REF"); }
+static void run_ref_surv() { run_data_reader("survival", "SURVIVAL"); }
+static void run_sleep() { pm_power_sleep(); }
+
+static bool isExitKey(char k) {
+    return pm_is_exit_key(k);
+}
+
+static void drawFrame(const char *title) {
+    gfx->fillScreen(C_BLACK);
+    gfx->fillRect(0, 0, DISP_W, HEADER_H, C_DARK);
+    gfx->drawFastHLine(0, HEADER_H - 1, DISP_W, C_GREEN);
+    gfx->setTextSize(1);
+    gfx->setTextColor(C_GREEN);
+    gfx->setCursor(8, 8);
+    gfx->print("PISCES MOON OS");
+    gfx->setTextColor(C_WHITE);
+    int titleX = (DISP_W - (int)strlen(title) * 6) / 2;
+    gfx->setCursor(max(150, titleX), 8);
+    gfx->print(title);
+}
+
+static void drawFooter() {
+    const int y = DISP_H - FOOTER_H;
+    gfx->fillRect(0, y, DISP_W, FOOTER_H, C_BLACK);
+    gfx->drawFastHLine(0, y, DISP_W, 0x2104);
+    gfx->setTextSize(1);
+
+    gfx->setCursor(6, y + 6);
+    gfx->setTextColor(WiFi.status() == WL_CONNECTED ? C_GREEN : C_GREY);
+    gfx->print(WiFi.status() == WL_CONNECTED ? "WIFI" : "WIFI--");
+
+    gfx->setCursor(70, y + 6);
+    gfx->setTextColor(gps.location.isValid() ? C_GREEN : C_GREY);
+    gfx->print(gps.location.isValid() ? "GPS" : "GPS--");
+
+    gfx->setCursor(128, y + 6);
+    gfx->setTextColor(g_sd_ready ? C_GREEN : 0xFD20);
+    gfx->print(g_sd_ready ? "SD" : "SD LATE");
+
+    gfx->setCursor(204, y + 6);
+    gfx->setTextColor(wardrive_active ? C_GREEN : C_GREY);
+    gfx->print(wardrive_active ? "GE ON" : "GE --");
+
+    int bat = 0;
+    uint16_t mv = 0;
+    gfx->setCursor(270, y + 6);
+    if (readPagerBattery(bat, mv)) {
+        gfx->setTextColor(bat > 50 ? C_GREEN : bat > 20 ? 0xFD20 : C_RED);
+        gfx->printf("BAT:%d%%", bat);
+    } else {
+        gfx->setTextColor(C_GREY);
+        gfx->print("BAT--");
+    }
+
+    gfx->setCursor(DISP_W - 116, y + 6);
+    gfx->setTextColor(C_GREY);
+    gfx->print("M=BACK  BOOT=SLEEP");
+}
+
+static void getBoxPos(int slot, int &x, int &y) {
+    x = GRID_X + (slot % GRID_COLS) * (BOX_W + GAP_X);
+    y = GRID_Y + (slot / GRID_COLS) * (BOX_H + GAP_Y);
+}
+
+static void drawBox(int x, int y, int w, int h, uint16_t border, bool selected) {
+    uint16_t fill = selected ? 0x0018 : C_DARK;
+    gfx->fillRect(x + 4, y, w - 8, h, fill);
+    gfx->fillRect(x, y + 4, w, h - 8, fill);
+    gfx->drawRect(x + 4, y, w - 8, h, border);
+    gfx->drawFastHLine(x, y + 4, 4, border);
+    gfx->drawFastHLine(x + w - 4, y + 4, 4, border);
+    gfx->drawFastHLine(x, y + h - 4, 4, border);
+    gfx->drawFastHLine(x + w - 4, y + h - 4, 4, border);
+}
+
+static void drawCategories() {
+    drawFrame("LAUNCHER");
+    for (int i = 0; i < NUM_CATEGORIES; i++) {
+        int x, y;
+        getBoxPos(i, x, y);
+        bool sel = (i == selectedCategory);
+        uint16_t color = CATEGORIES[i].color;
+        drawBox(x, y, BOX_W, BOX_H, color, sel);
+        gfx->setTextSize(2);
+        gfx->setTextColor(sel ? color : C_GREEN);
+        gfx->setCursor(x + 10, y + 10);
+        gfx->print(CATEGORIES[i].icon);
+        gfx->setTextSize(1);
+        gfx->setCursor(x + 34, y + 14);
+        gfx->print(CATEGORIES[i].name);
+        gfx->setTextColor(sel ? C_WHITE : C_GREY);
+        gfx->setCursor(x + 34, y + 30);
+        gfx->printf("%d apps", CATEGORIES[i].appCount);
+    }
+    drawFooter();
+}
+
+static void drawApps() {
+    const TloraCategory &cat = CATEGORIES[openCategory];
+    drawFrame(cat.name);
+    int start = appPage * APPS_PER_PAGE;
+    for (int slot = 0; slot < APPS_PER_PAGE; slot++) {
+        int idx = start + slot;
+        if (idx >= cat.appCount) break;
+        int x, y;
+        getBoxPos(slot, x, y);
+        bool sel = (idx == selectedApp);
+        drawBox(x, y, BOX_W, BOX_H, cat.color, sel);
+        gfx->setTextSize(1);
+        gfx->setTextColor(sel ? C_WHITE : C_GREEN);
+        const char *name = cat.apps[idx].name;
+        gfx->setCursor(x + (BOX_W - (int)strlen(name) * 6) / 2, y + 22);
+        gfx->print(name);
+    }
+
+    int totalPages = (cat.appCount + APPS_PER_PAGE - 1) / APPS_PER_PAGE;
+    if (totalPages > 1) {
+        gfx->setTextColor(C_GREY);
+        gfx->setCursor((DISP_W - 48) / 2, BODY_BOTTOM - 8);
+        gfx->printf("%d/%d", appPage + 1, totalPages);
+    }
+    drawFooter();
+}
+
+static void launchSelectedApp() {
+    const TloraCategory &cat = CATEGORIES[openCategory];
+    if (selectedApp < 0 || selectedApp >= cat.appCount) return;
+    exitApp = false;
+    gfx->fillScreen(C_BLACK);
+    delay(80);
+    cat.apps[selectedApp].run();
+    selectedApp = min(selectedApp, cat.appCount - 1);
+    drawApps();
+}
+
+static void openSelectedCategory() {
+    openCategory = selectedCategory;
+    selectedApp = appPage = 0;
+    level = 1;
+    drawApps();
+}
+
+static void moveSelection(int dx, int dy) {
+    if (level == 0) {
+        int col = selectedCategory % GRID_COLS;
+        int row = selectedCategory / GRID_COLS;
+        if (dx < 0 && col > 0) col--;
+        if (dx > 0 && col < GRID_COLS - 1) col++;
+        if (dy < 0 && row > 0) row--;
+        if (dy > 0) row++;
+        int next = row * GRID_COLS + col;
+        if (next >= 0 && next < NUM_CATEGORIES && next != selectedCategory) {
+            selectedCategory = next;
+            drawCategories();
+        }
+        return;
+    }
+
+    const TloraCategory &cat = CATEGORIES[openCategory];
+    int next = selectedApp;
+    if (dx < 0) next--;
+    if (dx > 0) next++;
+    if (dy < 0) next -= GRID_COLS;
+    if (dy > 0) next += GRID_COLS;
+    next = constrain(next, 0, cat.appCount - 1);
+    if (next != selectedApp) {
+        selectedApp = next;
+        appPage = selectedApp / APPS_PER_PAGE;
+        drawApps();
+    }
+}
+
+static void pollBootSleepShortcut() {
+    bool pressed = digitalRead(BOOT_BTN_PIN) == LOW;
+    if (!pressed) {
+        bootHoldStart = 0;
+        return;
+    }
+    if (bootHoldStart == 0) bootHoldStart = millis();
+    if (millis() - bootHoldStart > 1800) {
+        gfx->fillRect(0, DISP_H / 2 - 14, DISP_W, 28, C_DARK);
+        gfx->drawFastHLine(0, DISP_H / 2 - 14, DISP_W, C_GREEN);
+        gfx->setTextColor(C_GREEN);
+        gfx->setCursor((DISP_W - 90) / 2, DISP_H / 2 - 3);
+        gfx->print("SLEEPING...");
+        delay(250);
+        pm_power_sleep();
+    }
+}
+
+static void handleKeyboard(char k) {
+    if (k == 0) return;
+    if (isExitKey(k)) {
+        if (level == 1) {
+            level = 0;
+            selectedApp = 0;
+            appPage = 0;
+            drawCategories();
+        }
+        return;
+    }
+    switch (k) {
+        case 'w': case 'W':
+            moveSelection(0, -1);
+            return;
+        case 'z': case 'Z':
+        case 's': case 'S':
+            moveSelection(0, 1);
+            return;
+        case 'a': case 'A':
+            moveSelection(-1, 0);
+            return;
+        case 'd': case 'D':
+            moveSelection(1, 0);
+            return;
+        default:
+            break;
+    }
+    if (k == 13 || k == '\n' || k == 'o' || k == 'O') {
+        if (level == 0) {
+            openSelectedCategory();
+        } else {
+            launchSelectedApp();
+        }
+    }
+}
+
+static void handleTrackball() {
+    TrackballState tb = update_trackball();
+    if (tb.x == 0 && tb.y == 0 && !tb.clicked) return;
+
+    if (level == 0) {
+        moveSelection(tb.x, tb.y);
+        if (tb.clicked) {
+            openSelectedCategory();
+        }
+        return;
+    }
+
+    moveSelection(tb.x, tb.y);
+    if (tb.clicked) launchSelectedApp();
+}
+
+void run_launcher() {
+    pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
+    init_trackball();
+    level = 0;
+    selectedCategory = 0;
+    openCategory = 0;
+    selectedApp = 0;
+    appPage = 0;
+    drawCategories();
+
+    uint32_t lastFooter = millis();
+    while (true) {
+        pollBootSleepShortcut();
+        char k = get_keypress();
+        handleKeyboard(k);
+        handleTrackball();
+        if (millis() - lastFooter > 2000) {
+            drawFooter();
+            lastFooter = millis();
+        }
+        delay(25);
+        yield();
+    }
+}
+
+#endif  // DEVICE_TLORAPAGER

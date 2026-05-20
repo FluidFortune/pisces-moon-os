@@ -33,8 +33,6 @@
 #include <Arduino.h>
 #include <Arduino_GFX_Library.h>
 #include <FS.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
 #include "SdFat.h"
 #include "touch.h"
 #include "trackball.h"
@@ -45,7 +43,6 @@
 
 extern Arduino_GFX *gfx;
 extern SdFat sd;
-extern SemaphoreHandle_t spi_mutex;
 
 // ─────────────────────────────────────────────
 //  MAP DIMENSIONS
@@ -346,68 +343,51 @@ static void newCity() {
 
 // ─────────────────────────────────────────────
 //  SAVE / LOAD (to SD)
-//  SPI Bus Treaty: wraps SD access in spi_mutex.
-//  Uses 1000ms timeout because the save writes ~16KB
-//  of city data — Ghost Engine on Core 0 will see this
-//  as a longer-than-usual SD operation but that's fine.
 // ─────────────────────────────────────────────
 #define SAVE_PATH "/simcity.sav"
 #define SAVE_MAGIC 0x53494D43  // "SIMC"
 
 static bool saveCity() {
-    bool ok = false;
-    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        FsFile f = sd.open(SAVE_PATH, O_WRITE | O_CREAT | O_TRUNC);
-        if (f) {
-            uint32_t magic = SAVE_MAGIC;
-            f.write(&magic,     sizeof(magic));
-            f.write(&funds,     sizeof(funds));
-            f.write(&taxRate,   sizeof(taxRate));
-            f.write(&population,sizeof(population));
-            f.write(&gameYear,  sizeof(gameYear));
-            f.write(&gameMonth, sizeof(gameMonth));
-            f.write(&simSpeed,  sizeof(simSpeed));
-            f.write(cityMap, MAP_W * MAP_H * sizeof(MapTile));
-            f.close();
-            ok = true;
-        }
-        xSemaphoreGive(spi_mutex);
-    }
-    if (ok) {
-        strcpy(cityMessage, "City saved.");
-        messageTimer = 2000;
-    }
-    return ok;
+    FsFile f = sd.open(SAVE_PATH, O_WRITE | O_CREAT | O_TRUNC);
+    if (!f) return false;
+
+    uint32_t magic = SAVE_MAGIC;
+    f.write(&magic,     sizeof(magic));
+    f.write(&funds,     sizeof(funds));
+    f.write(&taxRate,   sizeof(taxRate));
+    f.write(&population,sizeof(population));
+    f.write(&gameYear,  sizeof(gameYear));
+    f.write(&gameMonth, sizeof(gameMonth));
+    f.write(&simSpeed,  sizeof(simSpeed));
+    f.write(cityMap, MAP_W * MAP_H * sizeof(MapTile));
+    f.close();
+
+    strcpy(cityMessage, "City saved.");
+    messageTimer = 2000;
+    return true;
 }
 
 static bool loadCity() {
-    bool ok = false;
-    if (spi_mutex && xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        if (sd.exists(SAVE_PATH)) {
-            FsFile f = sd.open(SAVE_PATH, O_READ);
-            if (f) {
-                uint32_t magic = 0;
-                f.read(&magic, sizeof(magic));
-                if (magic == SAVE_MAGIC) {
-                    f.read(&funds,      sizeof(funds));
-                    f.read(&taxRate,    sizeof(taxRate));
-                    f.read(&population, sizeof(population));
-                    f.read(&gameYear,   sizeof(gameYear));
-                    f.read(&gameMonth,  sizeof(gameMonth));
-                    f.read(&simSpeed,   sizeof(simSpeed));
-                    f.read(cityMap, MAP_W * MAP_H * sizeof(MapTile));
-                    ok = true;
-                }
-                f.close();
-            }
-        }
-        xSemaphoreGive(spi_mutex);
-    }
-    if (ok) {
-        strcpy(cityMessage, "City loaded.");
-        messageTimer = 2000;
-    }
-    return ok;
+    if (!sd.exists(SAVE_PATH)) return false;
+    FsFile f = sd.open(SAVE_PATH, O_READ);
+    if (!f) return false;
+
+    uint32_t magic = 0;
+    f.read(&magic, sizeof(magic));
+    if (magic != SAVE_MAGIC) { f.close(); return false; }
+
+    f.read(&funds,      sizeof(funds));
+    f.read(&taxRate,    sizeof(taxRate));
+    f.read(&population, sizeof(population));
+    f.read(&gameYear,   sizeof(gameYear));
+    f.read(&gameMonth,  sizeof(gameMonth));
+    f.read(&simSpeed,   sizeof(simSpeed));
+    f.read(cityMap, MAP_W * MAP_H * sizeof(MapTile));
+    f.close();
+
+    strcpy(cityMessage, "City loaded.");
+    messageTimer = 2000;
+    return true;
 }
 
 // ─────────────────────────────────────────────
@@ -1045,7 +1025,7 @@ static void showToolMenu() {
             if (currentTool < NUM_TOOLS-1) { currentTool++; showToolMenu(); } }
         if (tb.clicked || k == 13 || k == 't' || k == 'T' ||
             gamepad_pressed(GP_A | GP_START) ||
-            (get_touch(&tx, &ty) && ty < 40)) {
+            (get_touch(&tx, &ty) && ty < 24)) {
             while(get_touch(&tx,&ty)){delay(10);}
             break;
         }
