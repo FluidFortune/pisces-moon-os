@@ -12,36 +12,16 @@
 #ifndef PROBE_INTEL_H
 #define PROBE_INTEL_H
 
-// ─────────────────────────────────────────────
-//  PROBE INTEL — RF Device Intelligence App
-//
-//  Two modes, user-selectable on launch:
-//
-//  SCAN MODE (standalone)
-//    Active WiFi scans every ~8s. Builds a list of nearby
-//    networks with SSID, BSSID, RSSI, encryption, GPS coords.
-//    Logs to /probe_intel_NNNN.csv on SD. No host required.
-//    Best for: field work with the T-Deck Plus as a solo unit.
-//
-//  PROMISCUOUS MODE (edge node)
-//    True 802.11 monitor mode — captures all management frames
-//    passively (beacons, probe-req, probe-resp, deauth, auth, etc).
-//    Displays live frame-type counters on screen.
-//    If Bridge is also active, the wardrive Ghost Engine streams
-//    {event:"pkt",...} JSON over Serial to the connected host.
-//    If Bridge is NOT active, still works standalone showing stats.
-//    Best for: T-Deck as an edge sensor feeding a laptop dashboard.
-//
-//  Mode selection is on the launch screen — trackball up/down,
-//  trackball click or ENTER to confirm. Can switch mid-session
-//  via [M] key from either mode screen.
-//
-//  SPI Bus Treaty:
-//    Scan mode SD writes are wrapped in spi_mutex.
-//    Promiscuous mode uses pm_promiscuous.h queue which is
-//    already ISR-safe. No SD writes in promiscuous mode.
-// ─────────────────────────────────────────────
+/**
+ * PISCES MOON OS — PROBE REQUEST INTELLIGENCE
+ * Passive analysis of 802.11 probe requests.
+ * Reveals what SSIDs nearby devices are actively seeking.
+ *
+ * USE ONLY IN ENVIRONMENTS WHERE YOU HAVE AUTHORIZATION.
+ * Probe requests are publicly broadcast by devices — this
+ * tool only observes and displays them, no transmission.
+ */
 
 void run_probe_intel();
 
-#endif // PROBE_INTEL_H
+#endif

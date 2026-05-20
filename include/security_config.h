@@ -15,13 +15,18 @@
  * Ghost Partition / Dual-PIN / Deniable Encryption system.
  *
  * SETUP INSTRUCTIONS:
- * 1. Copy this file is already named security_config.h (it ships disabled by default)
- * 2. To enable the Ghost Partition system, uncomment // #define GHOST_PARTITION_ENABLED
- * 3. Set your three PINs below (any length, alphanumeric, keyboard-typeable)
+ * 1. This file ships disabled by default for release/community builds.
+ * 2. To enable the Ghost Partition system locally, create
+ *    include/security_config_private.h and define:
+ *      GHOST_PARTITION_ENABLED
+ *      PRIMARY_PIN
+ *      DECOY_PIN
+ *      NUKE_PIN
+ * 3. Never commit real PINs or private security config to GitHub.
  * 4. Format a 64GB MicroSD card with TWO FAT32 partitions, each <= 32GB
  *    - Partition 1: Public / Decoy data (medical, baseball, music, games)
  *    - Partition 2: Ghost / Tactical data (wardrive logs, Gemini vault, scan results)
- * 5. Add security_config.h to your .gitignore — DO NOT commit your PINs to GitHub
+ * 5. Keep security_config_private.h in .gitignore — DO NOT commit your PINs to GitHub
  *
  * IF GHOST PARTITION IS NOT ENABLED:
  * The device boots normally with no PIN screen. All data goes to Partition 1.
@@ -49,11 +54,15 @@
 #ifndef SECURITY_CONFIG_H
 #define SECURITY_CONFIG_H
 
+#if __has_include("security_config_private.h")
+#include "security_config_private.h"
+#endif
+
 // ─────────────────────────────────────────────
 //  MASTER SWITCH
-//  Uncomment the line below to enable the Ghost
-//  Partition system. Leave commented for standard
-//  single-partition operation (default/community build).
+//  Release/community builds leave Ghost Partition
+//  disabled by default. Define this only in a local
+//  private config or private build flags.
 // ─────────────────────────────────────────────
 // #define GHOST_PARTITION_ENABLED
 
@@ -67,22 +76,32 @@
 #ifdef GHOST_PARTITION_ENABLED
 
     // Primary PIN: unlocks Tactical Mode + Ghost Partition
-    #define PRIMARY_PIN     "YOUR_TACTICAL_PIN_HERE"
+    // #define PRIMARY_PIN     "set-in-security_config_private.h"
 
     // Decoy PIN: unlocks Student Mode only (Partition 1, safe apps)
     // Use this if forced to unlock the device under duress
-    #define DECOY_PIN       "YOUR_DECOY_PIN_HERE"
+    // #define DECOY_PIN       "set-in-security_config_private.h"
 
     // Nuke PIN: deletes Ghost Partition index files then loads Student Mode
     // Data is irrecoverable after this — use with intent
-    #define NUKE_PIN        "YOUR_NUKE_PIN_HERE"
+    // #define NUKE_PIN        "set-in-security_config_private.h"
+
+#if !defined(PRIMARY_PIN) || !defined(DECOY_PIN) || !defined(NUKE_PIN)
+    #error "GHOST_PARTITION_ENABLED requires PRIMARY_PIN, DECOY_PIN, and NUKE_PIN in security_config_private.h or private build flags."
+#endif
 
     // Maximum failed PIN attempts before lockout engages
+    // #define PIN_MAX_ATTEMPTS    3
+#ifndef PIN_MAX_ATTEMPTS
     #define PIN_MAX_ATTEMPTS    3
+#endif
 
     // Lockout duration in milliseconds (default: 60 seconds)
     // LoRa and background tasks continue running during lockout
+    // #define PIN_LOCKOUT_MS      60000UL
+#ifndef PIN_LOCKOUT_MS
     #define PIN_LOCKOUT_MS      60000UL
+#endif
 
     // Boot key combo to enable Ghost Partition detection
     // Both must be held LOW at boot (active LOW, INPUT_PULLUP)

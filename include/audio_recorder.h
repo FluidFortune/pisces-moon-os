@@ -12,8 +12,6 @@
 #ifndef AUDIO_RECORDER_H
 #define AUDIO_RECORDER_H
 
-#include "hal.h"
-
 #ifdef AUDIO_DISABLED
   // FrankenDot has no audio hardware — stub prevents linker errors
   inline void run_audio_recorder() {

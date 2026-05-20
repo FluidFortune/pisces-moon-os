@@ -36,6 +36,8 @@ void run_system();
 void run_snake();
 void run_pacman();
 void run_galaga();
+void run_tetris();
+void run_pole_position();
 void run_chess();
 
 // App Suite — INTEL

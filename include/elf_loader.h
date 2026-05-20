@@ -51,7 +51,13 @@
 #include <Arduino.h>
 #include <FS.h>
 #include "SdFat.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#ifdef DEVICE_TLORAPAGER
+#include "pm_disp_tlorapager.h"
+#else
 #include <Arduino_GFX_Library.h>
+#endif
 
 // ============================================================
 //  Global OS objects — defined in main.cpp
@@ -59,47 +65,39 @@
 //  this header can see them without a duplicate definition.
 // ============================================================
 extern SdFat sd;
-extern Arduino_GFX* gfx;
-
+#ifdef DEVICE_TLORAPAGER
+extern PMDispTLoRaPager *gfx;
+#else
+extern Arduino_GFX *gfx;
+#endif
 // SPI Bus Treaty flags — defined in their respective .cpp files
 extern volatile bool wifi_in_use;       // wardrive.cpp
 extern volatile bool lora_voice_active; // lora_voice.cpp
+extern SemaphoreHandle_t spi_mutex;     // main.cpp
 
-// SPI mutex — defined in main.cpp. ELF modules can take this directly
-// in API v1.1+, but the helper functions below are the recommended path.
-#include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
-extern SemaphoreHandle_t spi_mutex;
-
-// ============================================================
-//  ELF SD HANDLE
-//  Opaque handle returned by ctx->sd_open_*. Internally these
-//  map to FsFile slots managed inside elf_loader.cpp.
-//  Handles are integers so the ABI doesn't depend on FsFile
-//  layout (which can change between SdFat versions).
-// ============================================================
-#define ELF_SD_MAX_HANDLES   8
-#define ELF_SD_HANDLE_INVALID (-1)
+#define ELF_API_MAJOR_SUPPORTED  1
+#define ELF_API_MINOR_SUPPORTED  1
+#define ELF_SD_MAX_HANDLES       8
+#define ELF_SD_HANDLE_INVALID   -1
 
 // ============================================================
 //  ElfContext — OS → ELF handshake packet
 //  Passed to every loaded ELF via elf_main(ctx).
 //  ELF module receives this as (void*) and casts to (ElfContext*).
-//
-//  ABI v1.0 — fields up to and including os_version
-//  ABI v1.1 — adds spi_mutex_ptr and SPI-safe helpers
 // ============================================================
 struct ElfContext {
-    // ─── v1.0 fields ────────────────────────────────────────
     // Hardware access — populated by elf_build_context()
+#ifdef DEVICE_TLORAPAGER
+    PMDispTLoRaPager* gfx;      // Display driver (always valid)
+#else
     Arduino_GFX* gfx;           // Display driver (always valid)
-    SdFat*       sd;            // SD filesystem (DEPRECATED in v1.1+ —
-                                // use sd_* helpers instead for treaty safety)
+#endif
+    SdFat*       sd;            // SD filesystem, public partition
     void*        gamepad;       // Cast to GamepadState* (gamepad.h)
 
     // Display geometry
-    uint16_t screen_w;          // 320
-    uint16_t screen_h;          // 240
+    uint16_t screen_w;          // Active display width
+    uint16_t screen_h;          // Active display height
 
     // SPI Bus Treaty flags — ELF modules must honor these
     volatile bool* wifi_in_use;    // Check before any WiFi API calls
@@ -111,30 +109,18 @@ struct ElfContext {
 
     // Platform version for ABI compatibility checks inside ELF modules
     uint8_t api_major;          // 1
-    uint8_t api_minor;          // 1 in current firmware
+    uint8_t api_minor;          // 0
     char    os_version[16];     // "0.9.6"
 
-    // ─── v1.1 fields — SPI Bus Treaty compliance ───────────
-    //
-    // These helper functions are the ONLY safe way for ELF modules
-    // to do SD I/O. Each helper internally takes spi_mutex before
-    // touching the bus, blocks if a concurrent firmware operation
-    // (Ghost Engine wardrive task, LoRa TX) holds the lock, and
-    // releases on completion. This makes treaty violations impossible
-    // by construction.
-    //
-    // ELF authors targeting api_major=1, api_minor>=1 should:
-    //   - Check ctx->api_minor >= 1 before using these
-    //   - Use ctx->sd_* helpers instead of ctx->sd
-    //   - For LoRa or other SPI peripherals, take spi_mutex_ptr directly
-    //
-    // ELF authors targeting api_minor=0 (legacy) can still use ctx->sd
-    // directly but MUST take *ctx->spi_mutex_ptr before doing so. The
-    // spi_mutex_ptr is also valid in v1.0 (zero-filled reserved area).
+    // PSRAM allocation — passed to ELF for sandbox tracking.
+    // Set by elf_build_context() to point at the current PSRAM
+    // region reserved for this ELF; size is the byte count.
+    void*  psram_base;          // Cast back to (uint8_t*) inside ELF
+    size_t psram_size;          // Size in bytes
 
-    SemaphoreHandle_t* spi_mutex_ptr;   // For direct mutex acquisition
-
-    // SPI-safe SD helpers — all internally take/release spi_mutex
+    // SPI-safe SD helpers — v1.1.
+    // ELF modules should use these instead of touching SdFat directly.
+    SemaphoreHandle_t* spi_mutex_ptr;
     int  (*sd_open_read)(const char* path);
     int  (*sd_open_write)(const char* path, bool append);
     int  (*sd_read)(int handle, void* buf, int len);
@@ -143,10 +129,10 @@ struct ElfContext {
     bool (*sd_exists)(const char* path);
     bool (*sd_mkdir)(const char* path);
     bool (*sd_remove)(const char* path);
-    int  (*sd_size)(const char* path);  // returns bytes, -1 on fail
+    int  (*sd_size)(const char* path);
 
-    // Reserved — zero-filled, available for ELF API v1.2+
-    uint8_t _reserved[16];
+    // Reserved — zero-filled, available for future ELF API growth.
+    uint8_t _reserved[64];
 };
 
 // ============================================================
@@ -194,10 +180,6 @@ enum ElfLoadResult {
     ELF_SD_ERROR      = 6,  // SD open or read failure
     ELF_EXEC_ERROR    = 7,  // elf_main() returned non-zero
 };
-
-// Maximum ELF API major version this OS release supports
-#define ELF_API_MAJOR_SUPPORTED  1
-#define ELF_API_MINOR_SUPPORTED  1   // v1.1 — adds SPI Bus Treaty helpers
 
 // ============================================================
 //  Internal engine state — DEFINED in elf_loader.cpp

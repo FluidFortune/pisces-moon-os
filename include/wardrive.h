@@ -1,3 +1,14 @@
+// Pisces Moon OS
+// Copyright (C) 2026 Eric Becker / Fluid Fortune
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// This program is free software: you can redistribute it
+// and/or modify it under the terms of the GNU Affero General
+// Public License as published by the Free Software Foundation,
+// either version 3 of the License, or any later version.
+//
+// fluidfortune.com
+
 #ifndef WARDRIVE_H
 #define WARDRIVE_H
 
@@ -45,6 +56,13 @@ void init_wardrive_core();
 void run_wardrive();
 void wardrive_task(void* pvParameters);
 
+// Clean shutdown of the wardrive task and all its resources.
+// Called from wifi_mode.cpp when switching from SCANNER to CLIENT mode.
+// Blocks until the task confirms exit. Returns false on timeout.
+// After successful teardown, init_wardrive_core() can be called again
+// to respawn the task.
+bool wardrive_teardown(uint32_t timeout_ms = 3000);
+
 // Mode selection — call from app task (Core 1), not from wardrive task.
 // If wardrive is currently running, it will pick up the new mode on
 // its next cycle. Safe to call while wardrive_active is true.
@@ -59,5 +77,8 @@ const char* wardrive_get_log_filename();
 
 // ─── v1.1 — Bridge streaming ───────────────────────────────────────
 extern volatile bool wardrive_bridge_streaming;
+extern volatile bool wardrive_raw_log;  // When true: emit wifi_seen for EVERY observation
+                                        // (not just new/updated). Enables PMStats.timeline()
+                                        // and PMStats.persistence() in The Clinician.
 
 #endif
