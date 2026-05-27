@@ -8,6 +8,16 @@
 #include <M5Cardputer.h>
 #endif
 
+#ifdef DEVICE_C28P
+// C28P audio is implemented in c28p_audio.cpp — ES8311 codec
+// init over I2C and I2S tone playback via DMA. Forward-declared
+// here so game_audio.cpp can call them without including the
+// driver's internal headers.
+extern "C" bool c28p_audio_begin();
+extern "C" void c28p_audio_stop();
+extern "C" void c28p_audio_tone(uint16_t freq, uint16_t ms);
+#endif
+
 struct PMNote {
     uint16_t freq;
     uint16_t ms;
@@ -67,6 +77,9 @@ static void playTone(uint16_t freq, uint16_t ms) {
 #ifdef DEVICE_CARDPUTER_ADV
     if (!audioReady || freq == 0) return;
     M5Cardputer.Speaker.tone(freq, ms);
+#elif defined(DEVICE_C28P)
+    if (!audioReady) return;
+    c28p_audio_tone(freq, ms);
 #else
     (void)freq;
     (void)ms;
@@ -76,6 +89,8 @@ static void playTone(uint16_t freq, uint16_t ms) {
 void pm_game_audio_begin() {
 #ifdef DEVICE_CARDPUTER_ADV
     audioReady = true;
+#elif defined(DEVICE_C28P)
+    audioReady = c28p_audio_begin();
 #else
     audioReady = false;
 #endif
@@ -88,6 +103,8 @@ void pm_game_audio_stop() {
     songIndex = 0;
 #ifdef DEVICE_CARDPUTER_ADV
     if (audioReady) M5Cardputer.Speaker.stop();
+#elif defined(DEVICE_C28P)
+    if (audioReady) c28p_audio_stop();
 #endif
 }
 

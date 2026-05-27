@@ -114,9 +114,11 @@
     // Only this key loads Tactical Mode. ANY other key silently loads
     // Student Mode instead — the user sees no indication of failure.
     // This key does not appear on any label on the device.
-    // Change this to any keyboard-typeable character.
+    // Override in security_config_private.h to change.
     // Default: backtick (`) — obscure position, not used in PINs
-    // #define UNLOCK_KEY      '`'
+    #ifndef UNLOCK_KEY
+        #define UNLOCK_KEY      '`'
+    #endif
     // ────────────────────────────────────────────────────────────────
 
     // SD Card partition indices (1-based, per SdFat convention)
@@ -142,16 +144,19 @@
         "/wardrive/index.json"
     };
 
-    // Wardrive flat-file rotation targets (no index — must remove individually)
-    // Matches the wardrive rolling log naming scheme
-    #define WARDRIVE_LOG_COUNT  10
-    static const char* WARDRIVE_LOGS[WARDRIVE_LOG_COUNT] = {
-        "/wardrive/wardrive_01.csv", "/wardrive/wardrive_02.csv",
-        "/wardrive/wardrive_03.csv", "/wardrive/wardrive_04.csv",
-        "/wardrive/wardrive_05.csv", "/wardrive/wardrive_06.csv",
-        "/wardrive/wardrive_07.csv", "/wardrive/wardrive_08.csv",
-        "/wardrive/wardrive_09.csv", "/wardrive/wardrive_10.csv"
-    };
+    // Wardrive flat-file rotation targets.
+    //
+    // v1.2.1 — Wardrive sessions are written as /wardrive_NNNN.csv at the
+    // root of whichever partition wardrive is using (currently the PUBLIC
+    // partition — see wardrive.cpp). Session numbers are 1-9999.
+    //
+    // Rather than hardcoding filenames, the nuke routine dynamically scans
+    // for files matching this prefix and extension on BOTH partitions, so
+    // it stays correct regardless of session count or which partition
+    // wardrive is using.
+    #define WARDRIVE_LOG_PREFIX  "/wardrive_"
+    #define WARDRIVE_LOG_SUFFIX  ".csv"
+    #define WARDRIVE_LOG_MAX_SESSION  9999
 
 #endif // GHOST_PARTITION_ENABLED
 

@@ -22,6 +22,7 @@
 //    T-Deck Plus:   LoRa + SD                    (2)
 //    T-LoraPager:   LCD + LoRa + SD + NFC        (4)
 //    Cardputer ADV: LCD + LoRa + SD (when ready) (3)
+//    C28P:          LCD + SDIO                   (2) — no LoRa, no NFC
 //
 //  Plus Ghost Engine Core 0 contention on all devices.
 //  The Ghost Engine is always running. The Treaty is why
@@ -213,7 +214,7 @@ static inline void xl9555_boot_sequence() {
 #endif // DEVICE_TLORAPAGER
 
 
-// ── No-op power macros for T-Deck and Cardputer ──────────
+// ── No-op power macros for T-Deck, Cardputer, and C28P ───
 // These devices have no power gating — peripherals are
 // always on. Macros compile to nothing in release builds.
 #ifndef DEVICE_TLORAPAGER
@@ -239,9 +240,10 @@ static inline void xl9555_boot_sequence() {
 // ── Safety check ─────────────────────────────────────────
 #if !defined(DEVICE_TDECK_PLUS) && \
     !defined(DEVICE_TLORAPAGER) && \
-    !defined(DEVICE_CARDPUTER_ADV)
+    !defined(DEVICE_CARDPUTER_ADV) && \
+    !defined(DEVICE_C28P)
   #error "No device target defined. Set DEVICE_TDECK_PLUS, \
-DEVICE_TLORAPAGER, or DEVICE_CARDPUTER_ADV in platformio.ini."
+DEVICE_TLORAPAGER, DEVICE_CARDPUTER_ADV, or DEVICE_C28P in platformio.ini."
 #endif
 
 #endif // SPI_TREATY_H

@@ -79,6 +79,9 @@
   #define HAS_RTC           0
   #define HAS_NRF24         0
   #define HAS_IOEXP         0
+  #define HAS_TOUCH         1
+  #define HAS_KEYBOARD      1
+  #define HAS_BATTERY       1
 
 #endif // DEVICE_TDECK_PLUS
 
@@ -213,6 +216,9 @@
   #define HAS_RTC           1
   #define HAS_NRF24         1
   #define HAS_IOEXP         1
+  #define HAS_TOUCH         0             // no touchscreen on Pager
+  #define HAS_KEYBOARD      1             // TCA8418 matrix
+  #define HAS_BATTERY       1
 
   // SPI Bus Treaty note:
   // This device has MORE SPI Treaty participants than T-Deck:
@@ -246,8 +252,79 @@
   #define HAS_RTC           0
   #define HAS_NRF24         0
   #define HAS_IOEXP         0
+  #define HAS_TOUCH         0             // no touchscreen
+  #define HAS_KEYBOARD      1             // M5 Cardputer keyboard
+  #define HAS_BATTERY       1
 
 #endif // DEVICE_CARDPUTER_ADV
+
+
+// ── C28P (LCDwiki 2.8" ESP32-S3 Display) ─────────────────
+// Entry-level kiosk target. Touch-only input, USB-powered desk
+// fixture, audio I/O as the headline capability.
+//
+// INTERNAL DEVELOPMENT — pin assignments per LCDwiki documentation.
+// Subject to first-bring-up confirmation.
+#ifdef DEVICE_C28P
+
+  #define SCREEN_W          240
+  #define SCREEN_H          320           // native portrait
+  #define SCREEN_DRIVER     ILI9341
+
+  // Display SPI pins (defined via -D in platformio.ini)
+  #define LCD_MOSI          PIN_LCD_MOSI
+  #define LCD_MISO          PIN_LCD_MISO
+  #define LCD_SCK           PIN_LCD_SCK
+  #define LCD_CS            PIN_LCD_CS
+  #define LCD_DC            PIN_LCD_DC
+  #define LCD_RST           PIN_LCD_RST
+  #define LCD_BL            PIN_LCD_BL
+
+  // Touch (FT6336G capacitive, I2C shared bus)
+  #define TOUCH_INT         PIN_TOUCH_INT
+  #define TOUCH_RST         PIN_TOUCH_RST
+
+  // I2C bus (touch + audio codec + future expansion)
+  #define I2C_SDA           PIN_I2C_SDA
+  #define I2C_SCL           PIN_I2C_SCL
+
+  // I2S audio (ES8311 codec)
+  #define I2S_MCLK          PIN_I2S_MCLK
+  #define I2S_SCLK          PIN_I2S_SCLK
+  #define I2S_LRCK          PIN_I2S_LRCK
+  #define I2S_DOUT          PIN_I2S_DOUT
+  #define I2S_DIN           PIN_I2S_DIN
+
+  // MicroSD via SDIO 4-bit mode (separate from SPI bus)
+  #define SD_CLK            PIN_SD_CLK
+  #define SD_CMD            PIN_SD_CMD
+  #define SD_D0             PIN_SD_D0
+  #define SD_D1             PIN_SD_D1
+  #define SD_D2             PIN_SD_D2
+  #define SD_D3             PIN_SD_D3
+
+  // Misc
+  #define RGB_LED           PIN_RGB_LED   // single WS2812
+  #define BAT_ADC           PIN_BAT_ADC
+  #define BOOT_BTN          PIN_BOOT_BTN
+
+  // Capabilities — C28P is touch-only kiosk
+  #define HAS_TRACKBALL     0
+  #define HAS_LORA          0
+  #define HAS_GPS           0
+  #define HAS_AUDIO         1             // headline capability
+  #define HAS_NFC           0
+  #define HAS_IMU           0
+  #define HAS_HAPTIC        0
+  #define HAS_ENCODER       0
+  #define HAS_RTC           0
+  #define HAS_NRF24         0
+  #define HAS_IOEXP         0
+  #define HAS_TOUCH         1
+  #define HAS_KEYBOARD      0             // no physical keys
+  #define HAS_BATTERY       0             // USB-powered desk fixture
+
+#endif // DEVICE_C28P
 
 
 // ── RUNTIME CAPABILITY CHECKS ────────────────────────────
@@ -264,5 +341,8 @@ static inline int pm_has_encoder(void) { return HAS_ENCODER; }
 static inline int pm_has_rtc(void)     { return HAS_RTC;     }
 static inline int pm_has_nrf24(void)   { return HAS_NRF24;   }
 static inline int pm_has_ioexp(void)   { return HAS_IOEXP;   }
+static inline int pm_has_touch(void)   { return HAS_TOUCH;   }
+static inline int pm_has_keyboard(void){ return HAS_KEYBOARD;}
+static inline int pm_has_battery(void) { return HAS_BATTERY; }
 
 #endif // HAL_PINS_H

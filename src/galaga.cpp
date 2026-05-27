@@ -45,17 +45,26 @@ extern SdFat sd;
 // ─────────────────────────────────────────────
 //  CONSTANTS
 // ─────────────────────────────────────────────
+#ifdef DEVICE_C28P
+#include "c28p_dpad.h"
+#endif
+
 #ifdef DEVICE_TLORAPAGER
 #define SCREEN_W        480
 #define SCREEN_H        222
 #elif defined(DEVICE_CARDPUTER_ADV)
 #define SCREEN_W        240
 #define SCREEN_H        135
+#elif defined(DEVICE_C28P)
+#define SCREEN_W        240
+#define SCREEN_H        200
 #else
 #define SCREEN_W        320
 #define SCREEN_H        240
 #endif
 #ifdef DEVICE_CARDPUTER_ADV
+#define PLAY_W          220
+#elif defined(DEVICE_C28P)
 #define PLAY_W          220
 #else
 #define PLAY_W          280   // Play area inside the centered viewport
@@ -94,6 +103,17 @@ extern SdFat sd;
 #define COL_BULLET      0xFFE0   // Yellow
 #define COL_BEE         0xFFE0   // Yellow
 #define COL_BUTTERFLY   0x07E0   // Green
+
+// Clear the active game area. On C28P, the bottom 120px of the
+// physical screen holds the virtual D-pad chrome and must not be
+// wiped — restrict the clear to the top 200px game viewport.
+static inline void clearGameArea() {
+#ifdef DEVICE_C28P
+    gfx->fillRect(0, 0, 240, 200, COL_BG);
+#else
+    clearGameArea();
+#endif
+}
 #define COL_BOSS        0xF81F   // Magenta
 #define COL_BEAM        0x001F   // Blue (tractor beam)
 #define COL_EXPLOSION   0xF800   // Red
@@ -475,6 +495,18 @@ static void drawHUD() {
     if (score == lastHudScore && lives == lastHudLives && stage == lastHudStage) return;
     lastHudScore = score; lastHudLives = lives; lastHudStage = stage;
 
+#ifdef DEVICE_C28P
+    // C28P: dpad layer owns the top 14px exit bar with "< EXIT" on the
+    // left. Paint our HUD into the right side of that strip without
+    // touching the exit affordance.
+    gfx->fillRect(80, 0, 240 - 80, 14, COL_BG);
+    gfx->setTextSize(1);
+    gfx->setTextColor(COL_HUD);
+    gfx->setCursor(86, 4);
+    gfx->printf("SC:%d  STG:%d  L:%d", score, stage, lives);
+    return;
+#endif
+
     gfx->fillRect(0, 0, SCREEN_W, HUD_H, COL_BG);
     gfx->setTextSize(1);
     gfx->setTextColor(COL_HUD);
@@ -579,13 +611,13 @@ static void saveHS(int hs) {
 //  dodge and shoot for max points
 // ─────────────────────────────────────────────
 static void runChallengingStage() {
-    gfx->fillScreen(COL_BG);
+    clearGameArea();
     gfx->setTextSize(2);
     gfx->setTextColor(COL_HUD);
     gfx->setCursor((SCREEN_W - 132) / 2, SCREEN_H / 2 - 20); gfx->print("CHALLENGING");
     gfx->setCursor((SCREEN_W - 96) / 2, SCREEN_H / 2 + 5); gfx->print("STAGE !!");
     delay(2000);
-    gfx->fillScreen(COL_BG);
+    clearGameArea();
     initStars();
 
     // 40 enemies fly through in a figure-8 pattern
@@ -724,7 +756,7 @@ static void initStage() {
     // Force HUD redraw at start of each stage
     lastHudScore = -1; lastHudLives = -1; lastHudStage = -1;
 
-    gfx->fillScreen(COL_BG);
+    clearGameArea();
     initStars();
     for (int s = 0; s < NUM_STARS; s++)
         gfx->drawPixel(stars[s].x, stars[s].y, COL_STAR);
@@ -1031,6 +1063,11 @@ void run_galaga() {
     score     = 0;
     lives     = 3;
     stage     = 1;
+
+#ifdef DEVICE_C28P
+    // Paint the virtual D-pad chrome below the game viewport
+    c28p_dpad_render();
+#endif
 
     ship.x         = PLAY_X + PLAY_W / 2;
     ship.alive     = true;

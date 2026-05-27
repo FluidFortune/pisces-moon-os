@@ -1,0 +1,44 @@
+import math
+
+def calculate_distance(lat1, lon1, lat2, lon2):
+    """The Haversine Formula: Calculates distance between two GPS points in miles."""
+    R = 3958.8  # Earth radius in miles
+    dLat = math.radians(lat2 - lat1)
+    dLon = math.radians(lon2 - lon1)
+    a = math.sin(dLat/2) * math.sin(dLat/2) + \
+        math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * \
+        math.sin(dLon/2) * math.sin(dLon/2)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c
+
+# --- Inside your load_csv method ---
+def load_csv(self):
+    filepath = filedialog.askopenfilename(title="Select Wardrive CSV")
+    if not filepath: return
+    
+    try:
+        raw_df = pd.read_csv(filepath)
+        clean_df = raw_df[(raw_df['CurrentLatitude'] != 0.0)].copy()
+        
+        # CALCULATE PATROL DISTANCE
+        total_miles = 0.0
+        # Iterate through coordinates to find the distance of the path
+        coords = clean_df[['CurrentLatitude', 'CurrentLongitude']].values
+        for i in range(len(coords) - 1):
+            dist = calculate_distance(coords[i][0], coords[i][1], coords[i+1][0], coords[i+1][1])
+            # Filter out GPS "teleportation" jumps (anything over 5 miles in one log interval)
+            if dist < 5.0:
+                total_miles += dist
+
+        # DEDUPLICATION (Keep strongest signals)
+        clean_df = clean_df.sort_values('RSSI', ascending=False).drop_duplicates(subset=['MAC'])
+        
+        self.df = clean_df
+        self.status_lbl.configure(
+            text=f"Distance: {total_miles:.2f} miles | Unique Nodes: {len(clean_df)}", 
+            text_color="#07E0"
+        )
+        self.map_btn.configure(state="normal")
+        
+    except Exception as e:
+        messagebox.showerror("Data Error", f"Failed to process patrol: {e}")

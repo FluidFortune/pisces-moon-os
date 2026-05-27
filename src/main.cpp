@@ -23,11 +23,14 @@
 #include <SD.h>
 #include <SdFat.h>           
 #include <TinyGPSPlus.h>     
-#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_CARDPUTER_ADV)
+#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P)
 #include <Arduino_GFX_Library.h>
 #endif
 #ifdef DEVICE_TLORAPAGER
     #include "pm_disp_tlorapager.h"
+#endif
+#ifdef DEVICE_C28P
+    #include "c28p_boot.h"
 #endif
 #include <XPowersLib.h>
 #include <esp_task_wdt.h>    // WDT feed — prevents Guru Meditation during long setup()
@@ -49,6 +52,7 @@
 #include "ghost_partition.h"  // Ghost Partition / PIN router system
 #ifdef DEVICE_CARDPUTER_ADV
 #include "pi4ioe_cap.h"       // Cap LoRa-1262 I2C expander (RF switch enable)
+#include "cardputer_i2c_module.h"
 #endif
 
 // --- GLOBAL VARIABLES TO SATISFY THE LINKER ---
@@ -163,6 +167,24 @@ const unsigned long WIFI_TIMEOUT_MS = 5000;  // 5 seconds max for autoconnect
 #define BOARD_KEY_INT     PIN_KEY_INT
 #endif // DEVICE_CARDPUTER_ADV
 
+
+#ifdef DEVICE_C28P
+// LCDwiki 2.8" ESP32-S3 Display (C28P variant)
+// ILI9341V 240x320 IPS, native portrait orientation.
+// No keyboard, no LoRa, no GPS — touch-only desk fixture.
+// Pins resolved from platformio.ini -DPIN_LCD_* defines.
+#define BOARD_TFT_BL      PIN_LCD_BL
+#define BOARD_TFT_DC      PIN_LCD_DC
+#define BOARD_TFT_CS      PIN_LCD_CS
+#define BOARD_TFT_MOSI    PIN_LCD_MOSI
+#define BOARD_TFT_MISO    PIN_LCD_MISO
+#define BOARD_TFT_SCK     PIN_LCD_SCK
+#define BOARD_TFT_RST     PIN_LCD_RST
+
+#define BOARD_I2C_SDA     PIN_I2C_SDA
+#define BOARD_I2C_SCL     PIN_I2C_SCL
+#endif // DEVICE_C28P
+
 // --- DRIVER INSTANTIATION ---
 #ifdef DEVICE_TDECK_PLUS
 Arduino_DataBus *bus = new Arduino_HWSPI(BOARD_TFT_DC, BOARD_TFT_CS, BOARD_TFT_SCK, BOARD_TFT_MOSI, BOARD_TFT_MISO, &SPI, true);
@@ -194,6 +216,20 @@ PMDispTLoRaPager *gfx = new PMDispTLoRaPager(
     BOARD_TFT_SCK, BOARD_TFT_MISO, BOARD_TFT_MOSI,
     BOARD_TFT_CS, BOARD_TFT_DC, BOARD_TFT_BL,
     40000000UL, SPI);
+#endif
+
+
+#ifdef DEVICE_C28P
+// C28P: ILI9341V 240x320 IPS, native portrait orientation.
+// Rotation 0 = portrait with USB-C at the bottom.
+// IPS flag (true) inverts colors correctly for IPS panels.
+// The ILI9341 driver in Arduino_GFX is largely compatible with
+// the ILI9341V controller used on the C28P.
+Arduino_DataBus *bus = new Arduino_HWSPI(BOARD_TFT_DC, BOARD_TFT_CS,
+                                          BOARD_TFT_SCK, BOARD_TFT_MOSI,
+                                          BOARD_TFT_MISO, &SPI, true);
+Arduino_GFX *gfx = new Arduino_ILI9341(bus, BOARD_TFT_RST,
+                                        0 /* portrait */, true /* IPS */);
 #endif
 
 // --- MULTI-THREADING HANDLES ---
@@ -1212,6 +1248,7 @@ void setup() {
 
     Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
     init_keyboard();
+    cardputer_i2c_module_begin();
 
     // ── Cap LoRa-1262 RF switch enable ──────────────────────────────
     // The Cap LoRa-1262 routes the SX1262's RF signal through an
@@ -1235,6 +1272,43 @@ void setup() {
     digitalWrite(BOARD_TFT_BL, HIGH);
     Serial.println("[HAL] Cardputer ADV display init complete");
 #endif // DEVICE_CARDPUTER_ADV
+
+#ifdef DEVICE_C28P
+    // ── C28P display init ────────────────────────────────────────────
+    // LCDwiki 2.8" ESP32-S3 Display (ILI9341V, 240x320 portrait).
+    // Pattern matches Cardputer ADV: raise CS, init shared SPI bus,
+    // backlight low during init to suppress white flash, gfx->begin()
+    // runs the controller init sequence, two fillScreen() calls flush
+    // the SPI command buffer, then backlight on.
+    //
+    // The C28P does not share SPI with LoRa/SD (no LoRa, SD is on a
+    // separate SDIO bus), so this is the simplest SPI init in the
+    // codebase — LCD owns the SPI bus alone.
+    pinMode(BOARD_TFT_CS, OUTPUT);
+    digitalWrite(BOARD_TFT_CS, HIGH);
+
+    SPI.begin(BOARD_TFT_SCK, BOARD_TFT_MISO, BOARD_TFT_MOSI);
+    pinMode(BOARD_TFT_BL, OUTPUT);
+    digitalWrite(BOARD_TFT_BL, LOW);   // off during flush — prevents white flash
+
+    gfx->begin();
+    gfx->fillScreen(0x0000);
+    gfx->fillScreen(0x0000);
+    delay(50);
+    digitalWrite(BOARD_TFT_BL, HIGH);   // backlight on after init
+    Serial.println("[HAL] C28P display init complete");
+
+    // I2C bus init — touch (FT6336G @ 0x38) + audio codec (ES8311 @ 0x18)
+    // share this bus. c28p_setup() in c28p_boot.cpp re-checks the bus
+    // and probes for both devices.
+    Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
+    Wire.setClock(400000);
+
+    // Hand off to c28p_boot.cpp for the C28P-specific hardware probe
+    // (I2C bus scan, touch init, etc.). Runs serial-only narration so
+    // failures are localizable without on-screen UI.
+    c28p_setup();
+#endif // DEVICE_C28P
 
 #ifdef DEVICE_TLORAPAGER
     // ── T-LoraPager boot sequence ──────────────────────────
@@ -1714,13 +1788,16 @@ void setup() {
 
     drawBootSection("PROCESS SPAWN");
 
-#ifdef DEVICE_CARDPUTER_ADV
+#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P)
     // Cardputer ADV (no PSRAM): defer wardrive task spawn until user
     // explicitly launches the wardrive app. The task's NimBLE init
     // claims ~48KB of internal SRAM which the device cannot afford
     // to lock up at boot — the launcher and other apps need that
     // headroom. run_wardrive() will call init_wardrive_core() on
     // first entry. T-Deck and Pager keep boot-spawn behavior.
+    //
+    // C28P (desk kiosk): no GPS, no mobility — wardrive is not part
+    // of the C28P focus and the symbol isn't linked in this build.
     drawBootLine("00:08", "WARDRIVE_CORE",         nullptr, 2, "DEFERRED");
     delay(60);
 #else
@@ -1733,7 +1810,7 @@ void setup() {
     // wardrive owns BLE startup/order.
     drawBootLine("00:09", "GAMEPAD_BLE",           nullptr, 2, "SKIPPED");
 
-#ifdef DEVICE_CARDPUTER_ADV
+#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P)
     // ── Cardputer ADV: SKIP Gemini boot-time init ────────────────────
     // The Gemini client allocates HTTPS context, JSON history buffer,
     // and NoSQL "gemini" category at init — ~15KB total. On the no-
@@ -1741,8 +1818,12 @@ void setup() {
     // budget. init_gemini() is idempotent (see gemini_client.cpp:131
     // — the chat path auto-initializes if needed), so deferring boot
     // init is safe.
+    //
+    // C28P (first boot): gemini_client.cpp is not in the v1.2.1
+    // src_filter for C28P. Will be added when AI Voice Terminal
+    // lands as a C28P-specific app.
     drawBootLine("00:10", "GEMINI_CLIENT",         nullptr, 2, "DEFERRED");
-    Serial.println("[SYSTEM] Cardputer: Gemini client deferred — "
+    Serial.println("[SYSTEM] Cardputer/C28P: Gemini client deferred — "
                    "lazy-init at first chat entry");
 #else
     init_gemini();
@@ -1752,8 +1833,8 @@ void setup() {
 
     // CRITICAL: render line FIRST, then call auto_connect_wifi() wrapper
     // WiFi SDK calls corrupt GFX cursor if text follows on same line
-#ifdef DEVICE_CARDPUTER_ADV
-    // ── Cardputer ADV: SKIP autoconnect ──────────────────────────────
+#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P)
+    // ── Cardputer ADV / C28P: SKIP autoconnect ───────────────────────
     // On the no-PSRAM Cardputer, WiFi STA mode consumes ~52KB and
     // bringing it up at boot leaves insufficient memory for the
     // wardrive + NimBLE budget OR for the Gemini client to operate.
@@ -1768,11 +1849,16 @@ void setup() {
     // mode init. Saved credentials persist on SD (wifi_manager.cpp),
     // so client-mode launches auto-associate without re-prompting.
     //
+    // C28P (desk kiosk): same deferred policy. WiFi comes up when
+    // the user explicitly launches a network-dependent app. No
+    // boot-time radio activity on a kiosk that may sit idle for
+    // hours.
+    //
     // T-Deck Plus and Pager have 8MB PSRAM and no such constraint;
     // they keep boot-time autoconnect behavior (else branch below).
     drawBootLine("00:11", "WiFi Auto-Connect",     nullptr, 2, "DEFERRED");
     delay(60);
-    Serial.println("[SYSTEM] Cardputer: WiFi autoconnect deferred — "
+    Serial.println("[SYSTEM] Cardputer/C28P: WiFi autoconnect deferred — "
                    "user-initiated only (mode-lock policy)");
     isWiFiConnected = false;
 #else
@@ -1783,9 +1869,19 @@ void setup() {
     esp_task_wdt_reset();
 
     delay(200);
+#ifndef DEVICE_C28P
+    // Ghost Engine (Core 0 background task) — spawned on devices that
+    // run wardrive. On C28P (no GPS, no field intelligence focus,
+    // wardrive.cpp not in the v1.2.1 src_filter), the Engine is not
+    // spawned and the wardrive_active flag is not defined.
     xTaskCreatePinnedToCore(core0GhostTask, "GhostTask", 10000, NULL, 1, &GhostTask, 0);
     wardrive_active = true;   // Ghost Engine starts immediately — never stops
     drawBootLine("00:12", "CORE_0_GHOST",          nullptr, 1, "ACTIVE");
+#else
+    drawBootLine("00:12", "CORE_0_GHOST",          nullptr, 2, "SKIPPED");
+    Serial.println("[SYSTEM] C28P: Ghost Engine not spawned — "
+                   "wardrive subsystem not in v1.2.1 build for this target");
+#endif
     delay(60);
 
 #ifdef DEVICE_TLORAPAGER
@@ -1810,12 +1906,25 @@ void setup() {
     // 11. GHOST PARTITION PIN SCREEN
     // No-op if GHOST_PARTITION_ENABLED not defined, boot key not held,
     // or no second partition detected on the card.
+    //
+    // C28P: Ghost Partition is not part of the kiosk threat model
+    // (no field-intelligence use case on a desk fixture). The
+    // ghost_partition.cpp file is excluded from the C28P src_filter.
+#ifndef DEVICE_C28P
     ghost_partition_run_pin_screen();
+#endif
     esp_task_wdt_reset();
 }
 
 // --- MAIN EXECUTIVE LOOP ---
 void loop() {
+#ifdef DEVICE_C28P
+    // C28P uses its own minimal touch launcher defined in c28p_boot.cpp.
+    // It never returns — the loop() body below only runs on the other
+    // devices.
+    c28p_launcher();
+#else
     run_launcher();
+#endif
     delay(100);
 }

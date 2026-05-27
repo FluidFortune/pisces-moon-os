@@ -31,6 +31,9 @@
 #include "theme.h"
 #include "pm_input.h"
 #include "SdFat.h"
+#ifdef DEVICE_C28P
+#include "c28p_dpad.h"
+#endif
 
 #ifdef DEVICE_TLORAPAGER
 extern PMDispTLoRaPager *gfx;
@@ -58,6 +61,24 @@ extern SdFat sd;
   #define OVER_Y      30
   #define OVER_W      180
   #define OVER_H      75
+#elif defined(DEVICE_C28P)
+  // C28P: 240×320 portrait, top 200px is game area, bottom 120px is D-pad chrome.
+  // Top 14px is the universal exit bar painted by c28p_dpad_render.
+  // The playfield lives at y=16-200 (184 tall). CELL=8 gives 30 cols × 23 rows.
+  #define GRID_X      0
+  #define GRID_Y      16
+  #define GRID_W      240
+  #define GRID_H      184
+  #define CELL        8
+  #define HEADER_H    14
+  #define SCREEN_W    240
+  #define SCREEN_H    200
+  #define HEADER_TXT_SIZE   1
+  // Game-over box: centered in top 200px viewport
+  #define OVER_X      20
+  #define OVER_Y      60
+  #define OVER_W      200
+  #define OVER_H      80
 #else
   // T-Deck Plus / T-LoRa Pager: 320×240 viewport centered on wider displays
   #define GRID_X      0
@@ -102,8 +123,12 @@ static int view_x() {
 }
 
 static int view_y() {
+#ifdef DEVICE_C28P
+    return 0;
+#else
     int h = gfx->height();
     return (h > SCREEN_H) ? (h - SCREEN_H) / 2 : 0;
+#endif
 }
 
 // ─────────────────────────────────────────────
@@ -139,6 +164,18 @@ static void draw_cell(int col, int row, uint16_t color) {
 static void draw_header(int score, int hi) {
     int vx = view_x();
     int vy = view_y();
+#ifdef DEVICE_C28P
+    // C28P: the dpad layer owns the top 14px as the exit bar with
+    // "< EXIT" text on the left. We paint score/hi on the right
+    // side of that same strip, leaving the left untouched so the
+    // exit affordance stays visible. No separate game header.
+    gfx->fillRect(80, 0, 240 - 80, 14, 0x0000);   // clear right portion
+    gfx->setTextSize(1);
+    gfx->setTextColor(C_GREEN);
+    gfx->setCursor(90, 4);
+    gfx->printf("SNAKE  S:%d  H:%d", score, hi);
+    return;
+#endif
     gfx->fillRect(vx, vy, SCREEN_W, HEADER_H, BORDER_COLOR);
     gfx->setTextSize(HEADER_TXT_SIZE);
     gfx->setTextColor(C_GREEN);
@@ -207,6 +244,47 @@ static void draw_playfield(const SnakePt body[], int len, int head, int food_col
     draw_border();
 }
 
+#ifdef DEVICE_C28P
+// ─────────────────────────────────────────────
+//  C28P DELTA REDRAW
+//
+//  Instead of repainting the entire playfield every tick (which
+//  causes visible bounce as the screen flashes through black),
+//  only repaint the cells that changed:
+//    - Old tail position becomes black (snake vacated it)
+//    - Previous head position becomes body color (no longer head)
+//    - New head position becomes head color
+//    - Food position painted if it just spawned (ate previous one)
+//
+//  Pre-conditions:
+//    - The full playfield was drawn once via draw_playfield()
+//      before the first delta call.
+//    - prev_head is the head's position BEFORE this move
+//    - vacated_tail is the cell that was the tail BEFORE this move
+//      (may be invalid if snake just ate — pass {-1,-1} to skip)
+//    - new_food is true if the food just respawned this tick
+// ─────────────────────────────────────────────
+static void draw_playfield_delta(const SnakePt body[], int len, int head,
+                                  int food_col, int food_row,
+                                  SnakePt prev_head, SnakePt vacated_tail,
+                                  bool new_food) {
+    // 1) Black out the vacated tail cell
+    if (vacated_tail.col >= 0 && vacated_tail.row >= 0) {
+        draw_cell(vacated_tail.col, vacated_tail.row, BG_COLOR);
+    }
+    // 2) Previous head becomes body color (unless body is now too short)
+    if (len > 1) {
+        draw_cell(prev_head.col, prev_head.row, SNAKE_COLOR);
+    }
+    // 3) New head
+    draw_cell(body[head].col, body[head].row, HEAD_COLOR);
+    // 4) New food if it just appeared
+    if (new_food && food_col >= 0 && food_row >= 0) {
+        draw_cell(food_col, food_row, FOOD_COLOR);
+    }
+}
+#endif
+
 // ─────────────────────────────────────────────
 //  GAME OVER SCREEN
 // ─────────────────────────────────────────────
@@ -253,6 +331,38 @@ static OverAction show_game_over(int score, int hi, bool new_hi) {
     const char *prompt = "R=RETRY  Q=QUIT";
     gfx->setCursor(ox + (OVER_W - (int)strlen(prompt) * 6) / 2, oy + 58);
     gfx->print(prompt);
+#elif defined(DEVICE_C28P)
+    // C28P portrait, touch-only input
+    gfx->setTextSize(2);
+    gfx->setTextColor(C_RED);
+    gfx->setCursor(ox + (OVER_W - 108) / 2, oy + 8);
+    gfx->print("GAME OVER");
+
+    gfx->setTextSize(1);
+    gfx->setTextColor(C_WHITE);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "Score: %d", score);
+    int tw = strlen(buf) * 6;
+    gfx->setCursor(ox + (OVER_W - tw) / 2, oy + 30);
+    gfx->print(buf);
+
+    if (new_hi) {
+        gfx->setTextColor(0xFFE0);
+        const char *msg = "** NEW HIGH SCORE **";
+        gfx->setCursor(ox + (OVER_W - (int)strlen(msg) * 6) / 2, oy + 42);
+        gfx->print(msg);
+    } else {
+        gfx->setTextColor(C_GREY);
+        snprintf(buf, sizeof(buf), "Best: %d", hi);
+        tw = strlen(buf) * 6;
+        gfx->setCursor(ox + (OVER_W - tw) / 2, oy + 42);
+        gfx->print(buf);
+    }
+
+    gfx->setTextColor(C_GREEN);
+    const char *cp = "A=RETRY  B=QUIT";
+    gfx->setCursor(ox + (OVER_W - (int)strlen(cp) * 6) / 2, oy + 62);
+    gfx->print(cp);
 #else
     // T-Deck / Pager original layout
     gfx->setTextSize(2);
@@ -282,8 +392,14 @@ static OverAction show_game_over(int score, int hi, bool new_hi) {
 
     while (true) {
         PMNesInput input = pm_read_nes_input(true);
+#ifdef DEVICE_C28P
+        // C28P: A=retry (rotate-like positive action), B=quit, exit bar=quit
+        if (input.a)                 return OVER_RETRY;
+        if (input.b || input.quit)   return OVER_EXIT;
+#else
         if (input.key == 'r' || input.key == 'R' || input.start) return OVER_RETRY;
         if (input.quit || input.a || input.b || input.key == PM_KEY_ENTER) return OVER_EXIT;
+#endif
         delay(30);
         yield();
     }
@@ -293,8 +409,12 @@ static OverAction show_game_over(int score, int hi, bool new_hi) {
 //  MAIN ENTRY POINT
 // ─────────────────────────────────────────────
 void run_snake() {
-#ifndef DEVICE_CARDPUTER_ADV
+#if !defined(DEVICE_CARDPUTER_ADV) && !defined(DEVICE_C28P)
     init_trackball();
+#endif
+#ifdef DEVICE_C28P
+    // Paint the virtual D-pad chrome below the game viewport.
+    c28p_dpad_render();
 #endif
 
     int hi = load_high_score();
@@ -319,7 +439,12 @@ void run_snake() {
         int food_row = -1;
         place_food(body, len, head, food_col, food_row);
 
+#ifdef DEVICE_C28P
+        // C28P: only clear top 200px game area, preserve D-pad chrome below.
+        gfx->fillRect(0, 0, 240, 200, BG_COLOR);
+#else
         gfx->fillScreen(BG_COLOR);
+#endif
         draw_header(score, hi);
         draw_playfield(body, len, head, food_col, food_row);
 
@@ -378,14 +503,28 @@ void run_snake() {
                 step_ms = max((unsigned long)80, 200UL - (unsigned long)(score / 10) * 8);
             }
 
+#ifdef DEVICE_C28P
+            // Capture the old positions for the delta redraw
+            SnakePt prev_head = body[head];
+            int old_tail_idx = (head - len + 1 + MAX_LEN) % MAX_LEN;
+            SnakePt vacated_tail = ate ? SnakePt{-1, -1} : body[old_tail_idx];
+#endif
+
             head = (head + 1) % MAX_LEN;
             body[head] = new_head;
 
+            bool food_respawned = false;
             if (ate) {
                 place_food(body, len, head, food_col, food_row);
+                food_respawned = true;
                 draw_header(score, hi);
             }
+#ifdef DEVICE_C28P
+            draw_playfield_delta(body, len, head, food_col, food_row,
+                                 prev_head, vacated_tail, food_respawned);
+#else
             draw_playfield(body, len, head, food_col, food_row);
+#endif
 
             yield();
         }

@@ -29,6 +29,9 @@
 #include "game_input.h"
 #include "theme.h"
 #include "pacman.h"
+#ifdef DEVICE_C28P
+#include "c28p_dpad.h"
+#endif
 
 #ifdef DEVICE_TLORAPAGER
 extern PMDispTLoRaPager *gfx;
@@ -53,6 +56,15 @@ extern SemaphoreHandle_t spi_mutex;
 #define TS          6
 #define HUD_H       12
 #define MAZE_TOP    20
+#elif defined(DEVICE_C28P)
+// C28P 240×320 portrait, top 200px game area, bottom 120px D-pad.
+// TS=6 → maze is 168 wide × 186 tall, plus HUD=10 and MAZE_TOP=4
+// totals 200px in the vertical, exactly filling the game viewport.
+#define SCREEN_W    240
+#define SCREEN_H    200
+#define TS          6
+#define HUD_H       10
+#define MAZE_TOP    4
 #else
 #define SCREEN_W    320
 #define SCREEN_H    240
@@ -192,8 +204,12 @@ static int viewX() {
 }
 
 static int viewY() {
+#ifdef DEVICE_C28P
+    return 0;
+#else
     int h = gfx->height();
     return (h > SCREEN_H) ? (h - SCREEN_H) / 2 : 0;
+#endif
 }
 
 // ─────────────────────────────────────────────
@@ -444,6 +460,17 @@ static void saveHS(int hs) {
 static void drawHUD() {
     int vx = viewX();
     int vy = viewY();
+#ifdef DEVICE_C28P
+    // C28P: top 14px is dpad's exit bar. Don't paint a separate HUD;
+    // instead write score/level/lives compactly into the right side
+    // of the exit bar.
+    gfx->fillRect(80, 0, 240 - 80, 14, COL_BLACK);
+    gfx->setTextSize(1);
+    gfx->setTextColor(COL_SCORE);
+    gfx->setCursor(86, 4);
+    gfx->printf("S:%d  H:%d  LV:%d", score, highScore, lives);
+    return;
+#endif
     gfx->fillRect(vx, vy, SCREEN_W, HUD_H, COL_BLACK);
     gfx->setTextSize(1);
     gfx->setTextColor(COL_SCORE);
@@ -915,11 +942,21 @@ void run_pacman() {
     lives     = 3;
     stage     = 1;
 
+#ifdef DEVICE_C28P
+    // Paint D-pad chrome below the game viewport
+    c28p_dpad_render();
+#endif
+
     while (lives > 0) {
         // Stage setup
         initMaze();
         initEntities();
+#ifdef DEVICE_C28P
+        // C28P: only clear the top 200px game area, preserve D-pad chrome
+        gfx->fillRect(0, 0, 240, 200, COL_BLACK);
+#else
         gfx->fillScreen(COL_BLACK);
+#endif
         drawMazeFull();
         drawHUD();
         drawPac();

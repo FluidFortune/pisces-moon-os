@@ -112,15 +112,22 @@ static bool _mountGhost(uint8_t csPin, SPIClass& spi) {
 static void _drawMFAScreen() {
     gfx->fillScreen(C_BLACK);
 
-    // Header bar
-    gfx->fillRect(0, 0, 320, 26, 0x0841);
+    // Read actual display dimensions. T-Deck Plus = 320x240;
+    // T-LoraPager = 480x222; Cardputer ADV = 240x135.
+    const int W = gfx->width();
+    const int H = gfx->height();
+    const int CX = W / 2;
+
+    // Header bar — full width, fixed 26px tall (matches _drawPinScreen)
+    gfx->fillRect(0, 0, W, 26, 0x0841);
     gfx->setTextColor(C_GREEN);
     gfx->setTextSize(1);
     gfx->setCursor(10, 8);
     gfx->print("PISCES MOON OS  //  SECURE BOOT");
 
-    // Lock icon — open (PIN accepted)
-    int lx = 148, ly = 60;
+    // Lock icon — open (PIN accepted) — centered horizontally
+    int lx = CX - 12;
+    int ly = 60;
     gfx->fillRect(lx,     ly,      24, 18, 0x4208);
     gfx->drawRect(lx,     ly,      24, 18, C_GREEN);
     gfx->fillRect(lx + 8, ly + 6,  8,  8,  C_BLACK);
@@ -128,21 +135,26 @@ static void _drawMFAScreen() {
     gfx->drawRect(lx + 4, ly - 14, 16, 14, C_GREEN);
     gfx->fillRect(lx + 6, ly - 12, 12, 8,  C_BLACK);
 
-    // Title
+    // Title — centered horizontally
     gfx->setTextSize(2);
     gfx->setTextColor(C_CYAN);
-    gfx->setCursor(40, 95);
-    gfx->print("PRESS UNLOCK KEY");
+    const char* prompt = "PRESS UNLOCK KEY";
+    int promptW = (int)strlen(prompt) * 12;  // 12px per char at size 2
+    gfx->setCursor(CX - promptW / 2, 95);
+    gfx->print(prompt);
 
     // Dim instruction — no hint about which key
     gfx->setTextSize(1);
     gfx->setTextColor(0x4208);
-    gfx->setCursor(70, 130);
-    gfx->print("PIN accepted. Key required.");
+    const char* hint = "PIN accepted. Key required.";
+    int hintW = (int)strlen(hint) * 6;
+    gfx->setCursor(CX - hintW / 2, 130);
+    gfx->print(hint);
 
-    // Footer
+    // Footer — clamp Y so it stays visible on shorter Cardputer screen
+    int footerY = (H > 220) ? 210 : H - 16;
     gfx->setTextColor(0x4208);
-    gfx->setCursor(10, 210);
+    gfx->setCursor(10, footerY);
     gfx->print("Wrong key loads safe mode.");
 }
 
@@ -226,11 +238,99 @@ static void _drawPinScreen(const String& entered, const String& statusMsg, uint1
 }
 
 // ─────────────────────────────────────────────
+//  INTERNAL: MFA UNLOCK-KEY PROMPT
+//  v1.2.1 — restored after v1.1 removal.
+//
+//  After a correct Primary PIN, this prompt appears asking the
+//  user to "PRESS UNLOCK KEY". Only the configured UNLOCK_KEY
+//  character returns true. ANY other key returns false silently,
+//  with no on-screen indication of failure — the caller then
+//  loads Student Mode as if a Decoy PIN had been entered.
+//
+//  Design rationale:
+//    - The unlock key is the second factor in two-factor unlock.
+//    - It does not appear on any device label or in any visible
+//      hint. Operator must memorize it.
+//    - Silent failure is intentional: an observer watching the
+//      device cannot tell from the UI whether the user just
+//      entered a Primary PIN + wrong key (Student Mode) or
+//      a Decoy PIN (also Student Mode). Both paths produce the
+//      identical visible outcome.
+//    - Q (exit/abort) also returns false — same as wrong key.
+// ─────────────────────────────────────────────
+static bool _promptUnlockKey() {
+    // Use the existing MFA screen renderer (now responsive across
+    // T-Deck Plus, T-LoRa Pager, and Cardputer ADV).
+    _drawMFAScreen();
+
+    // Block until a single keypress arrives.
+    // No backspace, no retry — one key, one decision.
+    while (true) {
+        char c = get_keypress();
+        if (c == 0) {
+            delay(15);
+            yield();
+            continue;
+        }
+        // Any non-zero key resolves the prompt.
+        // Match against UNLOCK_KEY; anything else (including Q and Enter)
+        // counts as a failed MFA and silently falls back to Student Mode.
+        Serial.printf("[MFA-DIAG] received char=0x%02X expected=0x%02X match=%s\n",
+                      (unsigned char)c, (unsigned char)UNLOCK_KEY,
+                      (c == UNLOCK_KEY) ? "yes" : "no");
+        return (c == UNLOCK_KEY);
+    }
+}
+
+// ─────────────────────────────────────────────
+//  INTERNAL: WIPE WARDRIVE LOGS ON A GIVEN PARTITION
+//  v1.2.1 — dynamic scan replaces hardcoded list.
+//  Wardrive writes /wardrive_NNNN.csv at the root of
+//  whichever partition is active. Currently that's the
+//  PUBLIC partition (sd), but the nuke wipes both so
+//  the behavior is correct if/when wardrive is moved
+//  to the Ghost partition in a future release.
+//
+//  Returns the number of files removed.
+// ─────────────────────────────────────────────
+static int _nukeWardriveLogsOn(SdFat& volume, const char* label) {
+    int wiped = 0;
+    char path[32];
+
+    // Iterate the full 1..9999 session-number space.
+    // Each existence check is a single metadata read — fast and
+    // SPI-bus safe. Misses (file doesn't exist) cost essentially
+    // nothing on a FAT32 volume.
+    for (int n = 1; n <= WARDRIVE_LOG_MAX_SESSION; n++) {
+        snprintf(path, sizeof(path), "%s%04d%s",
+                 WARDRIVE_LOG_PREFIX, n, WARDRIVE_LOG_SUFFIX);
+        if (volume.exists(path)) {
+            if (volume.remove(path)) {
+                wiped++;
+            } else {
+                Serial.printf("[GHOST] Failed to remove %s on %s\n",
+                              path, label);
+            }
+        }
+    }
+    return wiped;
+}
+
+// ─────────────────────────────────────────────
 //  INTERNAL: NUKE SEQUENCE
-//  Deletes Ghost Partition index files only.
+//  v1.2.1 — wipes Ghost Partition NoSQL indexes AND
+//  scans BOTH partitions for wardrive CSV logs.
+//
+//  This is a LOGICAL wipe — files are removed from the
+//  filesystem, making them invisible to the OS. Physical
+//  NAND blocks containing the data persist until the SD
+//  card's wear-leveling controller reuses them. For threat
+//  models requiring guaranteed unrecoverability, physical
+//  destruction of the SD card is required.
+//
 //  Fast metadata ops — no SPI bus stall.
-//  Does NOT format the partition (that would
-//  lock the bus and violate the SPI Bus Treaty).
+//  Does NOT format the partition (that would lock the bus
+//  and violate the SPI Bus Treaty).
 // ─────────────────────────────────────────────
 static void _executeNuke() {
     gfx->fillScreen(C_BLACK);
@@ -241,11 +341,13 @@ static void _executeNuke() {
     gfx->setTextSize(1);
     gfx->setTextColor(C_WHITE);
     gfx->setCursor(10, 120);
-    gfx->print("Removing Ghost Partition indexes...");
+    gfx->print("Removing tactical data...");
 
     int removed = 0;
 
-    // Remove NoSQL index files — renders each category invisible to the OS
+    // ── 1. Ghost Partition NoSQL index files ──
+    // Removing the index renders the entire category invisible
+    // to the OS even though raw entries may persist as orphans.
     for (int i = 0; i < NUKE_TARGETS_COUNT; i++) {
         if (_sdGhost.exists(NUKE_INDEX_FILES[i])) {
             _sdGhost.remove(NUKE_INDEX_FILES[i]);
@@ -254,13 +356,17 @@ static void _executeNuke() {
         }
     }
 
-    // Remove wardrive flat CSV files — these don't use the index pattern
-    for (int i = 0; i < WARDRIVE_LOG_COUNT; i++) {
-        if (_sdGhost.exists(WARDRIVE_LOGS[i])) {
-            _sdGhost.remove(WARDRIVE_LOGS[i]);
-            removed++;
-        }
-    }
+    // ── 2. Wardrive CSVs on the Ghost Partition ──
+    // Future-proofing — if wardrive is moved to sdGhost in a
+    // later release, this catches its logs there.
+    removed += _nukeWardriveLogsOn(_sdGhost, "GHOST");
+    gfx->print(".");
+
+    // ── 3. Wardrive CSVs on the Public Partition ──
+    // Current wardrive writes /wardrive_NNNN.csv to sd (Public).
+    // This is the primary wipe target until wardrive is migrated.
+    removed += _nukeWardriveLogsOn(sd, "PUBLIC");
+    gfx->print(".");
 
     gfx->setCursor(10, 145);
     gfx->setTextColor(C_GREEN);
@@ -458,11 +564,18 @@ void ghost_partition_run_pin_screen() {
             if (entered.length() == 0) continue;
 
             if (_verifyPin(entered, PRIMARY_PIN)) {
-                // ── PRIMARY PIN: Tactical Mode ──
-                // MFA unlock key removed — pending redesign.
-                // Primary PIN goes directly to Tactical Mode.
+                // ── PRIMARY PIN: MFA + Tactical Mode ──
+                // v1.2.1 — MFA unlock-key restored.
+                // Correct PIN brings up the "PRESS UNLOCK KEY" prompt.
+                // The correct UNLOCK_KEY loads Tactical Mode.
+                // Any other key silently falls back to Student Mode —
+                // visually indistinguishable from a Decoy PIN entry.
                 _attemptCount = 0;
-                _loadTacticalMode();
+                if (_promptUnlockKey()) {
+                    _loadTacticalMode();
+                } else {
+                    _loadStudentMode();
+                }
                 return;
 
             } else if (_verifyPin(entered, DECOY_PIN)) {

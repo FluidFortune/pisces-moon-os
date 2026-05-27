@@ -9,7 +9,7 @@
 // ============================================================
 //  hal_display.h — Per-device display initialization
 //
-//  Per-device display init. T-Deck/Cardputer use Arduino_GFX;
+//  Per-device display init. T-Deck/Cardputer/C28P use Arduino_GFX;
 //  T-LoRaPager uses the standalone PMDispTLoRaPager driver.
 //
 //  All apps use the global `gfx` pointer after init.
@@ -19,6 +19,7 @@
 //  T-Deck Plus:   ST7789,  320x240, SPI
 //  T-LoraPager:   ST7796U, 480x222, SPI (x-offset 49)
 //  Cardputer ADV: ST7789,  240x135, SPI (TBD)
+//  C28P:          ILI9341V, 240x320 portrait, SPI
 // ============================================================
 
 #include "hal_pins.h"
@@ -125,6 +126,50 @@ static inline bool pm_display_init() {
 #endif // DEVICE_CARDPUTER_ADV
 
 
+// ── C28P — ILI9341V 240×320 portrait ─────────────────────
+// LCDwiki 2.8" ESP32-S3 Display. Native portrait orientation
+// drives a kiosk/desk form factor. ILI9341V is largely compatible
+// with the ILI9341 driver in Arduino_GFX_Library.
+//
+// Backlight via PIN_LCD_BL (PWM-capable GPIO). The LCDwiki
+// reference design uses simple high-side LED control through a
+// transistor — analogWrite gives smooth dimming.
+//
+// Touch is handled separately via the FT6336G I2C driver
+// (see hal_input.h C28P block).
+//
+// INTERNAL DEVELOPMENT: pin assignments are based on LCDwiki
+// published documentation. Confirm against hardware before
+// shipping.
+#ifdef DEVICE_C28P
+
+static inline bool pm_display_init() {
+    Arduino_DataBus *bus = new Arduino_ESP32SPI(
+        LCD_DC,   // DC
+        LCD_CS,   // CS
+        LCD_SCK,  // SCK
+        LCD_MOSI, // MOSI
+        LCD_MISO  // MISO (read-back)
+    );
+    gfx = new Arduino_ILI9341(
+        bus,
+        LCD_RST,  // RST
+        0,        // rotation — 0 = native portrait (240 wide, 320 tall)
+        true      // IPS
+    );
+    if (!gfx->begin()) {
+        Serial.println("[DISPLAY] ILI9341V init failed");
+        return false;
+    }
+    gfx->fillScreen(BLACK);
+    Serial.printf("[DISPLAY] ILI9341V %dx%d ready (portrait)\n",
+                  SCREEN_W, SCREEN_H);
+    return true;
+}
+
+#endif // DEVICE_C28P
+
+
 // ── Brightness helper — works on all devices ─────────────
 // level: 0-255
 static inline void pm_display_brightness(uint8_t level) {
@@ -136,6 +181,9 @@ static inline void pm_display_brightness(uint8_t level) {
 #elif defined(DEVICE_CARDPUTER_ADV)
     // TODO
     (void)level;
+#elif defined(DEVICE_C28P)
+    // Direct PWM on LCD_BL (transistor-driven high-side switch)
+    analogWrite(LCD_BL, level);
 #endif
 }
 

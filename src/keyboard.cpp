@@ -13,6 +13,9 @@
 #include "keyboard.h"
 #include "hal.h"
 #include "pm_input.h"
+#ifdef DEVICE_CARDPUTER_ADV
+#include "cardputer_i2c_module.h"
+#endif
 
 // ============================================================
 //  KEYBOARD INPUT
@@ -364,6 +367,7 @@ static void cp_kb_push(char c) {
     cp_kb_fifo[cp_kb_fifo_head] = c;
     cp_kb_fifo_head = (cp_kb_fifo_head + 1) % CP_KB_FIFO_DEPTH;
     cp_kb_fifo_count++;
+    cardputer_i2c_module_offer_key(c);
 }
 
 // Pop one char from the FIFO; returns 0 if empty.

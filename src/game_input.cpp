@@ -6,6 +6,9 @@
 #include "gamepad.h"
 #include "keyboard.h"
 #include "pm_input.h"
+#ifdef DEVICE_C28P
+#include "c28p_dpad.h"
+#endif
 
 static bool keyIs(char key, char lower) {
     return key == lower || key == (char)(lower - 'a' + 'A');
@@ -53,6 +56,14 @@ PMNesInput pm_read_nes_input(bool includeTrackball) {
         input.down  = input.down  || (input.trackball.y == 1);
         input.a     = input.a     || input.trackball.clicked;
     }
+
+#ifdef DEVICE_C28P
+    // C28P: OR in virtual D-pad touch state. The dpad layer writes
+    // directly into the input struct's direction/A/B fields.
+    // Calling poll() also handles selective redraw of the on-screen
+    // controller chrome when buttons change state.
+    c28p_dpad_poll(&input);
+#endif
 
     return input;
 }
