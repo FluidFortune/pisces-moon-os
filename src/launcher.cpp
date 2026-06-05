@@ -53,15 +53,28 @@ extern bool wardrive_active;  // Ghost Engine state — Core 0
 #include "galaga.h"
 #include "tetris.h"
 #include "pole_position.h"
+#include "mario_bros.h"
+#include "breakout.h"
+#include "game_2048.h"
+#include "minesweeper.h"
+#include "connect4.h"
+#include "simon.h"
+#include "solitaire.h"
+#include "asteroids.h"
+#include "space_invaders.h"
+#include "frogger.h"
 #include "chess.h"
 #include "baseball.h"
 #include "pkt_sniffer.h"
 #include "beacon_spotter.h"
 #include "net_scanner.h"
 #include "hash_tool.h"
-#include "doom_app.h"
-#include "simcity.h"
 #include "trails.h"
+#include "pm_units.h"
+#include "pm_contacts.h"
+#include "pm_notes.h"
+#include "pm_tracker_scan.h"
+#include "pm_clock.h"
 #include "mesh_messenger.h"
 #include "gemini_client.h"
 #include "voice_terminal.h"
@@ -80,6 +93,7 @@ extern bool wardrive_active;  // Ghost Engine state — Core 0
 #include "usb_ducky.h"
 #include "wifi_ducky.h"
 #include "bridge_app.h"
+#include "ereader.h"
 #include "apps.h"
 
 extern Arduino_GFX *gfx;
@@ -292,7 +306,7 @@ struct Category {
     const char* name;
     const char* icon;
     uint16_t    color;
-    AppEntry    apps[16];   // Sized for largest category (CYBER: 14 apps)
+    AppEntry    apps[20];   // Sized for largest category (GAMES: 19 apps)
     int         appCount;
 };
 
@@ -359,19 +373,203 @@ struct Category {
 #define APP_BRIDGE       48   // USB Serial JSON bridge for web emulator
 #define APP_TETRIS       49   // Native falling-block game
 #define APP_POLE         50   // Native pseudo-3D racer
+#define APP_MARIO        51   // Native side-scrolling platformer
+#define APP_BREAKOUT     52
+#define APP_2048         53
+#define APP_MINESWEEPER  54
+#define APP_CONNECT4     55
+#define APP_SIMON        56
+#define APP_SOLITAIRE    57
+#define APP_ASTEROIDS    58
+#define APP_INVADERS     59
+#define APP_FROGGER      60
+
+// v1.2.2 — E-Reader
+#define APP_EREADER      61   // SD-card text/markdown reader
+
+// v1.3.0 — C28P/Maxine new category apps (hidden until now)
+#define APP_TIMER        62   // pm_run_timer()      — Clock app TIMER tab
+#define APP_STOPWATCH    63   // pm_run_stopwatch()  — Clock app STOPWATCH tab
+#define APP_UNITS        64   // pm_run_units()      — Unit converter
+#define APP_NOTES        65   // pm_run_notes()      — Touch-kiosk notes
+#define APP_CONTACTS     66   // pm_run_contacts()   — Address book
+#define APP_TRACKER_SCAN 67   // pm_run_tracker_scan() — AirTag/Tile detector
+#define APP_AI_TERMINAL  68   // AI chat terminal (API key TBD — stub)
+#define APP_RSS          69   // RSS feed reader
 
 // ─────────────────────────────────────────────
 //  CATEGORY DEFINITIONS
-//
-//  Folder colors (RGB565):
-//  COMMS  = Teal       0x03EF
-//  CYBER  = Red/orange 0xF200  (distinct, signals security context)
-//  TOOLS  = Dark red   0x8C00
-//  GAMES  = Dark green 0x0400
-//  MEDIA  = Dark amber 0x7800
-//  INTEL  = Dark blue  0x000F
-//  SYSTEM = Dark grey  0x3186
 // ─────────────────────────────────────────────
+
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+// ─────────────────────────────────────────────
+//  C28P / MAXINE — 12-slot 3×4 grid
+//
+//  Slot layout:
+//    0=SYSTEM   1=COMMS     2=CYBER
+//    3=UTILITIES 4=PERSONAL  5=REFERENCE
+//    6=AI       7=MEDIA     8=[empty/future]
+//    9=ARCADE  10=PUZZLES  11=TETRIS★ (direct launch, bottom-right)
+//
+//  Jen loves Tetris. Tetris is the feature app.
+// ─────────────────────────────────────────────
+#define GRID_SLOTS   12
+#define SLOT_NONE    -1   // empty placeholder (reserved for future SOCIAL)
+#define SLOT_TETRIS  -2   // bottom-right hero tile — direct-launches Tetris
+static const int SLOT_CAT[GRID_SLOTS] = {
+    0, 1, 2,         // SYSTEM, COMMS, CYBER
+    3, 4, 5,         // UTILITIES, PERSONAL, REFERENCE
+    6, 7, SLOT_NONE, // AI, MEDIA, [empty]
+    8, 9, SLOT_TETRIS// ARCADE, PUZZLES, TETRIS★
+};
+
+#ifdef DEVICE_C28P
+  // 240×320 portrait — 4px left margin, 74px wide boxes, 7px gaps
+  #define NEW_BOX_W   74
+  #define NEW_BOX_H   40
+  #define NEW_GAP_X    7
+  #define NEW_GAP_Y    6
+  #define NEW_GRID_X   4
+  #define NEW_GRID_Y  32
+#else
+  // Maxine 480×800 portrait — spacious layout
+  #define NEW_BOX_W  148
+  #define NEW_BOX_H  100
+  #define NEW_GAP_X   12
+  #define NEW_GAP_Y   10
+  #define NEW_GRID_X   6
+  #define NEW_GRID_Y  60
+#endif
+
+#define NUM_CATEGORIES 10   // real categories (slots 0-7 + 9-10)
+
+static const uint16_t CAT_ACCENT[] = {
+    0x8410,  // 0 SYSTEM     — silver
+    0x03EF,  // 1 COMMS      — teal
+    0xF400,  // 2 CYBER      — red-orange
+    0xFD20,  // 3 UTILITIES  — amber
+    0xF81F,  // 4 PERSONAL   — magenta
+    0x07FF,  // 5 REFERENCE  — cyan
+    0x9818,  // 6 AI         — purple
+    0xF81F,  // 7 MEDIA      — magenta
+    0x07E0,  // 8 ARCADE     — green
+    0x0400,  // 9 PUZZLES    — dark green
+};
+
+static const Category categories[] = {
+
+    { "SYSTEM", "S", 0x8410,
+      {{"WIFI JOIN", APP_WIFI_JOIN},
+       {"FILES",     APP_FILES},
+       {"SD FILES",  APP_FILEMGR},
+       {"ABOUT",     APP_ABOUT},
+       {"SYSTEM",    APP_SYSTEM},
+       {"uPY REPL",  APP_MICROPYTHON},
+       {"ELF APPS",  APP_ELF_BROWSER},
+       {"GAMEPAD",   APP_GAMEPAD},
+       {"BRIDGE",    APP_BRIDGE}},
+      9 },
+
+    { "COMMS", "C", 0x03EF,
+      {{"GPS",      APP_GPS},
+       {"MESH",     APP_MESH},
+       {"LORA PTT", APP_LORA_VOICE}},
+      3 },
+
+    { "CYBER", "!", 0xF400,
+      {{"WARDRIVE",   APP_WARDRIVE},
+       {"BT RADAR",   APP_BT_RADAR},
+       {"PKT SNIFF",  APP_PKT_SNIFFER},
+       {"TRACKER",    APP_TRACKER_SCAN},
+       {"BEACON",     APP_BEACON},
+       {"NET SCAN",   APP_NET_SCANNER},
+       {"HASH TOOL",  APP_HASH_TOOL},
+       {"GATT XPLR",  APP_BLE_GATT},
+       {"WPA HS",     APP_WPA_HS},
+       {"RF SPECTRM", APP_RF_SPECTRUM},
+       {"PROBE INTL", APP_PROBE_INTEL},
+       {"PKT ANLYS",  APP_PKT_ANALYSIS},
+       {"BLE DUCKY",  APP_BLE_DUCKY},
+       {"USB DUCKY",  APP_USB_DUCKY},
+       {"WIFI DUCKY", APP_WIFI_DUCKY}},
+      15 },
+
+    { "UTILITIES", "U", 0xFD20,
+      {{"CLOCK",     APP_CLOCK},
+       {"TIMER",     APP_TIMER},
+       {"STOPWATCH", APP_STOPWATCH},
+       {"CALC",      APP_CALC},
+       {"UNITS",     APP_UNITS}},
+      5 },
+
+    { "PERSONAL", "P", 0xF81F,
+      {{"NOTES",    APP_NOTES},
+       {"CONTACTS", APP_CONTACTS},
+       {"CALENDAR", APP_CALENDAR},
+       {"ETCH",     APP_ETCH}},
+      4 },
+
+    { "REFERENCE", "R", 0x07FF,
+      {{"SURVIVAL", APP_REF_SURV},
+       {"E-READER", APP_EREADER},
+       {"MEDICAL",  APP_REF_MED},
+       {"TRAILS",   APP_TRAILS},
+       {"BASEBALL", APP_BASEBALL},
+       {"RSS",      APP_RSS}},
+      6 },
+
+    { "AI", "A", 0x9818,
+      {{"VOICE AI",   APP_VOICE_TERM},
+       {"AI TERM",    APP_AI_TERMINAL},
+       {"GEMINI LOG", APP_GEMINI_LOG}},
+      3 },
+
+    { "MEDIA", "M", 0xF81F,
+      {{"PLAYER",   APP_PLAYER},
+       {"RECORDER", APP_RECORDER}},
+      2 },
+
+    { "ARCADE", "G", 0x07E0,
+      {{"PAC-MAN",  APP_PACMAN},
+       {"GALAGA",   APP_GALAGA},
+       {"MARIO",    APP_MARIO},
+       {"BREAKOUT", APP_BREAKOUT},
+       {"ASTERS",   APP_ASTEROIDS},
+       {"INVADERS", APP_INVADERS},
+       {"FROGGER",  APP_FROGGER},
+       {"POLE",     APP_POLE},
+       {"SNAKE",    APP_SNAKE}},
+      9 },
+
+    { "PUZZLES", "Z", 0x0400,
+      {{"2048",      APP_2048},
+       {"MINES",     APP_MINESWEEPER},
+       {"C4",        APP_CONNECT4},
+       {"SIMON",     APP_SIMON},
+       {"SOLITAIRE", APP_SOLITAIRE},
+       {"CHESS",     APP_CHESS}},
+      6 },
+
+};
+
+#else
+// ─────────────────────────────────────────────
+//  T-DECK PLUS — original 7-category 3×3 grid (unchanged)
+// ─────────────────────────────────────────────
+#define NUM_CATEGORIES 7
+#define GRID_SLOTS     NUM_CATEGORIES
+#define SLOT_TETRIS    -2   // unused on T-Deck Plus
+
+static const uint16_t CAT_ACCENT[] = {
+    0x03EF,  // COMMS  — teal
+    0xF400,  // CYBER  — red-orange
+    0xFD20,  // TOOLS  — amber
+    0x07E0,  // GAMES  — green
+    0x07FF,  // INTEL  — cyan
+    0xF81F,  // MEDIA  — magenta
+    0x8410,  // SYSTEM — silver
+};
+
 static const Category categories[] = {
 
     { "COMMS", "C", 0x03EF,
@@ -404,8 +602,9 @@ static const Category categories[] = {
        {"CALC",      APP_CALC},
        {"CLOCK",     APP_CLOCK},
        {"CALENDAR",  APP_CALENDAR},
-       {"ETCH",      APP_ETCH}},
-      5 },
+       {"ETCH",      APP_ETCH},
+       {"E-READER",  APP_EREADER}},
+      6 },
 
     { "GAMES", "G", 0x0400,
       {{"SNAKE",     APP_SNAKE},
@@ -413,11 +612,21 @@ static const Category categories[] = {
        {"GALAGA",    APP_GALAGA},
        {"TETRIS",    APP_TETRIS},
        {"POLE",      APP_POLE},
+       {"MARIO",     APP_MARIO},
+       {"BREAKOUT",  APP_BREAKOUT},
+       {"2048",      APP_2048},
+       {"MINES",     APP_MINESWEEPER},
+       {"C4",        APP_CONNECT4},
+       {"SIMON",     APP_SIMON},
+       {"SOLITAIRE", APP_SOLITAIRE},
+       {"ASTERS",    APP_ASTEROIDS},
+       {"INVADERS",  APP_INVADERS},
+       {"FROGGER",   APP_FROGGER},
        {"CHESS",     APP_CHESS},
        {"DOOM",      APP_DOOM},
        {"SIMCITY",   APP_SIMCITY},
        {"RETRO",     APP_RETRO}},
-      9 },
+      19 },
 
     { "INTEL", "I", 0x000F,
       {{"TERMINAL",  APP_TERMINAL},
@@ -446,7 +655,7 @@ static const Category categories[] = {
       8 },
 
 };
-#define NUM_CATEGORIES 7
+#endif  // DEVICE_C28P || DEVICE_MAXINE
 
 // ─────────────────────────────────────────────
 //  STATE
@@ -471,12 +680,22 @@ static int estimateBatteryPercent(float volts) {
 //  For 7 cats in a 3-col grid: row 0 = 0,1,2  row 1 = 3,4,5  row 2 = 6
 //  We shrink box height slightly to fit 3 rows.
 // ─────────────────────────────────────────────
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#define BOX_W  NEW_BOX_W
+#define BOX_H  NEW_BOX_H
+#define GAP_X  NEW_GAP_X
+#define GAP_Y  NEW_GAP_Y
+#define GRID_X NEW_GRID_X
+#define GRID_Y NEW_GRID_Y
+#else
+// T-Deck Plus — 320×240 landscape geometry (unchanged)
 #define BOX_W  85
 #define BOX_H  56    // Reduced from 65 to fit 3 rows
 #define GAP_X  15
 #define GAP_Y  10
 #define GRID_X 17
 #define GRID_Y 32
+#endif
 
 static void getBoxPos(int slot, int& bx, int& by) {
     bx = GRID_X + (slot % 3) * (BOX_W + GAP_X);
@@ -555,56 +774,122 @@ static void updateStatusBar() {
 //  CATEGORY SCREEN
 // ─────────────────────────────────────────────
 static void drawCategoryGrid() {
-    // Background drawn by drawLauncherBackground() — just draw icons on top
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+    // 12-slot layout: categories + empty placeholder + Tetris hero tile
+    for (int slot = 0; slot < GRID_SLOTS; slot++) {
+        int bx, by; getBoxPos(slot, bx, by);
+        int ci = SLOT_CAT[slot];
+
+        if (ci == SLOT_NONE) {
+            // Empty placeholder — dimly styled, reserved for future SOCIAL
+            drawChamferedBox(bx, by, BOX_W, BOX_H, C_DARK, 0x0841, 4);
+            gfx->setTextColor(0x18C3); gfx->setTextSize(1);
+            gfx->setCursor(bx + (BOX_W - 24)/2, by + BOX_H/2 - 4);
+            gfx->print("SOON");
+            continue;
+        }
+
+        if (ci == SLOT_TETRIS) {
+            // Hero tile — bottom-right, direct Tetris launch.
+            // Styled in Tetris cyan with pulsing corner dot.
+            bool sel = (selectedCategory == slot);
+            uint16_t acc = 0x07FF;   // Tetris cyan
+            drawChamferedBox(bx, by, BOX_W, BOX_H,
+                             sel ? 0x0C18 : 0x0414, acc, 5);
+            // Pulsing corner dot
+            uint16_t dotC = ((millis() / 300) % 2) ? 0xFFFF : acc;
+            gfx->fillRect(bx+3, by+3, 3, 3, dotC);
+            if (sel) {
+                gfx->drawLine(bx+2, by+8, bx+8, by+2, acc);
+                int scanY = by + ((millis() / 80) % BOX_H);
+                gfx->drawFastHLine(bx+5, scanY, BOX_W-10, acc & 0x1CE7);
+            }
+            // "TETRIS" at size 2 for prominence
+            gfx->setTextSize(2);
+            gfx->setTextColor(sel ? 0xFFFF : acc);
+            int tw = 6 * 2 * 6;  // 6 chars × size-2 pixel width
+            gfx->setCursor(bx + (BOX_W - tw)/2, by + 6);
+            gfx->print("TETRIS");
+            // "► PLAY" sub-label in amber
+            gfx->setTextSize(1);
+            gfx->setTextColor(sel ? 0xFFFF : 0xFD20);
+            gfx->setCursor(bx + (BOX_W - 30)/2, by + BOX_H - 12);
+            gfx->print("> PLAY");
+            continue;
+        }
+
+        // Regular category tile
+        bool sel = (selectedCategory == slot);
+        uint16_t accent = CAT_ACCENT[ci];
+        if (!sel) drawIconTraces(bx, by, BOX_W, BOX_H, accent);
+        drawChamferedBox(bx, by, BOX_W, BOX_H,
+                         sel ? 0x0018 : C_DARK,
+                         sel ? accent : (accent & 0x39E7), 5);
+        if (sel) {
+            gfx->drawLine(bx+2, by+8, bx+8, by+2, accent);
+            int scanY = by + ((millis() / 80) % BOX_H);
+            gfx->drawFastHLine(bx+5, scanY, BOX_W-10, accent & 0x1CE7);
+        } else {
+            gfx->drawLine(bx+2, by+8, bx+8, by+2, accent & 0x2104);
+        }
+        // Icon glyph — size 2 (fits in compact BOX_H=40 on C28P)
+        gfx->setTextSize(2);
+        gfx->setTextColor(sel ? accent : C_GLOW);
+        gfx->setCursor(bx + BOX_W/2 - 6, by + 6);
+        gfx->print(categories[ci].icon);
+        // Category name
+        gfx->setTextSize(1);
+        gfx->setTextColor(sel ? accent : 0xA534);
+        int nlen = strlen(categories[ci].name);
+        gfx->setCursor(bx + (BOX_W - nlen*6)/2, by + BOX_H - 10);
+        gfx->print(categories[ci].name);
+        // App count — dim, top-right corner
+        gfx->setTextColor(sel ? accent : 0x2945);
+        gfx->setCursor(bx + BOX_W - 13, by + 3);
+        gfx->printf("%d", categories[ci].appCount);
+        // CYBER pulsing alert dot
+        if (strcmp(categories[ci].name, "CYBER") == 0) {
+            uint16_t dotCol = ((millis() / 400) % 2) ? 0xF400 : 0xFD20;
+            gfx->fillRect(bx+3, by+3, 3, 3, dotCol);
+        }
+    }
+#else
+    // T-Deck Plus — original 7-category loop (unchanged)
     for (int i = 0; i < NUM_CATEGORIES; i++) {
         int bx, by; getBoxPos(i, bx, by);
         bool sel = (selectedCategory == i);
         uint16_t accent = CAT_ACCENT[i];
-
-        // Trace decorations behind box
         if (!sel) drawIconTraces(bx, by, BOX_W, BOX_H, accent);
-
-        // Chamfered box — dark fill, accent border
         drawChamferedBox(bx, by, BOX_W, BOX_H,
                          sel ? 0x0018 : C_DARK,
                          sel ? accent : (accent & 0x39E7), 8);
-
-        // Inner corner accent lines for depth
         if (sel) {
             gfx->drawLine(bx+2, by+10, bx+10, by+2, accent);
             gfx->drawLine(bx+BOX_W-10, by+2, bx+BOX_W-2, by+10, accent);
-            // Scan line — subtle CRT feel
             int scanY = by + ((millis() / 80) % BOX_H);
             gfx->drawFastHLine(bx+8, scanY, BOX_W-16, accent & 0x1CE7);
         } else {
             gfx->drawLine(bx+2, by+10, bx+10, by+2, accent & 0x2104);
             gfx->drawLine(bx+BOX_W-10, by+2, bx+BOX_W-2, by+10, accent & 0x2104);
         }
-
-        // Big letter icon
         gfx->setTextSize(3);
         gfx->setTextColor(sel ? accent : C_GLOW);
         gfx->setCursor(bx + BOX_W/2 - 9, by + 10);
         gfx->print(categories[i].icon);
-
-        // Category name
         gfx->setTextSize(1);
         gfx->setTextColor(sel ? accent : 0xA534);
         int nlen = strlen(categories[i].name);
         gfx->setCursor(bx + (BOX_W - nlen*6)/2, by + BOX_H - 12);
         gfx->print(categories[i].name);
-
-        // App count — dim, top-right
         gfx->setTextColor(sel ? accent : 0x2945);
         gfx->setCursor(bx + BOX_W - 13, by + 3);
         gfx->printf("%d", categories[i].appCount);
-
-        // CYBER pulsing alert dot
         if (strcmp(categories[i].name, "CYBER") == 0) {
             uint16_t dotCol = ((millis() / 400) % 2) ? 0xF400 : 0xFD20;
             gfx->fillRect(bx + 3, by + 3, 3, 3, dotCol);
         }
     }
+#endif
 }
 
 static void drawCategoryUI() {
@@ -626,10 +911,22 @@ static void drawCategoryUI() {
 //  APP SCREEN
 // ─────────────────────────────────────────────
 static void drawAppGrid() {
-    const Category& cat = categories[openCategory];
+    const Category& cat = categories[
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+        SLOT_CAT[openCategory]
+#else
+        openCategory
+#endif
+    ];
     int startIdx = appPage * 6;
     int catIdx = openCategory;
-    uint16_t accent = (catIdx < NUM_CATEGORIES) ? CAT_ACCENT[catIdx] : C_MATRIX;
+    uint16_t accent = CAT_ACCENT[
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+        SLOT_CAT[openCategory]
+#else
+        catIdx < NUM_CATEGORIES ? catIdx : 0
+#endif
+    ];
 
     // Circuit background in content area
     gfx->fillRect(0, 24, 320, 186, C_BLACK);
@@ -762,6 +1059,7 @@ static void launchApp(int launchId) {
         case APP_CLOCK:        run_clock();                                 break;
         case APP_CALENDAR:     run_calendar();                              break;
         case APP_ETCH:         run_etch();                                  break;
+        case APP_EREADER:      run_ereader();                               break;
 
         // GAMES
         case APP_SNAKE:        run_snake();                                 break;
@@ -769,6 +1067,16 @@ static void launchApp(int launchId) {
         case APP_GALAGA:       run_galaga();                                break;
         case APP_TETRIS:       run_tetris();                                break;
         case APP_POLE:         run_pole_position();                         break;
+        case APP_MARIO:        run_mario_bros();                            break;
+        case APP_BREAKOUT:     run_breakout();                              break;
+        case APP_2048:         run_2048();                                  break;
+        case APP_MINESWEEPER:  run_minesweeper();                           break;
+        case APP_CONNECT4:     run_connect4();                              break;
+        case APP_SIMON:        run_simon();                                 break;
+        case APP_SOLITAIRE:    run_solitaire();                             break;
+        case APP_ASTEROIDS:    run_asteroids();                             break;
+        case APP_INVADERS:     run_space_invaders();                        break;
+        case APP_FROGGER:      run_frogger();                               break;
         case APP_CHESS:        run_chess();                                 break;
         case APP_DOOM:         run_doom();                                   break;
         case APP_SIMCITY:      run_simcity();                                break;
@@ -812,8 +1120,36 @@ static void launchApp(int launchId) {
         case APP_USB_DUCKY:    run_usb_ducky();                             break;
         case APP_WIFI_DUCKY:   run_wifi_ducky();                            break;
 
+        // CYBER — v1.3.0 (was hidden, now surfaced)
+        case APP_TRACKER_SCAN: pm_run_tracker_scan();                       break;
+
         // SYSTEM — Bridge App
         case APP_BRIDGE:       run_bridge();                                break;
+
+        // UTILITIES — new (were hidden behind pm_clock.h)
+        case APP_TIMER:        pm_run_timer();                              break;
+        case APP_STOPWATCH:    pm_run_stopwatch();                          break;
+        case APP_UNITS:        pm_run_units();                              break;
+
+        // PERSONAL — new (were hidden)
+        case APP_NOTES:        pm_run_notes();                              break;
+        case APP_CONTACTS:     pm_run_contacts();                           break;
+
+        // AI TERMINAL — stub until API token configured
+        case APP_AI_TERMINAL:
+            gfx->fillScreen(C_BLACK);
+            gfx->setCursor(20, 100); gfx->setTextColor(0x9818); gfx->setTextSize(2);
+            gfx->print("AI TERMINAL");
+            gfx->setCursor(20, 130); gfx->setTextColor(C_GREY); gfx->setTextSize(1);
+            gfx->print("Configure API key in secrets.h");
+            gfx->print("\nSee other Mac for token details.");
+            delay(3000);
+            break;
+
+        // REFERENCE — RSS stub (full RSS app to be wired per-device)
+        case APP_RSS:
+            run_data_reader("rss_cache", "RSS FEEDS");
+            break;
 
         default:
             gfx->setCursor(80, 110); gfx->setTextColor(C_APP_RED);
@@ -829,8 +1165,8 @@ static void launchApp(int launchId) {
 // ─────────────────────────────────────────────
 //  FOLDER OPEN / CLOSE
 // ─────────────────────────────────────────────
-static void openFolder(int idx) {
-    openCategory = idx;
+static void openFolder(int slot) {
+    openCategory = slot;  // stores the SLOT index; drawAppUI uses SLOT_CAT[openCategory]
     currentLevel = 1;
     selectedApp  = -1;
     appPage      = 0;
@@ -863,12 +1199,22 @@ static void handleTouch() {
     if (currentLevel == 0) {
         // Header area — nothing to do
         if (ty < 40) return;
-        // Find tapped category
-        for (int i = 0; i < NUM_CATEGORIES; i++) {
-            int bx, by; getBoxPos(i, bx, by);
+        // Find tapped slot
+        for (int slot = 0; slot < GRID_SLOTS; slot++) {
+            int bx, by; getBoxPos(slot, bx, by);
             if (tx >= bx && tx < bx + BOX_W && ty >= by && ty < by + BOX_H) {
-                if (doubleTap) { openFolder(i); return; }
-                if (selectedCategory != i) { selectedCategory = i; drawCategoryUI(); }
+                int ci = SLOT_CAT[slot];
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+                if (ci == SLOT_NONE) return;  // empty tile — no-op
+                if (ci == SLOT_TETRIS) {
+                    // Hero tile: single tap selects, double tap launches directly
+                    if (doubleTap) { launchApp(APP_TETRIS); return; }
+                    if (selectedCategory != slot) { selectedCategory = slot; drawCategoryUI(); }
+                    return;
+                }
+#endif
+                if (doubleTap) { openFolder(slot); return; }
+                if (selectedCategory != slot) { selectedCategory = slot; drawCategoryUI(); }
                 return;
             }
         }
@@ -1106,17 +1452,28 @@ static const TloraAppEntry APPS_TOOLS[] = {
     {"CLOCK",    run_clock},
     {"CALENDAR", run_calendar},
     {"ETCH",     run_etch},
+    {"E-READER", run_ereader},
 };
 static const TloraAppEntry APPS_GAMES[] = {
-    {"SNAKE",   run_snake},
-    {"PAC-MAN", run_pacman},
-    {"GALAGA",  run_galaga},
-    {"TETRIS",  run_tetris},
-    {"POLE",    run_pole_position},
-    {"CHESS",   run_chess},
-    {"DOOM",    run_doom},
-    {"SIMCITY", run_simcity},
-    {"RETRO",   run_retro_pack},
+    {"SNAKE",     run_snake},
+    {"PAC-MAN",   run_pacman},
+    {"GALAGA",    run_galaga},
+    {"TETRIS",    run_tetris},
+    {"POLE",      run_pole_position},
+    {"MARIO",     run_mario_bros},
+    {"BREAKOUT",  run_breakout},
+    {"2048",      run_2048},
+    {"MINES",     run_minesweeper},
+    {"C4",        run_connect4},
+    {"SIMON",     run_simon},
+    {"SOLITAIRE", run_solitaire},
+    {"ASTERS",    run_asteroids},
+    {"INVADERS",  run_space_invaders},
+    {"FROGGER",   run_frogger},
+    {"CHESS",     run_chess},
+    {"DOOM",      run_doom},
+    {"SIMCITY",   run_simcity},
+    {"RETRO",     run_retro_pack},
 };
 static const TloraAppEntry APPS_INTEL[] = {
     {"TERMINAL",   run_terminal},

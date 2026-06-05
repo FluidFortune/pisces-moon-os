@@ -12,6 +12,9 @@
 #include "game_input.h"
 #include "pole_position.h"
 #include "theme.h"
+#ifdef DEVICE_C28P
+#include "c28p_dpad.h"
+#endif
 
 #ifdef DEVICE_TLORAPAGER
 extern PMDispTLoRaPager *gfx;
@@ -29,6 +32,25 @@ static constexpr int VIEW_W = 320;
 static constexpr int VIEW_H = 222;
 static constexpr int HORIZON = 76;
 static constexpr int CAR_Y = 178;
+#elif defined(DEVICE_C28P)
+// C28P 240x320 portrait, touch-only. The game renders in the top 200px
+// (C28P_GAME_VIEW_H); the bottom 120px holds the virtual D-pad chrome.
+// The road uses the full 240px width (wider than Tetris's narrow board).
+// HORIZON/CAR_Y are scaled to the 200px-tall viewport, with the road
+// kept clear of the bottom edge so it never paints into the D-pad zone.
+static constexpr int VIEW_W = 240;
+static constexpr int VIEW_H = 200;
+static constexpr int HORIZON = 70;
+static constexpr int CAR_Y = 176;
+#elif defined(DEVICE_MAXINE)
+// Maxine 480x800 portrait. Top 520px game area above the virtual D-pad.
+// The road uses the full 480px width. HORIZON/CAR_Y scaled to the
+// 520px-tall viewport so the perspective lines read clearly on the
+// larger display.
+static constexpr int VIEW_W = 480;
+static constexpr int VIEW_H = 520;
+static constexpr int HORIZON = 180;
+static constexpr int CAR_Y = 460;
 #else
 static constexpr int VIEW_W = 320;
 static constexpr int VIEW_H = 240;
@@ -75,8 +97,14 @@ static int vx() {
 }
 
 static int vy() {
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+    // Top-anchor the viewport on touch kiosks: bottom rows belong to the
+    // virtual D-pad chrome and must not be painted by the game.
+    return 0;
+#else
     int h = gfx->height();
     return (h > VIEW_H) ? (h - VIEW_H) / 2 : 0;
+#endif
 }
 
 static float roadCurveAt(float z) {
@@ -103,9 +131,13 @@ static int curveCenter(int y) {
     int oy = vy();
     int span = max(1, VIEW_H - HORIZON);
     int dy = max(0, y - (oy + HORIZON));
-    float depth = (float)dy / span;
-    float curve = roadCurveAt((1.0f - depth) * 900.0f);
-    return ox + VIEW_W / 2 + (int)(curve * depth * depth * VIEW_W * 0.30f);
+    float depth = (float)dy / span;          // 0 at horizon, 1 at the car
+    float far = 1.0f - depth;                // 1 at horizon, 0 at the car
+    float curve = roadCurveAt(far * 900.0f);
+    // Offset is weighted by far^2 so the horizon swings off-center on a
+    // curve and the near edge (under the car) stays put. Scaled by VIEW_W
+    // so the bend reads the same proportionally on every screen size.
+    return ox + VIEW_W / 2 + (int)(curve * far * far * VIEW_W * 0.30f);
 }
 
 static void resetRival(int i, float zBase) {
@@ -144,7 +176,23 @@ static void drawBackground() {
         gfx->fillTriangle(sx + 18, base, sx + 43, peak + 6, sx + 70, base, COL_MOUNTAIN);
     }
 
+#if !defined(DEVICE_CARDPUTER_ADV) && !defined(DEVICE_MAXINE) && !defined(DEVICE_C28P)
+    // Pre-fill the road+grass area. drawRoad() then paints slice-by-slice
+    // over the top with the actual road geometry. The pre-fill exists so
+    // any sliver missed by the slice loop reads as grass, not stale pixels.
+    //
+    // SKIPPED on Cardputer, Maxine, and C28P for the same reason: the
+    // pre-fill is the dominant source of perceived flicker. ~22,000
+    // pixels on Cardputer, ~31,200 on C28P (240×130), and ~163,000 on
+    // Maxine (480×340) of solid green are written every frame, then
+    // immediately overwritten by drawRoad's slice writes. The eye reads
+    // the green-then-road transition mid-paint as strobing. drawRoad
+    // covers every pixel from y=HORIZON to y=VIEW_H anyway, so the
+    // pre-fill is redundant. T-Deck Plus and Pager keep the pre-fill
+    // because their parallel-write paths and smaller HORIZON-to-bottom
+    // spans make the double-paint visually negligible.
     gfx->fillRect(ox, oy + HORIZON, VIEW_W, VIEW_H - HORIZON, COL_GRASS_A);
+#endif
 }
 
 static void drawRoad() {
@@ -283,14 +331,51 @@ static void drawTitle() {
     gfx->print((VIEW_W < 260) ? "POLE RUN" : "POLE POSITION");
     gfx->setTextSize(1);
     gfx->setTextColor(C_WHITE);
+
+    // Device-aware control hints. The previous "B accel A brake L/R steer"
+    // labels were keyboard-meaningless on Cardputer (B is the K key,
+    // A is the O key) — players had no way to know how to accelerate,
+    // so the car never moved and the road never scrolled. Each branch
+    // below shows the keys the user can actually see on the device.
+#ifdef DEVICE_CARDPUTER_ADV
+    gfx->setCursor(ox + VIEW_W / 2 - 48, oy + VIEW_H - 28);
+    gfx->print("PRESS B TO RACE");
+    gfx->setTextColor(C_GREY);
+    gfx->setCursor(ox + VIEW_W / 2 - 74, oy + VIEW_H - 16);
+    gfx->print("K=GAS  O=BRAKE  A/D=STEER");
+#elif defined(DEVICE_TLORAPAGER)
     gfx->setCursor(ox + VIEW_W / 2 - 61, oy + VIEW_H - 28);
-    gfx->print("START/B TO RACE");
+    gfx->print("PRESS START TO RACE");
     gfx->setTextColor(C_GREY);
     gfx->setCursor(ox + VIEW_W / 2 - 76, oy + VIEW_H - 16);
-    gfx->print("A/O accel  Z/down brake");
+    gfx->print("B=GAS  A=BRAKE  L/R=STEER");
+#elif defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+    gfx->setCursor(ox + VIEW_W / 2 - 56, oy + VIEW_H - 28);
+    gfx->print("TAP B TO RACE");
+    gfx->setTextColor(C_GREY);
+    gfx->setCursor(ox + VIEW_W / 2 - 80, oy + VIEW_H - 16);
+    gfx->print("ON-SCREEN: B=GAS A=BRAKE");
+#else
+    gfx->setCursor(ox + VIEW_W / 2 - 61, oy + VIEW_H - 28);
+    gfx->print("B/START TO RACE");
+    gfx->setTextColor(C_GREY);
+    gfx->setCursor(ox + VIEW_W / 2 - 76, oy + VIEW_H - 16);
+    gfx->print("B=GAS  A=BRAKE  L/R=STEER");
+#endif
 }
 
 void run_pole_position() {
+#ifdef DEVICE_C28P
+    // Paint the virtual D-pad chrome below the game viewport. Drawn once;
+    // pm_read_nes_input() handles press/release feedback from here on.
+    c28p_dpad_render();
+#endif
+#ifdef DEVICE_MAXINE
+    // Same idea, different chrome: maxine_dpad_render draws into the
+    // bottom strip (y >= 520) which the game's viewport never touches.
+    extern void maxine_dpad_render();
+    maxine_dpad_render();
+#endif
     resetRace();
     drawTitle();
     while (true) {
@@ -311,14 +396,18 @@ void run_pole_position() {
 
             PMNesInput input = pm_read_nes_input(true);
             if (input.quit) return;
-            if (input.start) {
-                delay(160);
-                continue;
-            }
 
-            if (input.up || input.a) speed += 118.0f * dt;
+            // NES-style racing controls (no joystick, so no "hold up to go"):
+            //   B button  = accelerate (the gas button)
+            //   A button  = brake
+            //   left/right = steer
+            // START is left as START — it does not drive the car and no
+            // longer frame-skips mid-race.
+            bool accel = input.b;
+            bool brake = input.a;
+            if (accel) speed += 118.0f * dt;
             else speed -= 22.0f * dt;
-            if (input.down || input.b) speed -= 150.0f * dt;
+            if (brake) speed -= 150.0f * dt;
             speed = min(246.0f, max(0.0f, speed));
 
             float steer = 0.0f;
@@ -353,7 +442,30 @@ void run_pole_position() {
             for (int i = 0; i < NUM_RIVALS; i++) drawRival(rivals[i]);
             drawPlayerCar();
             drawHud();
+#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_MAXINE) || defined(DEVICE_C28P)
+            // Cardputer ST7789, Maxine RGB panel, and C28P ILI9341V all
+            // suffer at a 60fps target with this slice-based renderer.
+            //
+            // Cardputer (ST7789, SPI, no double-buffer): per-frame slice
+            //   writes catch the panel refresh mid-paint and read as
+            //   strobing. 30fps gives the eye more time to fuse adjacent
+            //   frames and reads much smoother.
+            // C28P (ILI9341V, SPI, no double-buffer): same architecture
+            //   as Cardputer, same outcome. The 240×130 road repaint
+            //   per frame exceeds what the panel can absorb at 60fps.
+            // Maxine: at 480×520 the per-frame slice writes are ~5×
+            //   the pixel work of Cardputer. The RGB panel itself doesn't
+            //   strobe like an SPI display, but a 60Hz target overshoots
+            //   the time budget, creating uneven frame pacing that reads
+            //   as judder. 30fps matches budget to capability cleanly.
+            //
+            // Animation math is dt-driven so this changes the visual
+            // cadence only, not the physics or how fast the road scrolls
+            // per real-world second.
+            delay(33);
+#else
             delay(16);
+#endif
             yield();
         }
         if (!waitRaceOver()) return;

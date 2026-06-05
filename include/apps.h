@@ -39,6 +39,16 @@ void run_galaga();
 void run_tetris();
 void run_pole_position();
 void run_chess();
+void run_mario_bros();
+void run_breakout();
+void run_2048();
+void run_minesweeper();
+void run_connect4();
+void run_simon();
+void run_solitaire();
+void run_asteroids();
+void run_space_invaders();
+void run_frogger();
 
 // App Suite — INTEL
 void run_terminal();
@@ -67,6 +77,7 @@ void run_voice_terminal();   // Speech-to-Text + Gemini + Text-to-Speech
 void run_lora_voice();       // LoRa push-to-talk walkie-talkie (Codec2)
 void run_ssh_client();       // SSH terminal client for homelab access
 void run_micropython();      // Interactive MicroPython REPL
+void run_ereader();          // SD-card text/markdown reader
 
 // ============================================================
 //  ELF ENGINE — v0.9.6 "ELF ON A SHELF"

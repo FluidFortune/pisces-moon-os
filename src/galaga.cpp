@@ -30,6 +30,7 @@
 #include <freertos/semphr.h>
 #include "trackball.h"
 #include "game_input.h"
+#include "game_audio.h"
 #include "theme.h"
 #include "galaga.h"
 
@@ -48,6 +49,9 @@ extern SdFat sd;
 #ifdef DEVICE_C28P
 #include "c28p_dpad.h"
 #endif
+#ifdef DEVICE_MAXINE
+#include "maxine_dpad.h"
+#endif
 
 #ifdef DEVICE_TLORAPAGER
 #define SCREEN_W        480
@@ -58,6 +62,11 @@ extern SdFat sd;
 #elif defined(DEVICE_C28P)
 #define SCREEN_W        240
 #define SCREEN_H        200
+#elif defined(DEVICE_MAXINE)
+// Maxine 480x800 portrait: top 520px game area above the dpad chrome.
+// PLAY_W spans the full screen width for a roomy formation.
+#define SCREEN_W        480
+#define SCREEN_H        520
 #else
 #define SCREEN_W        320
 #define SCREEN_H        240
@@ -66,6 +75,8 @@ extern SdFat sd;
 #define PLAY_W          220
 #elif defined(DEVICE_C28P)
 #define PLAY_W          220
+#elif defined(DEVICE_MAXINE)
+#define PLAY_W          440   // 20px margin each side on a 480-wide panel
 #else
 #define PLAY_W          280   // Play area inside the centered viewport
 #endif
@@ -104,14 +115,16 @@ extern SdFat sd;
 #define COL_BEE         0xFFE0   // Yellow
 #define COL_BUTTERFLY   0x07E0   // Green
 
-// Clear the active game area. On C28P, the bottom 120px of the
-// physical screen holds the virtual D-pad chrome and must not be
-// wiped — restrict the clear to the top 200px game viewport.
+// Clear the active game area. On touch kiosks the bottom strip
+// (C28P: y>=200, Maxine: y>=520) holds the virtual D-pad chrome
+// and must not be wiped — restrict the clear to the game viewport.
 static inline void clearGameArea() {
 #ifdef DEVICE_C28P
     gfx->fillRect(0, 0, 240, 200, COL_BG);
+#elif defined(DEVICE_MAXINE)
+    gfx->fillRect(0, 0, 480, 520, COL_BG);
 #else
-    clearGameArea();
+    gfx->fillScreen(COL_BG);
 #endif
 }
 #define COL_BOSS        0xF81F   // Magenta
@@ -507,6 +520,26 @@ static void drawHUD() {
     return;
 #endif
 
+#ifdef DEVICE_MAXINE
+    // Maxine: 480px wide, vy=0, paint a 22px tall HUD strip at top.
+    // Size-2 text reads cleanly on the larger panel.
+    gfx->fillRect(0, 0, SCREEN_W, 22, COL_BG);
+    gfx->setTextSize(2);
+    gfx->setTextColor(COL_HUD);
+    gfx->setCursor(8, 4);
+    gfx->printf("SC %d", score);
+    gfx->setCursor(180, 4);
+    gfx->printf("HI %d", highScore);
+    gfx->setCursor(340, 4);
+    gfx->printf("ST %d", stage);
+    // Lives as ship triangles on the far right
+    for (int i = 0; i < lives && i < 5; i++) {
+        int lx = SCREEN_W - 24 - i * 24;
+        gfx->fillTriangle(lx, 5, lx - 8, 17, lx + 8, 17, COL_SHIP);
+    }
+    return;
+#endif
+
     gfx->fillRect(0, 0, SCREEN_W, HUD_H, COL_BG);
     gfx->setTextSize(1);
     gfx->setTextColor(COL_HUD);
@@ -686,6 +719,7 @@ static void runChallengingStage() {
                     pb[b].active = true; shotCooldown = 15; break;
                 }
             }
+            pm_game_audio_fx_laser();
         }
 
         // Draw ship
@@ -706,6 +740,7 @@ static void runChallengingStage() {
                     ce[i].alive = false; pb[b].active = false;
                     gfx->fillRect((int)ce[i].x-6, (int)ce[i].y-6, 14, 14, COL_BG);
                     score += 100; hit++;
+                    pm_game_audio_fx_explode();
                     break;
                 }
             }
@@ -725,6 +760,7 @@ static void runChallengingStage() {
     gfx->setCursor(resultX + 20, resultY + 10);
     if (hit == 40) {
         score += 10000;
+        pm_game_audio_fx_phase();
         gfx->print("PERFECT!! +10000");
     } else {
         gfx->printf("HIT %d/40  +%d", hit, hit * 100);
@@ -830,6 +866,7 @@ static bool runStage() {
                     bullets[b].active  = true;
                     bullets[b].isEnemy = false;
                     shotCooldown       = 12;
+                    pm_game_audio_fx_laser();
                     // Dual ship fires both
                     if (ship.dual && ship.dualAlive) {
                         for (int b2 = b+1; b2 < MAX_BULLETS; b2++) {
@@ -969,6 +1006,7 @@ static bool runStage() {
                         ship.dualAlive = false; // Lose dual ship first
                     } else {
                         triggerExplosion((int)ship.x, SHIP_Y);
+                        pm_game_audio_fx_explode();
                         lives--;
                         if (lives <= 0) return false;
                         ship.x = PLAY_X + PLAY_W / 2;
@@ -1005,6 +1043,7 @@ static bool runStage() {
                             if (enemies[i].state == ES_DIVING) pts *= 2;
                             score += pts;
                             triggerExplosion((int)enemies[i].x, (int)enemies[i].y);
+                            pm_game_audio_fx_explode();
                             enemies[i].state = ES_DEAD;
                             if (bossBeaming && beamEnemy == i) bossBeaming = false;
                         }
@@ -1068,6 +1107,15 @@ void run_galaga() {
     // Paint the virtual D-pad chrome below the game viewport
     c28p_dpad_render();
 #endif
+#ifdef DEVICE_MAXINE
+    // Paint Maxine's virtual D-pad below the game viewport (y >= 520).
+    maxine_dpad_render();
+#endif
+
+    // Bring up the audio HAL for arcade SFX (laser shots, enemy and
+    // ship explosions, stage-clear). Galaga arcade had no continuous
+    // music during play — SFX-driven, like Mario Bros and Pac-Man.
+    pm_game_audio_begin();
 
     ship.x         = PLAY_X + PLAY_W / 2;
     ship.alive     = true;
@@ -1086,6 +1134,7 @@ void run_galaga() {
         if (!stageClear) break;
 
         // Stage clear jingle
+        pm_game_audio_fx_phase();
         gfx->setTextSize(2);
         gfx->setTextColor(COL_BULLET);
         gfx->setCursor((SCREEN_W - 144) / 2, SCREEN_H / 2 - 10);
@@ -1098,5 +1147,6 @@ void run_galaga() {
         highScore = score;
         saveHS(highScore);
     }
+    pm_game_audio_stop();
     showGameOver();
 }

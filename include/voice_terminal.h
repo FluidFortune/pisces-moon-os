@@ -17,7 +17,7 @@
  * Speech-to-Text input + Gemini AI + Text-to-Speech output
  *
  * Addresses the T-Deck keyboard limitation for longer text entry.
- * Press SPACE to record, speak your prompt, Gemini responds in text
+ * Press R to record on keyboard devices, speak your prompt, Gemini responds in text
  * and synthesized speech via the onboard speaker.
  *
  * STT: Google Speech-to-Text API (cloud, requires WiFi)
@@ -25,7 +25,7 @@
  * AI:  Gemini via existing ask_gemini() infrastructure
  *
  * Hardware note: GPIO0 (trackball click) shares pin with ES7210 mic.
- * Trackball click unavailable during active recording — use SPACE.
+ * Trackball click unavailable during active recording — use R.
  *
  * SPI Bus Treaty: WiFi HTTP calls use wifi_in_use flag.
  * SD card writes (vault) follow hit-and-run pattern.

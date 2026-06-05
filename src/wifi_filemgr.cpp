@@ -62,7 +62,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include "SdFat.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #ifdef DEVICE_TLORAPAGER
@@ -70,17 +69,27 @@
 #else
 #include <Arduino_GFX_Library.h>
 #endif
+#if !defined(DEVICE_C28P) && !defined(DEVICE_MAXINE)
 #include "keyboard.h"
-#include "pm_input.h"
 #include "touch.h"
+#endif
+#include "pm_input.h"
+#include "pm_storage.h"
 #include "theme.h"
 #include "wifi_filemgr.h"
 #include "wardrive.h"
 
-extern SdFat             sd;
 #ifdef DEVICE_TLORAPAGER
 extern PMDispTLoRaPager *gfx;
 static constexpr int DISP_W = 480;
+#elif defined(DEVICE_MAXINE)
+extern Arduino_GFX *gfx;
+extern bool maxine_touch_read(int16_t* x, int16_t* y);
+static constexpr int DISP_W = 480;
+#elif defined(DEVICE_C28P)
+extern Arduino_GFX *gfx;
+extern bool c28p_touch_read(int16_t* x, int16_t* y);
+static constexpr int DISP_W = 240;
 #elif defined(DEVICE_CARDPUTER_ADV)
 extern Arduino_GFX *gfx;
 static constexpr int DISP_W = 240;
@@ -94,6 +103,21 @@ extern SemaphoreHandle_t spi_mutex;
 
 static WebServer _server(80);
 static bool      _serverRunning = false;
+
+static bool _takeStorage(TickType_t wait) {
+    if (!spi_mutex) return true;
+    return xSemaphoreTakeRecursive(spi_mutex, wait) == pdTRUE;
+}
+
+static void _giveStorage() {
+    if (spi_mutex) xSemaphoreGiveRecursive(spi_mutex);
+}
+
+static const char* _leafName(const char* path) {
+    if (!path) return "";
+    const char* slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
 
 // ─────────────────────────────────────────────
 //  HELPERS
@@ -120,6 +144,8 @@ static String _contentType(const String& path) {
     if (path.endsWith(".png"))  return "image/png";
     if (path.endsWith(".jpg"))  return "image/jpeg";
     if (path.endsWith(".wav"))  return "audio/wav";
+    if (path.endsWith(".mp3"))  return "audio/mpeg";
+    if (path.endsWith(".ogg"))  return "audio/ogg";
     return "application/octet-stream";
 }
 
@@ -319,74 +345,70 @@ static uint32_t _zip_walk(WiFiClient& client,
                            uint32_t& streamOffset) {
     if (_zipFileCount >= ZIP_MAX_FILES) return 0;
 
-    FsFile dir = sd.open(sdPath.c_str());
-    if (!dir || !dir.isDir()) { dir.close(); return 0; }
+    pm_storage::File dir = pm_storage::openDir(sdPath.c_str());
+    if (!dir) return 0;
 
     uint32_t written = 0;
-    FsFile entry;
 
-    // Dirs first pass, then files — keeps archive organised
-    for (int pass = 0; pass < 2; pass++) {
-        dir.rewindDirectory();
-        while (entry.openNext(&dir, O_RDONLY)) {
-            char nm[64]; entry.getName(nm, sizeof(nm));
-            bool isDir = entry.isDir();
+    while (true) {
+        pm_storage::File entry = dir.openNextEntry();
+        if (!entry) break;
 
-            if ((pass == 0) != isDir) { entry.close(); continue; }
+        String entryName = String(_leafName(entry.name()));
+        if (!entryName.length()) {
+            entry.close();
+            continue;
+        }
 
-            String entryName = String(nm);
-            String fullSdPath = (sdPath == "/") ? "/" + entryName
-                                                 : sdPath + "/" + entryName;
-            String zipName    = zipPrefix.length()
-                                ? zipPrefix + "/" + entryName
-                                : entryName;
+        String fullSdPath = (sdPath == "/") ? "/" + entryName
+                                             : sdPath + "/" + entryName;
+        String zipName    = zipPrefix.length()
+                            ? zipPrefix + "/" + entryName
+                            : entryName;
 
-            if (isDir) {
-                entry.close();
-                // Recurse — release and re-acquire mutex around the recursive call
-                xSemaphoreGiveRecursive(spi_mutex);
-                _zip_walk(client, fullSdPath, zipName, streamOffset);
-                xSemaphoreTakeRecursive(spi_mutex, portMAX_DELAY);
-            } else {
-                if (_zipFileCount >= ZIP_MAX_FILES) { entry.close(); break; }
+        if (entry.isDirectory()) {
+            entry.close();
+            _zip_walk(client, fullSdPath, zipName, streamOffset);
+        } else {
+            if (_zipFileCount >= ZIP_MAX_FILES) { entry.close(); break; }
 
-                uint32_t fileSize = entry.fileSize();
+            uint32_t fileSize = entry.size();
 
-                // Record this entry for the central directory
-                _zipEntries[_zipFileCount].name   = zipName;
-                _zipEntries[_zipFileCount].offset = streamOffset;
-                _zipEntries[_zipFileCount].size   = fileSize;
-                _zipEntries[_zipFileCount].crc32  = 0; // filled below
+            // Record this entry for the central directory
+            _zipEntries[_zipFileCount].name   = zipName;
+            _zipEntries[_zipFileCount].offset = streamOffset;
+            _zipEntries[_zipFileCount].size   = fileSize;
+            _zipEntries[_zipFileCount].crc32  = 0; // filled below
 
-                // Write local header
-                uint32_t hdrSize = _zip_write_local_header(client, zipName);
-                streamOffset += hdrSize;
+            // Write local header
+            uint32_t hdrSize = _zip_write_local_header(client, zipName);
+            streamOffset += hdrSize;
 
-                // Stream file data + compute CRC32
-                uint32_t crc    = 0;
-                uint32_t remain = fileSize;
-                uint8_t  buf[512];
+            // Stream file data + compute CRC32
+            uint32_t crc    = 0;
+            uint32_t remain = fileSize;
+            uint8_t  buf[512];
 
-                while (remain > 0) {
-                    size_t toRead = min((uint32_t)sizeof(buf), remain);
-                    size_t got    = entry.read(buf, toRead);
-                    if (got == 0) break;
-                    crc = _crc32_update(crc, buf, got);
-                    client.write(buf, got);
-                    streamOffset += got;
-                    remain       -= got;
-                    yield();
-                }
-
-                // Write data descriptor
-                _zip_write_data_descriptor(client, crc, fileSize);
-                streamOffset += 16;
-
-                _zipEntries[_zipFileCount].crc32 = crc;
-                _zipFileCount++;
-
-                entry.close();
+            while (remain > 0) {
+                size_t toRead = min((uint32_t)sizeof(buf), remain);
+                size_t got    = entry.read(buf, toRead);
+                if (got == 0) break;
+                crc = _crc32_update(crc, buf, got);
+                client.write(buf, got);
+                streamOffset += got;
+                written      += got;
+                remain       -= got;
+                yield();
             }
+
+            // Write data descriptor
+            _zip_write_data_descriptor(client, crc, fileSize);
+            streamOffset += 16;
+
+            _zipEntries[_zipFileCount].crc32 = crc;
+            _zipFileCount++;
+
+            entry.close();
         }
     }
 
@@ -463,15 +485,14 @@ static void _handleBackupZip() {
                  "Content-Type: application/zip\r\n"
                  "Content-Disposition: attachment; filename=\"" +
                  String(zipName) + "\"\r\n"
-                 "Transfer-Encoding: chunked\r\n"
                  "Connection: close\r\n\r\n";
     client.print(hdr);
 
-    // Walk and stream — hold mutex across each file, release between dirs
+    // Walk and stream. No Content-Length; the closed connection marks EOF.
     uint32_t streamOffset = 0;
-    if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+    if (_takeStorage(pdMS_TO_TICKS(2000))) {
         _zip_walk(client, "/", "", streamOffset);
-        xSemaphoreGiveRecursive(spi_mutex);
+        _giveStorage();
     }
 
     // Write central directory
@@ -489,8 +510,6 @@ static void _handleBackupZip() {
     // Write EOCD
     _zip_write_eocd(client, (uint16_t)_zipFileCount, cdSize, cdOffset);
 
-    // Terminate chunked transfer
-    client.print("0\r\n\r\n");
     client.flush();
 
     // Free central directory table
@@ -515,44 +534,40 @@ static void _handleBackupZip() {
 static void _selectWalkDir(const String& sdPath,
                             const String& indent,
                             String& html) {
-    FsFile dir = sd.open(sdPath.c_str());
-    if (!dir || !dir.isDir()) { dir.close(); return; }
+    pm_storage::File dir = pm_storage::openDir(sdPath.c_str());
+    if (!dir) return;
 
-    FsFile entry;
-    // Dirs first
-    for (int pass = 0; pass < 2; pass++) {
-        dir.rewindDirectory();
-        while (entry.openNext(&dir, O_RDONLY)) {
-            char nm[64]; entry.getName(nm, sizeof(nm));
-            bool isDir = entry.isDir();
-            if ((pass == 0) != isDir) { entry.close(); continue; }
+    while (true) {
+        pm_storage::File entry = dir.openNextEntry();
+        if (!entry) break;
 
-            String n        = String(nm);
-            String fullPath = (sdPath == "/") ? "/" + n : sdPath + "/" + n;
+        String n = String(_leafName(entry.name()));
+        if (!n.length()) {
+            entry.close();
+            continue;
+        }
+        String fullPath = (sdPath == "/") ? "/" + n : sdPath + "/" + n;
 
-            if (isDir) {
-                html += "<tr><td colspan='3' style='color:#00ccff;padding-left:"
-                     + indent + "px'>&#128193; " + _htmlEsc(n) + "/</td></tr>";
-                entry.close();
+        if (entry.isDirectory()) {
+            html += "<tr><td colspan='3' style='color:#00ccff;padding-left:"
+                 + indent + "px'>&#128193; " + _htmlEsc(n) + "/</td></tr>";
+            entry.close();
 
-                // Recurse with increased indent
-                int nextIndent = indent.toInt() + 16;
-                xSemaphoreGiveRecursive(spi_mutex);
-                _selectWalkDir(fullPath, String(nextIndent), html);
-                xSemaphoreTakeRecursive(spi_mutex, portMAX_DELAY);
-            } else {
-                uint32_t sz = entry.fileSize();
-                String ep   = _htmlEsc(fullPath);
-                html += "<tr>"
-                        "<td style='padding-left:" + indent + "px'>"
-                        "<input type='checkbox' class='fchk' value='/dl?path="
-                        + ep + "' name='f'> "
-                        "<span style='color:#00ff88'>" + _htmlEsc(n) + "</span></td>"
-                        "<td class='sz'>" + _humanSize(sz) + "</td>"
-                        "<td class='ac'><a href='/dl?path=" + ep + "'>&#11015; GET</a></td>"
-                        "</tr>";
-                entry.close();
-            }
+            // Recurse with increased indent
+            int nextIndent = indent.toInt() + 16;
+            _selectWalkDir(fullPath, String(nextIndent), html);
+        } else {
+            uint32_t sz = entry.size();
+            String ep   = _htmlEsc(fullPath);
+            html += "<tr>"
+                    "<td style='padding-left:" + indent + "px'>"
+                    "<input type='checkbox' class='fchk' value='/dl?path="
+                    + ep + "' name='f'> "
+                    "<span style='color:#00ff88'>" + _htmlEsc(n) + "</span></td>"
+                    "<td class='sz'>" + _humanSize(sz) + "</td>"
+                    "<td class='ac'><a href='/dl?path=" + ep + "'>&#11015; GET</a></td>"
+                    "</tr>";
+            entry.close();
         }
     }
     dir.close();
@@ -595,9 +610,9 @@ static void _handleSelectPage() {
             "<th><input type='checkbox' id='all' onchange='selAll(this.checked)'> NAME</th>"
             "<th>SIZE</th><th>DL</th></tr>";
 
-    if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    if (_takeStorage(pdMS_TO_TICKS(1000))) {
         _selectWalkDir("/", "18", html);
-        xSemaphoreGiveRecursive(spi_mutex);
+        _giveStorage();
     }
     html += "</table>";
 
@@ -682,45 +697,44 @@ static void _handleRoot() {
                 "<td class='sz'>—</td><td></td></tr>";
     }
 
-    if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-        FsFile dir = sd.open(path.c_str());
-        if (dir && dir.isDir()) {
-            for (int pass = 0; pass < 2; pass++) {
-                dir.rewindDirectory();
-                FsFile entry;
-                while (entry.openNext(&dir, O_RDONLY)) {
-                    char nm[64]; entry.getName(nm, sizeof(nm));
-                    bool isDir = entry.isDir();
-                    if ((pass==0) != isDir) { entry.close(); continue; }
+    if (_takeStorage(pdMS_TO_TICKS(500))) {
+        pm_storage::File dir = pm_storage::openDir(path.c_str());
+        if (dir) {
+            while (true) {
+                pm_storage::File entry = dir.openNextEntry();
+                if (!entry) break;
 
-                    String n  = String(nm);
-                    String ep = (path == "/") ? "/" + n : path + "/" + n;
-
-                    if (isDir) {
-                        html += "<tr><td class='dn'>&#128193; "
-                                "<a href='/?path=" + ep + "' style='color:#00ccff'>"
-                                + _htmlEsc(n) + "/</a></td>"
-                                "<td class='sz'>—</td>"
-                                "<td class='ac'><a href='/del?path=" + ep +
-                                "' onclick=\"return confirm('Delete "+_htmlEsc(n)+"?')\">&#128465; DEL</a></td></tr>";
-                    } else {
-                        uint32_t sz = entry.fileSize();
-                        html += "<tr><td class='fn'>&#128196; "
-                                "<a href='/dl?path=" + ep + "' style='color:#00ff88'>"
-                                + _htmlEsc(n) + "</a></td>"
-                                "<td class='sz'>" + _humanSize(sz) + "</td>"
-                                "<td class='ac'>"
-                                "<a href='/dl?path=" + ep + "'>&#11015; GET</a>"
-                                "<a href='/del?path=" + ep +
-                                "' onclick=\"return confirm('Delete "+_htmlEsc(n)+"?')\">&#128465; DEL</a>"
-                                "</td></tr>";
-                    }
+                String n = String(_leafName(entry.name()));
+                if (!n.length()) {
                     entry.close();
+                    continue;
                 }
+                String ep = (path == "/") ? "/" + n : path + "/" + n;
+
+                if (entry.isDirectory()) {
+                    html += "<tr><td class='dn'>&#128193; "
+                            "<a href='/?path=" + ep + "' style='color:#00ccff'>"
+                            + _htmlEsc(n) + "/</a></td>"
+                            "<td class='sz'>—</td>"
+                            "<td class='ac'><a href='/del?path=" + ep +
+                            "' onclick=\"return confirm('Delete "+_htmlEsc(n)+"?')\">&#128465; DEL</a></td></tr>";
+                } else {
+                    uint32_t sz = entry.size();
+                    html += "<tr><td class='fn'>&#128196; "
+                            "<a href='/dl?path=" + ep + "' style='color:#00ff88'>"
+                            + _htmlEsc(n) + "</a></td>"
+                            "<td class='sz'>" + _humanSize(sz) + "</td>"
+                            "<td class='ac'>"
+                            "<a href='/dl?path=" + ep + "'>&#11015; GET</a>"
+                            "<a href='/del?path=" + ep +
+                            "' onclick=\"return confirm('Delete "+_htmlEsc(n)+"?')\">&#128465; DEL</a>"
+                            "</td></tr>";
+                }
+                entry.close();
             }
             dir.close();
         }
-        xSemaphoreGiveRecursive(spi_mutex);
+        _giveStorage();
     }
     html += "</table>";
 
@@ -753,16 +767,16 @@ static void _handleDownload() {
     if (!_server.hasArg("path")) { _server.send(400,"text/plain","Missing path"); return; }
     String path = _server.arg("path");
 
-    if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-        FsFile file = sd.open(path.c_str(), O_READ);
-        if (!file || file.isDir()) {
-            xSemaphoreGiveRecursive(spi_mutex);
+    if (_takeStorage(pdMS_TO_TICKS(500))) {
+        pm_storage::File file = pm_storage::open(path.c_str(), pm_storage::Mode::Read);
+        if (!file) {
+            _giveStorage();
             _server.send(404,"text/plain","Not found"); return;
         }
         String fname = path.substring(path.lastIndexOf('/')+1);
         _server.sendHeader("Content-Disposition","attachment; filename=\""+fname+"\"");
-        _server.sendHeader("Content-Length", String(file.fileSize()));
-        _server.setContentLength(file.fileSize());
+        _server.sendHeader("Content-Length", String(file.size()));
+        _server.setContentLength(file.size());
         _server.send(200, _contentType(fname), "");
         WiFiClient client = _server.client();
         uint8_t buf[1024]; size_t n;
@@ -770,7 +784,7 @@ static void _handleDownload() {
             client.write(buf, n); yield();
         }
         file.close();
-        xSemaphoreGiveRecursive(spi_mutex);
+        _giveStorage();
     } else {
         _server.send(503,"text/plain","SD busy");
     }
@@ -779,7 +793,7 @@ static void _handleDownload() {
 // ─────────────────────────────────────────────
 //  UPLOAD
 // ─────────────────────────────────────────────
-static FsFile _upFile;
+static pm_storage::File _upFile;
 static bool   _upOk  = false;
 static String _upDir = "/";
 
@@ -811,22 +825,22 @@ static void _handleUploadData() {
         String dest = (_upDir == "/") ? "/" + String(up.filename.c_str())
                                       : _upDir + "/" + String(up.filename.c_str());
         Serial.printf("[FILEMGR] Upload start: %s\n", dest.c_str());
-        if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            if (!sd.exists(_upDir.c_str())) sd.mkdir(_upDir.c_str());
-            _upFile = sd.open(dest.c_str(), O_WRITE | O_CREAT | O_TRUNC);
-            xSemaphoreGiveRecursive(spi_mutex);
+        if (_takeStorage(pdMS_TO_TICKS(1000))) {
+            if (!pm_storage::exists(_upDir.c_str())) pm_storage::mkdir(_upDir.c_str());
+            _upFile = pm_storage::open(dest.c_str(), pm_storage::Mode::Write);
+            _giveStorage();
             _upOk = (bool)_upFile;
         }
         if (!_upOk) Serial.printf("[FILEMGR] Upload open FAILED: %s\n", dest.c_str());
     } else if (up.status == UPLOAD_FILE_WRITE && _upOk) {
-        if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (_takeStorage(pdMS_TO_TICKS(200))) {
             _upFile.write(up.buf, up.currentSize);
-            xSemaphoreGiveRecursive(spi_mutex);
+            _giveStorage();
         }
     } else if (up.status == UPLOAD_FILE_END && _upOk) {
-        if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (_takeStorage(pdMS_TO_TICKS(200))) {
             _upFile.close();
-            xSemaphoreGiveRecursive(spi_mutex);
+            _giveStorage();
         }
         Serial.printf("[FILEMGR] Upload done: %lu B\n", (unsigned long)up.totalSize);
     }
@@ -839,11 +853,11 @@ static void _handleDelete() {
     if (!_server.hasArg("path")) { _server.send(400,"text/plain","Missing path"); return; }
     String path = _server.arg("path");
     String par  = _parentOf(path);
-    if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-        if (sd.exists(path.c_str())) {
-            if (!sd.remove(path.c_str())) sd.rmdir(path.c_str());
+    if (_takeStorage(pdMS_TO_TICKS(500))) {
+        if (pm_storage::exists(path.c_str())) {
+            if (!pm_storage::remove(path.c_str())) pm_storage::rmdir(path.c_str());
         }
-        xSemaphoreGiveRecursive(spi_mutex);
+        _giveStorage();
     }
     _server.sendHeader("Location","/?path="+par);
     _server.send(303);
@@ -857,9 +871,9 @@ static void _handleMkdir() {
     String name = _server.hasArg("d")    ? _server.arg("d")    : "";
     if (name.length() > 0) {
         String np = (base == "/") ? "/" + name : base + "/" + name;
-        if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-            sd.mkdir(np.c_str());
-            xSemaphoreGiveRecursive(spi_mutex);
+        if (_takeStorage(pdMS_TO_TICKS(500))) {
+            pm_storage::mkdir(np.c_str());
+            _giveStorage();
         }
     }
     _server.sendHeader("Location","/?path="+base);
@@ -900,6 +914,30 @@ static void _drawScreen(const String& ip) {
     gfx->drawFastHLine(0, 210, DISP_W, 0xF800);
     gfx->setTextColor(0xF800); gfx->setCursor(60, 220);
     gfx->print(PM_STOP_COPY " SERVER");
+}
+
+static bool _filemgr_should_stop() {
+    int16_t tx, ty;
+#if defined(DEVICE_C28P)
+    if (c28p_touch_read(&tx, &ty) && ty < 40) {
+        while (c28p_touch_read(&tx, &ty)) { delay(10); yield(); }
+        return true;
+    }
+#elif defined(DEVICE_MAXINE)
+    if (maxine_touch_read(&tx, &ty) && ty < 56) {
+        while (maxine_touch_read(&tx, &ty)) { delay(10); yield(); }
+        return true;
+    }
+#else
+    if (get_touch(&tx, &ty) && ty < 40) {
+        while (get_touch(&tx, &ty)) { delay(10); yield(); }
+        return true;
+    }
+    if (pm_is_exit_key(get_keypress())) {
+        return true;
+    }
+#endif
+    return false;
 }
 
 // ─────────────────────────────────────────────
@@ -953,12 +991,7 @@ void run_wifi_filemgr() {
     while (_serverRunning) {
         _server.handleClient();
         yield();
-        int16_t tx, ty;
-        if (get_touch(&tx, &ty) && ty < 40) {
-            while (get_touch(&tx, &ty)) { delay(10); yield(); }
-            _serverRunning = false;
-        }
-        if (pm_is_exit_key(get_keypress())) {
+        if (_filemgr_should_stop()) {
             _serverRunning = false;
         }
         delay(2);

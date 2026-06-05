@@ -54,6 +54,12 @@ extern SdFat sd;            // Main public SdFat instance (Partition 1)
 static PiscesMoonMode  _currentMode       = PM_MODE_NORMAL;
 static bool            _bootKeyDetected   = false;
 
+#ifdef DEVICE_CARDPUTER_ADV
+static constexpr uint8_t PM_SD_SPI_CLOCK_MHZ = 4;
+#else
+static constexpr uint8_t PM_SD_SPI_CLOCK_MHZ = 10;
+#endif
+
 #ifdef GHOST_PARTITION_ENABLED
 
 static SdFat           _sdGhost;           // Partition 2 handle
@@ -85,7 +91,7 @@ static bool _mountGhost(uint8_t csPin, SPIClass& spi) {
     if (_ghostMounted) return true;
 
     // SdFat 2.2.3: begin() with SdSpiConfig, then select partition via vol()->begin()
-    SdSpiConfig cfg(csPin, SHARED_SPI, SD_SCK_MHZ(10), &spi);
+    SdSpiConfig cfg(csPin, SHARED_SPI, SD_SCK_MHZ(PM_SD_SPI_CLOCK_MHZ), &spi);
     if (!_sdGhost.begin(cfg)) {
         Serial.println("[GHOST] Partition 2 card init failed.");
         _ghostMounted = false;
@@ -448,7 +454,7 @@ void ghost_partition_check_boot_keys() {
 // ─────────────────────────────────────────────
 bool ghost_partition_mount_public(uint8_t csPin, SPIClass& spi) {
     // Always mount Partition 1 as the main 'sd' object
-    SdSpiConfig cfg(csPin, SHARED_SPI, SD_SCK_MHZ(10), &spi);
+    SdSpiConfig cfg(csPin, SHARED_SPI, SD_SCK_MHZ(PM_SD_SPI_CLOCK_MHZ), &spi);
 
 #ifdef GHOST_PARTITION_ENABLED
     // Mount with SdSpiConfig — standard single begin() call

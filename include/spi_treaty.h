@@ -241,9 +241,10 @@ static inline void xl9555_boot_sequence() {
 #if !defined(DEVICE_TDECK_PLUS) && \
     !defined(DEVICE_TLORAPAGER) && \
     !defined(DEVICE_CARDPUTER_ADV) && \
-    !defined(DEVICE_C28P)
+    !defined(DEVICE_C28P) && \
+    !defined(DEVICE_MAXINE)
   #error "No device target defined. Set DEVICE_TDECK_PLUS, \
-DEVICE_TLORAPAGER, DEVICE_CARDPUTER_ADV, or DEVICE_C28P in platformio.ini."
+DEVICE_TLORAPAGER, DEVICE_CARDPUTER_ADV, DEVICE_C28P, or DEVICE_MAXINE in platformio.ini."
 #endif
 
 #endif // SPI_TREATY_H

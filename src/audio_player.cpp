@@ -35,9 +35,26 @@ static constexpr int DISP_H = 240;
 #endif
 extern SdFat sd;
 
-#define I2S_BCLK   7
-#define I2S_LRC    5
-#define I2S_DOUT   6
+#ifdef DEVICE_TDECK_PLUS
+// T-Deck Plus is the only device with TWO I2S buses; output goes through
+// the dedicated OUT_ bus (MAX98357A amp). The OUT_ pins live in
+// platformio.ini build flags — see v1.3 PIN_I2S_* standardization.
+#define I2S_BCLK   PIN_I2S_OUT_SCLK
+#define I2S_LRC    PIN_I2S_OUT_LRCK
+#define I2S_DOUT   PIN_I2S_OUT_DOUT
+#else
+// Pager, Cardputer, and other single-bus devices use one I2S bus for
+// both input and output. The OUT/IN distinction collapses to plain
+// PIN_I2S_*; playback uses DOUT, recording uses DIN on the same bus.
+#define I2S_BCLK   PIN_I2S_SCLK
+#define I2S_LRC    PIN_I2S_LRCK
+#define I2S_DOUT   PIN_I2S_DOUT
+#endif
+// The three macros above are kept as aliases so the (long) call to
+// audio->setPinout() further down the file still reads naturally with
+// the historical BCLK/LRC/DOUT spelling that the Audio library docs use.
+// The pin VALUES come from platformio.ini build flags rather than
+// being hardcoded here — see the v1.3 PIN_I2S_* standardization.
 
 #define HEADER_H    26
 #define VIZ_Y       28

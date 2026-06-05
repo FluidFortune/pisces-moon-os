@@ -11,19 +11,39 @@
 
 #include <WiFi.h>
 #include <ArduinoJson.h>
-#include "SdFat.h"
+#include "pm_storage.h"
 #include "wifi_manager.h"
 
-extern SdFat sd;
+// v1.3.1: migrated from SdFat-direct to pm_storage HAL.
+//
+// Original implementation talked to the global `SdFat sd` object
+// directly. That works on devices with SPI-attached SD cards
+// (T-Deck Plus, T-LoRa Pager, Cardputer ADV) but on C28P (and
+// Maxine) the SD card is on the SDIO 4-bit bus via SD_MMC — the
+// SdFat global is never mounted to real storage there. Every
+// save_wifi_config() call silently failed on those devices:
+// sd.open() returned an invalid handle, the `if (outFile)` check
+// dropped through to "ERROR: Failed to write", and WiFi credentials
+// never persisted across reboots.
+//
+// pm_storage delegates to SdFat on the SPI-SD devices and to SD_MMC
+// on the SDIO devices. The same code path now works on all five
+// device targets. ArduinoJson's stream-mode deserialize/serialize
+// aren't usable here because pm_storage::File doesn't inherit from
+// Stream / Print — we marshal through a stack buffer / String
+// instead. WiFi config files are well under 1 KB so this is cheap.
 
 void save_wifi_config(const char* ssid, const char* password) {
     JsonDocument doc;
 
-    if (sd.exists("/wifi.cfg")) {
-        FsFile inFile = sd.open("/wifi.cfg", O_READ);
+    if (pm_storage::exists("/wifi.cfg")) {
+        pm_storage::File inFile = pm_storage::open("/wifi.cfg", pm_storage::Mode::Read);
         if (inFile) {
-            deserializeJson(doc, inFile);
+            char buf[1024];
+            size_t got = inFile.read((uint8_t*)buf, sizeof(buf) - 1);
+            buf[got] = 0;
             inFile.close();
+            deserializeJson(doc, buf);
         }
     }
 
@@ -31,9 +51,11 @@ void save_wifi_config(const char* ssid, const char* password) {
     doc["password"] = password;
     doc[ssid]    = password; // Keyring entry
 
-    FsFile outFile = sd.open("/wifi.cfg", O_WRITE | O_CREAT | O_TRUNC);
+    pm_storage::File outFile = pm_storage::open("/wifi.cfg", pm_storage::Mode::Write);
     if (outFile) {
-        serializeJson(doc, outFile);
+        String body;
+        serializeJson(doc, body);
+        outFile.print(body.c_str());
         outFile.close();
         Serial.println("[WIFI] Credentials saved to /wifi.cfg");
     } else {
@@ -42,14 +64,18 @@ void save_wifi_config(const char* ssid, const char* password) {
 }
 
 String get_known_password(String targetSSID) {
-    if (!sd.exists("/wifi.cfg")) return "";
+    if (!pm_storage::exists("/wifi.cfg")) return "";
 
-    FsFile file = sd.open("/wifi.cfg", O_READ);
+    pm_storage::File file = pm_storage::open("/wifi.cfg", pm_storage::Mode::Read);
     if (!file) return "";
 
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, file);
+    char buf[1024];
+    size_t got = file.read((uint8_t*)buf, sizeof(buf) - 1);
+    buf[got] = 0;
     file.close();
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, buf);
 
     if (!err && doc.containsKey(targetSSID)) {
         return doc[targetSSID].as<String>();
@@ -78,20 +104,24 @@ bool connect_to_wifi(const char* ssid, const char* password) {
 }
 
 void auto_connect_wifi() {
-    if (!sd.exists("/wifi.cfg")) {
+    if (!pm_storage::exists("/wifi.cfg")) {
         Serial.println("[WIFI] No config found on SD — skipping auto-connect.");
         return;
     }
 
-    FsFile file = sd.open("/wifi.cfg", O_READ);
+    pm_storage::File file = pm_storage::open("/wifi.cfg", pm_storage::Mode::Read);
     if (!file) {
         Serial.println("[WIFI] Could not open /wifi.cfg");
         return;
     }
 
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, file);
+    char buf[1024];
+    size_t got = file.read((uint8_t*)buf, sizeof(buf) - 1);
+    buf[got] = 0;
     file.close();
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, buf);
 
     if (err) {
         Serial.println("[WIFI] Config parse error — skipping.");

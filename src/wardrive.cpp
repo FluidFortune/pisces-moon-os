@@ -143,6 +143,7 @@
 #include <esp_netif.h>
 #include <esp_wifi.h>
 #include <esp_wifi_default.h>
+#include <esp_system.h>   // esp_reset_reason() — diag breadcrumb
 #endif
 
 extern TinyGPSPlus gps;
@@ -240,6 +241,11 @@ static bool isEspressifMAC(const char* mac) {
 }
 
 #define BLE_QUEUE_SIZE 32
+#ifdef DEVICE_CARDPUTER_ADV
+static constexpr int BLE_FLUSH_MAX_ROWS = 8;
+#else
+static constexpr int BLE_FLUSH_MAX_ROWS = BLE_QUEUE_SIZE;
+#endif
 struct BLEResult { char mac[18]; char name[32]; int rssi; };
 static BLEResult    bleQueue[BLE_QUEUE_SIZE];
 static volatile int bleHead = 0;
@@ -348,6 +354,113 @@ static constexpr uint32_t CP_BLE_SCAN_MIN_LARGEST_BLOCK = 20000;
 static constexpr uint32_t CP_BLE_RECOVER_FREE_HEAP = 52000;
 static constexpr uint32_t CP_BLE_RECOVER_LARGEST_BLOCK = 14000;
 static constexpr uint32_t CP_BLE_SCAN_SECONDS = 1;
+
+// ─────────────────────────────────────────────────────────────────
+//  DIAGNOSTIC LOG (Cardputer ADV) — untethered RF/heap telemetry
+//
+//  Mirrors the [WARDRIVE/CP] serial diagnostics to /diag_NNNN.txt on
+//  SD so a full Uber shift can be captured with no laptop tethered.
+//  Read the card at the desk afterward.
+//
+//  Crash-survival design: each line is flushed and the file CLOSED
+//  immediately, so a hard crash loses at most the in-flight line. The
+//  first line of every session is the reset reason (esp_reset_reason)
+//  decoded — so after a crash-and-reboot the NEXT session's header
+//  tells you what class of failure happened (PANIC / TASK_WDT /
+//  BROWNOUT / etc.), correlated with the last heap line before the gap.
+//
+//  Uses the shared spi_mutex so it never collides with the wardrive
+//  CSV writer or the file manager on the SPI bus.
+// ─────────────────────────────────────────────────────────────────
+static char _diag_log_file[32] = "";
+
+static const char* cp_reset_reason_str() {
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:   return "POWERON";
+        case ESP_RST_EXT:       return "EXT_RESET";
+        case ESP_RST_SW:        return "SW_RESET";
+        case ESP_RST_PANIC:     return "PANIC (crash/exception)";
+        case ESP_RST_INT_WDT:   return "INT_WDT (interrupt watchdog)";
+        case ESP_RST_TASK_WDT:  return "TASK_WDT (task watchdog)";
+        case ESP_RST_WDT:       return "OTHER_WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT (power sag)";
+        case ESP_RST_SDIO:      return "SDIO";
+        default:                return "UNKNOWN";
+    }
+}
+
+// Create /diag_NNNN.txt (matching the wardrive CSV session number when
+// possible) and write the reset-reason header. Best-effort; safe to call
+// repeatedly (no-op once created).
+static void cp_diag_open() {
+    if (_diag_log_file[0] != '\0') return;
+    if (!g_sd_ready || sd_in_use) return;
+    if (!spi_mutex) return;
+    if (xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return;
+
+    int n = 1;
+    for (; n <= 9999; n++) {
+        char path[32];
+        snprintf(path, sizeof(path), "/diag_%04d.txt", n);
+        if (!sd.exists(path)) break;
+    }
+    char tmp[32];
+    snprintf(tmp, sizeof(tmp), "/diag_%04d.txt", n);
+
+    FsFile f = sd.open(tmp, O_WRITE | O_CREAT | O_TRUNC);
+    if (f) {
+        f.printf("=== Pisces Moon diag session %04d ===\n", n);
+        f.printf("RESET REASON: %s\n", cp_reset_reason_str());
+        f.printf("boot free heap: %u  largest block: %u\n",
+                 (unsigned)ESP.getFreeHeap(),
+                 (unsigned)cp_largest_internal_block());
+        f.println("fields: uptime_ms,event,wifi_count,free_heap,largest_block,lat,lng");
+        f.flush();
+        f.close();
+        strncpy(_diag_log_file, tmp, sizeof(_diag_log_file) - 1);
+        _diag_log_file[sizeof(_diag_log_file) - 1] = '\0';
+        Serial.printf("[WARDRIVE/CP] Diag log: %s (reset: %s)\n",
+                      _diag_log_file, cp_reset_reason_str());
+    }
+    xSemaphoreGiveRecursive(spi_mutex);
+}
+
+// Append one GPS-stamped diagnostic line. event is a short tag like
+// "scan", "ble_skip", "ble_deinit". Flushes + closes immediately so a
+// crash cannot lose more than this one line.
+static void cp_diag_log(const char* event, int wifi_count,
+                        uint32_t free_heap, uint32_t largest_block) {
+    if (_diag_log_file[0] == '\0') return;
+    if (sd_in_use) return;
+    if (!spi_mutex) return;
+    if (xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    FsFile f = sd.open(_diag_log_file, O_WRITE | O_APPEND);
+    if (f) {
+        double lat = gps.location.isValid() ? gps.location.lat() : 0.0;
+        double lng = gps.location.isValid() ? gps.location.lng() : 0.0;
+        f.printf("%lu,%s,%d,%u,%u,%.6f,%.6f\n",
+                 (unsigned long)millis(), event, wifi_count,
+                 (unsigned)free_heap, (unsigned)largest_block, lat, lng);
+        f.flush();
+        f.close();
+    }
+    xSemaphoreGiveRecursive(spi_mutex);
+}
+
+static void cp_sd_diag_throttled(const char* event) {
+    static uint32_t last_log_ms = 0;
+    uint32_t now = millis();
+    if (now - last_log_ms < 3000) return;
+    last_log_ms = now;
+    Serial.printf("[WARDRIVE/CP] SD %s ready=%d busy=%d file=%s heap=%u largest=%u\n",
+                  event,
+                  g_sd_ready ? 1 : 0,
+                  sd_in_use ? 1 : 0,
+                  _current_log_file[0] ? _current_log_file : "(none)",
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)cp_largest_internal_block());
+}
 
 static void cp_format_mac(const uint8_t mac[6], char out[18]) {
     snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -527,11 +640,31 @@ static void initWardriveBLE() {
 // ─────────────────────────────────────────────────────────────
 static bool ensure_session_file() {
     if (_current_log_file[0] != '\0') return true;     // already created
-    if (!g_sd_ready) return false;                     // SD not ready yet
-    if (sd_in_use)   return false;                     // file mgr has the card
+    if (!g_sd_ready) {
+#ifdef DEVICE_CARDPUTER_ADV
+        cp_sd_diag_throttled("session_wait_not_ready");
+#endif
+        return false;                                  // SD not ready yet
+    }
+    if (sd_in_use) {
+#ifdef DEVICE_CARDPUTER_ADV
+        cp_sd_diag_throttled("session_wait_busy");
+#endif
+        return false;                                  // file mgr has the card
+    }
 
-    if (!spi_mutex) return false;
-    if (xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
+    if (!spi_mutex) {
+#ifdef DEVICE_CARDPUTER_ADV
+        cp_sd_diag_throttled("session_no_mutex");
+#endif
+        return false;
+    }
+    if (xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+#ifdef DEVICE_CARDPUTER_ADV
+        cp_sd_diag_throttled("session_mutex_timeout");
+#endif
+        return false;
+    }
 
     int session_num = _find_next_session_number();
     char tmp[32];
@@ -569,28 +702,71 @@ static void flushBLEQueue(const char* log_file) {
         portENTER_CRITICAL(&bleMux);
         bleTail = bleHead;
         portEXIT_CRITICAL(&bleMux);
+#ifdef DEVICE_CARDPUTER_ADV
+        cp_sd_diag_throttled("ble_flush_no_gps");
+#endif
         return;
     }
-    while (true) {
+
+    if (!spi_mutex) {
+#ifdef DEVICE_CARDPUTER_ADV
+        cp_sd_diag_throttled("ble_flush_no_mutex");
+#endif
+        return;
+    }
+
+    if (xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+#ifdef DEVICE_CARDPUTER_ADV
+        cp_sd_diag_throttled("ble_flush_mutex_timeout");
+#endif
+        return;
+    }
+
+    FsFile file = sd.open(log_file, O_WRITE | O_APPEND);
+    if (!file) {
+        xSemaphoreGiveRecursive(spi_mutex);
+#ifdef DEVICE_CARDPUTER_ADV
+        cp_sd_diag_throttled("ble_flush_open_fail");
+#endif
+        return;
+    }
+
+    int flushed = 0;
+    while (flushed < BLE_FLUSH_MAX_ROWS) {
         portENTER_CRITICAL(&bleMux);
-        if (bleTail == bleHead) { portEXIT_CRITICAL(&bleMux); break; }
+        if (bleTail == bleHead) {
+            portEXIT_CRITICAL(&bleMux);
+            break;
+        }
         BLEResult r = bleQueue[bleTail];
         bleTail = (bleTail + 1) % BLE_QUEUE_SIZE;
         portEXIT_CRITICAL(&bleMux);
 
-        if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            FsFile file = sd.open(log_file, O_WRITE | O_APPEND);
-            if (file) {
-                file.printf("%s,%s,%s,%s,%d,%d,%.6f,%.6f,%.1f,%d,%s\n",
-                    r.mac, r.name, "BT-LE", gps_timestamp().c_str(),
-                    0, r.rssi,
-                    gps.location.lat(), gps.location.lng(),
-                    gps.altitude.feet(), 10, "BT-LE");
-                file.close();
-            }
-            xSemaphoreGiveRecursive(spi_mutex);
-        }
+        file.printf("%s,%s,%s,%s,%d,%d,%.6f,%.6f,%.1f,%d,%s\n",
+            r.mac, r.name, "BT-LE", gps_timestamp().c_str(),
+            0, r.rssi,
+            gps.location.lat(), gps.location.lng(),
+            gps.altitude.feet(), 10, "BT-LE");
+        flushed++;
     }
+
+    file.close();
+    xSemaphoreGiveRecursive(spi_mutex);
+
+#ifdef DEVICE_CARDPUTER_ADV
+    if (flushed > 0) {
+        bool more_queued = false;
+        portENTER_CRITICAL(&bleMux);
+        more_queued = (bleTail != bleHead);
+        portEXIT_CRITICAL(&bleMux);
+        Serial.printf("[WARDRIVE/CP] BLE flush: wrote=%d more=%d heap=%u largest=%u\n",
+                      flushed, more_queued ? 1 : 0,
+                      (unsigned)ESP.getFreeHeap(),
+                      (unsigned)cp_largest_internal_block());
+    }
+#endif
+
+    if (flushed > 0) vTaskDelay(pdMS_TO_TICKS(1));
 }
 
 void wardrive_task(void *pvParameters) {
@@ -815,6 +991,9 @@ void wardrive_task(void *pvParameters) {
         // /wardrive_NNNN.csv file with proper rotation. Until then writes
         // are skipped silently.
         bool have_session = ensure_session_file();
+#ifdef DEVICE_CARDPUTER_ADV
+        cp_diag_open();   // open /diag_NNNN.txt once SD is ready (writes reset reason header)
+#endif
 
         // TIME-SLICED RADIO — skip SD writes if file manager is active
         // ─────────────────────────────────────────────────────
@@ -860,10 +1039,16 @@ void wardrive_task(void *pvParameters) {
 #ifdef DEVICE_CARDPUTER_ADV
                 wifi_mode_t raw_mode = WIFI_MODE_NULL;
                 esp_wifi_get_mode(&raw_mode);
-                Serial.printf("[WARDRIVE/CP] scan: n=%d total=%u mode=%d heap=%u largest=%u\n",
+                Serial.printf("[WARDRIVE/CP] scan: n=%d total=%u mode=%d heap=%u largest=%u session=%d sd_ready=%d sd_busy=%d\n",
                               n, (unsigned)cpTotalSeen, (int)raw_mode,
                               (unsigned)ESP.getFreeHeap(),
-                              (unsigned)cp_largest_internal_block());
+                              (unsigned)cp_largest_internal_block(),
+                              have_session ? 1 : 0,
+                              g_sd_ready ? 1 : 0,
+                              sd_in_use ? 1 : 0);
+                cp_diag_log("scan",
+                            cpTotalSeen > 0 ? (int)cpTotalSeen : n,
+                            ESP.getFreeHeap(), cp_largest_internal_block());
 #endif
 
                 // Only write to SD if we have a session file AND the file
@@ -877,6 +1062,7 @@ void wardrive_task(void *pvParameters) {
                     networks_total += reported;
                     if (gps.location.isValid()) {
                         if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                            bool wrote_wifi_rows = false;
                             FsFile file = sd.open(_current_log_file, O_WRITE | O_APPEND);
                             if (file) {
                                 for (int i = 0; i < n; ++i) {
@@ -915,9 +1101,23 @@ void wardrive_task(void *pvParameters) {
 #endif
                                 }
                                 file.close();
+                                wrote_wifi_rows = true;
+#ifdef DEVICE_CARDPUTER_ADV
+                            } else {
+                                cp_sd_diag_throttled("wifi_append_open_fail");
+#endif
                             }
                             xSemaphoreGiveRecursive(spi_mutex);
+                            if (wrote_wifi_rows) vTaskDelay(pdMS_TO_TICKS(1));
+#ifdef DEVICE_CARDPUTER_ADV
+                        } else {
+                            cp_sd_diag_throttled("wifi_append_mutex_timeout");
+#endif
                         }
+#ifdef DEVICE_CARDPUTER_ADV
+                    } else {
+                        cp_sd_diag_throttled("wifi_append_no_gps");
+#endif
                     }
                 } else if (n > 0) {
                     int reported = n;
@@ -1029,8 +1229,12 @@ void wardrive_task(void *pvParameters) {
                                   (unsigned)pre_ble_heap,
                                   (unsigned)pre_ble_largest,
                                   (unsigned)pressureSkips);
+                    cp_diag_log("ble_skip", networks_found,
+                                pre_ble_heap, pre_ble_largest);
                     if (pressureSkips >= 3 && nimbleInit) {
                         Serial.println("[WARDRIVE/CP] BLE pressure persists; deinit NimBLE for recovery");
+                        cp_diag_log("ble_deinit_pressure", networks_found,
+                                    pre_ble_heap, pre_ble_largest);
                         if (wdScan) wdScan->stop();
                         NimBLEDevice::deinit(true);
                         nimbleInit = false;
@@ -1048,19 +1252,18 @@ void wardrive_task(void *pvParameters) {
 #ifdef DEVICE_CARDPUTER_ADV
                 uint32_t post_ble_heap = ESP.getFreeHeap();
                 uint32_t post_ble_largest = cp_largest_internal_block();
-                if (s_ble_window_drops > 0 ||
-                    post_ble_heap < CP_BLE_RECOVER_FREE_HEAP ||
-                    post_ble_largest < CP_BLE_RECOVER_LARGEST_BLOCK) {
-                    Serial.printf("[WARDRIVE/CP] BLE window: seen=%u kept=%d drops=%u "
-                                  "heap=%u largest=%u\n",
-                                  (unsigned)s_ble_window_events, bt_found,
-                                  (unsigned)s_ble_window_drops,
-                                  (unsigned)post_ble_heap,
-                                  (unsigned)post_ble_largest);
-                }
+                Serial.printf("[WARDRIVE/CP] BLE window: seen=%u kept=%d drops=%u "
+                              "heap=%u largest=%u\n",
+                              (unsigned)s_ble_window_events, bt_found,
+                              (unsigned)s_ble_window_drops,
+                              (unsigned)post_ble_heap,
+                              (unsigned)post_ble_largest);
+                cp_diag_log("ble_window", bt_found, post_ble_heap, post_ble_largest);
                 if (post_ble_heap < CP_BLE_RECOVER_FREE_HEAP ||
                     post_ble_largest < CP_BLE_RECOVER_LARGEST_BLOCK) {
                     Serial.println("[WARDRIVE/CP] BLE heap floor breached; deinit NimBLE before next window");
+                    cp_diag_log("ble_deinit_floor", networks_found,
+                                post_ble_heap, post_ble_largest);
                     if (wdScan) wdScan->stop();
                     NimBLEDevice::deinit(true);
                     nimbleInit = false;
@@ -1259,8 +1462,15 @@ static void run_wardrive_cardputer() {
         // Column A values
         gfx->setTextColor(networks_found > 0 ? 0x07E0 : 0xFD20);
         gfx->setCursor(colAValueX, rowY[0]); gfx->print(networks_found);
-        gfx->setTextColor(0x07FF);
-        gfx->setCursor(colAValueX, rowY[1]); gfx->print(bt_found);
+        // Show current BLE count. bt_found resets to 0 at the start
+        // of each BLE window and accumulates kept devices during the
+        // scan. We snapshot it into a UI-side cache so the brief
+        // reset window doesn't blink the display to 0 between cycles.
+        static int bt_display_cached = 0;
+        int bt_snapshot = bt_found;
+        if (bt_snapshot > 0) bt_display_cached = bt_snapshot;
+        gfx->setTextColor(bt_display_cached > 0 ? 0x07FF : 0xFD20);
+        gfx->setCursor(colAValueX, rowY[1]); gfx->print(bt_display_cached);
         gfx->setTextColor(0xFFFF);
         gfx->setCursor(colAValueX, rowY[2]);
         gfx->printf("%.4f", gps.location.isValid() ? gps.location.lat() : 0.0);
@@ -1306,6 +1516,14 @@ static void run_wardrive_cardputer() {
 void run_wardrive() {
 #ifdef DEVICE_CARDPUTER_ADV
     run_wardrive_cardputer();
+    return;
+#endif
+
+#ifdef DEVICE_MAXINE
+    // Maxine uses its own wardrive UI in maxine_apps.cpp
+    // (maxine_run_wardrive). The shared scan task and anomaly engine
+    // are reused; only the render layer is per-device. This stub
+    // satisfies the linker on Maxine, which never calls run_wardrive().
     return;
 #endif
 
@@ -1379,8 +1597,13 @@ void run_wardrive() {
 
         gfx->setTextColor(networks_found > 0 ? 0x07E0 : 0xFD20);
         gfx->setCursor(dataX, 38);  gfx->println(networks_found);
-        gfx->setTextColor(0x07FF);
-        gfx->setCursor(dataX, 63);  gfx->println(bt_found);
+        // Current BLE count, cached to avoid blinking during the brief
+        // per-window reset (see comment in Cardputer block).
+        static int bt_display_cached = 0;
+        int bt_snapshot = bt_found;
+        if (bt_snapshot > 0) bt_display_cached = bt_snapshot;
+        gfx->setTextColor(bt_display_cached > 0 ? 0x07FF : 0xFD20);
+        gfx->setCursor(dataX, 63);  gfx->println(bt_display_cached);
         gfx->setTextColor(0xFFFF);
         gfx->setCursor(dataX, 88);  gfx->println(gps.satellites.value());
         gfx->setTextColor(0xC618);

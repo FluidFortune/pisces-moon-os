@@ -86,4 +86,21 @@ bool nosql_search(const char* category,
 // e.g. nosql_category_path("medical") -> "/data/medical"
 String nosql_category_path(const char* category);
 
+// ── Destructive ──────────────────────────────
+//
+// Erases every entry file in /data/<category>/, removes the
+// index.json, and rmdir's the category folder itself. After
+// this call, nosql_get_count(category) returns 0 and the next
+// nosql_init(category) / nosql_save_entry(category, ...) call
+// will recreate a fresh empty index.
+//
+// Returns true if the category was wiped (or wasn't there to
+// begin with). Returns false if directory walking failed mid
+// way — in which case the category may be partially erased.
+//
+// This is the destructive operation that powers the SYSTEM app's
+// FACTORY RESET button on touch kiosks. It is NOT called by any
+// of the normal write paths.
+bool nosql_clear_category(const char* category);
+
 #endif

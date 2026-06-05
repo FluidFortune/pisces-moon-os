@@ -1,0 +1,28 @@
+# Pisces Moon OS — pdf_to_text/requirements.txt
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# All four below are required for the full auto-fallback chain.
+# If you only have text PDFs (no scans), you can skip the OCR
+# dependencies and the tool will still work — it just won't be
+# able to handle scan-only PDFs.
+
+# ── Tier 1: PyMuPDF (fitz) ─────────────────────────────────
+# Primary text extractor. Fast, accurate, handles modern PDFs.
+PyMuPDF>=1.23.0
+
+# ── Tier 2: pdfminer.six ───────────────────────────────────
+# Fallback for weird/old PDFs that PyMuPDF can't parse.
+pdfminer.six>=20221105
+
+# ── Tier 3: Tesseract OCR (OPTIONAL) ───────────────────────
+# Only needed for scan-only PDFs (no embedded text). If these
+# aren't installed, the tool runs Tiers 1+2 just fine — it only
+# refuses to OCR (with a clear message) when a scan-PDF is given.
+#
+# Both also need system-level binaries (tesseract, poppler).
+# See README.md for OS-specific install instructions.
+pytesseract>=0.3.10
+pdf2image>=1.16.0
+Pillow>=10.0.0

@@ -1,0 +1,12 @@
+{
+  "category": "history",
+  "count": 6,
+  "entries": [
+    { "id": 1, "title": "The Printing Press", "tags": "technology,communication,renaissance,gutenberg", "file": "entry_001.json" },
+    { "id": 2, "title": "The Industrial Revolution", "tags": "industry,steam,manufacturing,economy", "file": "entry_002.json" },
+    { "id": 3, "title": "Electricity and the Grid", "tags": "electricity,power,edison,tesla,infrastructure", "file": "entry_003.json" },
+    { "id": 4, "title": "Germ Theory and Public Health", "tags": "medicine,disease,sanitation,vaccination", "file": "entry_004.json" },
+    { "id": 5, "title": "The Transistor and Computing", "tags": "computing,electronics,transistor,information", "file": "entry_005.json" },
+    { "id": 6, "title": "The Internet", "tags": "internet,networks,communication,information", "file": "entry_006.json" }
+  ]
+}

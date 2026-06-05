@@ -52,7 +52,7 @@
 //  only way to stop it, used by the UI's PAUSE button.
 // ─────────────────────────────────────────────
 
-#ifdef DEVICE_C28P
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -61,6 +61,19 @@
 #include <NimBLEAdvertisedDevice.h>
 #include "wardrive.h"
 #include "nosql_store.h"
+
+// ─────────────────────────────────────────────
+//  CSV LOG BACKEND (v1.3 — via pm_storage HAL)
+//
+//  In addition to NoSQL JSON entries, we maintain a parallel CSV log
+//  file at the root of the SD card so external tools (Wigle uploaders,
+//  awk scripts, spreadsheets) can ingest sessions directly. The CSV
+//  writer used to repeat nosql_store.cpp's dual-backend dance with
+//  WD_FS / WD_FILE / WD_OPEN_WRITE macros. v1.3 collapses both into
+//  pm_storage::File operations — SD_MMC on C28P, SdFat on Maxine, no
+//  visible branching at the call sites.
+// ─────────────────────────────────────────────
+#include "pm_storage.h"
 
 // Anomaly detection hooks (c28p_anomaly.cpp)
 extern void c28p_anomaly_init();
@@ -92,6 +105,107 @@ volatile bool wardrive_raw_log = false;
 static TaskHandle_t s_wd_task = nullptr;
 static volatile bool s_stop_requested = false;
 static SemaphoreHandle_t s_stop_done = nullptr;
+
+// ─────────────────────────────────────────────
+//  CSV LOG STATE
+//
+//  One CSV file opened per scan-task lifetime. Filename rotates
+//  on each launch (wardrive_001.csv, wardrive_002.csv, ...) so a
+//  user pulling the card to a desktop sees discrete sessions
+//  rather than one ever-growing file with mixed timestamps.
+//
+//  Filename rotation: scan upward from 1 to 999 looking for the
+//  first slot that doesn't yet exist on disk. 999 is the cap;
+//  beyond that we reuse 999 and append (no truncation) so logging
+//  never silently stops. In practice nobody hits 999 sessions on
+//  a single SD card before reformatting.
+// ─────────────────────────────────────────────
+static pm_storage::File s_csv_file;
+static bool             s_csv_open = false;
+static char             s_csv_filename[32] = {0};
+
+// Quote an SSID for CSV. Wraps in double quotes and escapes any
+// embedded double-quote by doubling it (RFC 4180). Truncates at
+// 32 chars to bound the line length. Output buffer must hold at
+// least 68 bytes (2 + 32 + 32 + 2 + 1).
+static void csv_quote_ssid(const char* in, char* out, size_t outsz) {
+    size_t w = 0;
+    if (outsz < 4) { if (outsz) out[0] = 0; return; }
+    out[w++] = '"';
+    size_t i = 0;
+    while (in[i] && i < 32 && w < outsz - 3) {
+        char c = in[i++];
+        if (c == '"' && w < outsz - 4) { out[w++] = '"'; out[w++] = '"'; }
+        else if (c < 0x20 || c == ',') out[w++] = ' ';   // sanitize control / delimiter
+        else out[w++] = c;
+    }
+    out[w++] = '"';
+    out[w] = 0;
+}
+
+static void wd_csv_open() {
+    if (s_csv_open) return;
+
+    // Find next available filename
+    int slot = 1;
+    for (; slot <= 999; slot++) {
+        snprintf(s_csv_filename, sizeof(s_csv_filename),
+                 "/wardrive_%03d.csv", slot);
+        if (!pm_storage::exists(s_csv_filename)) break;
+    }
+    if (slot > 999) {
+        snprintf(s_csv_filename, sizeof(s_csv_filename),
+                 "/wardrive_999.csv");
+    }
+
+    s_csv_file = pm_storage::open(s_csv_filename, pm_storage::Mode::Write);
+    if (!s_csv_file) {
+        Serial.printf("[C28P-WD-Engine] CSV open failed: %s\n",
+                      s_csv_filename);
+        s_csv_open = false;
+        return;
+    }
+    // Header row. Columns mirror what mobile wardrive.cpp writes
+    // minus the GPS fields (kiosk has no GPS). Wigle uploaders that
+    // expect lat/lon will see empty columns; that's the convention
+    // for stationary observations across the v1.2.x family.
+    s_csv_file.print("bssid,ssid,rssi,channel,encryption,t_ms,"
+                     "observed_uptime_s\n");
+    s_csv_file.flush();
+    s_csv_open = true;
+    Serial.printf("[C28P-WD-Engine] CSV log opened: %s\n", s_csv_filename);
+}
+
+static void wd_csv_close() {
+    if (!s_csv_open) return;
+    s_csv_file.close();
+    s_csv_open = false;
+    Serial.printf("[C28P-WD-Engine] CSV log closed: %s\n", s_csv_filename);
+}
+
+// Append one observation row. Called from do_wifi_scan() per
+// network seen, alongside the NoSQL JSON write.
+static void wd_csv_write_row(const uint8_t bssid[6], const char* ssid,
+                              int rssi, int channel, int encryption) {
+    if (!s_csv_open) return;
+    char ssid_q[72];
+    csv_quote_ssid(ssid ? ssid : "", ssid_q, sizeof(ssid_q));
+    s_csv_file.printf("%02X:%02X:%02X:%02X:%02X:%02X,%s,%d,%d,%d,%lu,%lu\n",
+                      bssid[0], bssid[1], bssid[2],
+                      bssid[3], bssid[4], bssid[5],
+                      ssid_q, rssi, channel, encryption,
+                      (unsigned long)millis(),
+                      (unsigned long)(millis() / 1000));
+    // Periodic flush so a power-cut doesn't lose the trailing rows.
+    // Every observation flush would slow the scan loop, so we batch
+    // — a 32-row interval keeps worst-case loss tiny on a typical
+    // 5-30 networks/scan setup.
+    static int rows_since_flush = 0;
+    if (++rows_since_flush >= 32) {
+        s_csv_file.flush();
+        rows_since_flush = 0;
+    }
+}
 
 // ─────────────────────────────────────────────
 //  BLE scan helpers
@@ -174,6 +288,11 @@ static int do_wifi_scan() {
         // rather than block the scan loop.
         if (!sd_in_use) {
             nosql_save_entry("wardrive", title, content);
+            // CSV mirror for desktop / Wigle tooling parity. Independent
+            // of the NoSQL write — same data, different format.
+            wd_csv_write_row(bssid_ptr, ssid.c_str(), rssi,
+                             WiFi.channel(i),
+                             (int)WiFi.encryptionType(i));
         }
     }
 
@@ -251,6 +370,10 @@ static void c28p_wardrive_task(void* /*pv*/) {
     nosql_init("ble_log");
     c28p_anomaly_init();
 
+    // Open the CSV log file. One file per task lifetime; rotates on
+    // each launch so external tooling sees clean session boundaries.
+    wd_csv_open();
+
     // Ensure WiFi is in station mode (no AP). Doesn't actually
     // connect — just enables the scanner.
     WiFi.mode(WIFI_STA);
@@ -277,6 +400,10 @@ static void c28p_wardrive_task(void* /*pv*/) {
 
     wardrive_active = false;
     Serial.println("[C28P-WD-Engine] Scan task exiting");
+
+    // Close the CSV log file so the trailing rows are flushed and
+    // the file handle isn't leaked across teardown / restart cycles.
+    wd_csv_close();
 
     if (s_stop_done) xSemaphoreGive(s_stop_done);
     s_wd_task = nullptr;
@@ -333,10 +460,11 @@ void wardrive_ble_resume() {
 }
 
 const char* wardrive_get_log_filename() {
-    // C28P uses NoSQL for wardrive observations, not a single CSV file.
-    // Return empty string so any caller treating this as a path knows
-    // there's no file-based log.
-    return "";
+    // After v1.2.2, the C28P/Maxine engine does write a CSV — return
+    // the current session's filename so callers (Bridge app, file
+    // manager) can display or copy it. Empty string means "no log
+    // currently open" (scan task not running, or open failed).
+    return s_csv_open ? s_csv_filename : "";
 }
 
 // wardrive_task signature is referenced by wardrive.h for the
@@ -350,12 +478,20 @@ void wardrive_task(void* /*pv*/) {
 }
 
 // run_wardrive() is the keyboard-driven UI from the mobile engine.
-// On C28P the UI is c28p_run_wardrive() (touch-driven). Provide a
-// stub so wardrive.h's declaration is satisfied; the real C28P UI
-// is in c28p_wardrive.cpp.
+// On C28P the UI is c28p_run_wardrive() (touch-driven). On Maxine the
+// UI is maxine_run_wardrive() (also touch-driven). Both kiosks dispatch
+// to their own touch UI; the keyboard-driven mobile UI isn't relevant.
+// We provide a device-aware stub so wardrive.h's declaration is
+// satisfied without pulling in c28p_wardrive.cpp on Maxine.
 void run_wardrive() {
+#ifdef DEVICE_C28P
     extern void c28p_run_wardrive();
     c28p_run_wardrive();
+#else
+    // Maxine: the launcher dispatches maxine_run_wardrive() directly.
+    // run_wardrive() should never be called here — stub to satisfy
+    // wardrive.h's declaration.
+#endif
 }
 
-#endif // DEVICE_C28P
+#endif // DEVICE_C28P || DEVICE_MAXINE

@@ -1,0 +1,12 @@
+{
+  "category": "medical",
+  "count": 6,
+  "entries": [
+    { "id": 1, "title": "When to Get Help First", "tags": "priorities,emergency,assessment", "file": "entry_001.json" },
+    { "id": 2, "title": "Severe Bleeding Control", "tags": "bleeding,wound,pressure,tourniquet", "file": "entry_002.json" },
+    { "id": 3, "title": "Shock Awareness", "tags": "shock,circulation,emergency", "file": "entry_003.json" },
+    { "id": 4, "title": "Burns: General First Aid", "tags": "burns,thermal,cooling", "file": "entry_004.json" },
+    { "id": 5, "title": "Hypothermia and Cold Exposure", "tags": "hypothermia,cold,warming,exposure", "file": "entry_005.json" },
+    { "id": 6, "title": "Choking Response Awareness", "tags": "choking,airway,heimlich", "file": "entry_006.json" }
+  ]
+}

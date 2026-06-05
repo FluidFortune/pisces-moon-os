@@ -64,8 +64,20 @@ extern SdFat sd;
 
 // ─────────────────────────────────────────────
 //  SCAN STATE
+//
+//  v1.3: capacity raised from 16 → 20 to better serve dense-RF
+//  field environments (e.g. urban deployments, conventions). The
+//  visible window (GX_DEV_ROWS) stays at 8 — the 320px-tall T-Deck
+//  layout cannot fit more rows without overlapping the status
+//  footer at y=210. The trackball scrolls through all 20.
+//
+//  Each GXDevice is 18+32+1+1 = 52 bytes. 20 × 52 = ~1KB of
+//  DRAM — trivial even on the no-PSRAM Cardputer. If high-RF
+//  environments cause memory pressure (NimBLE stack already
+//  uses ~80KB on Cardputer), drop this to 15. Storage is the
+//  cheap part; NimBLE controller buffers are the constraint.
 // ─────────────────────────────────────────────
-#define MAX_SCAN_RESULTS 16
+#define MAX_SCAN_RESULTS 20
 
 struct GXDevice {
     char    mac[18];

@@ -54,7 +54,7 @@
 //    - NO MAC-randomization detection yet (planned v1.3)
 // ─────────────────────────────────────────────
 
-#ifdef DEVICE_C28P
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -317,4 +317,4 @@ int c28p_anomaly_recent_alerts() {
     return nosql_get_count("wd_anomaly");
 }
 
-#endif // DEVICE_C28P
+#endif // DEVICE_C28P || DEVICE_MAXINE

@@ -82,8 +82,8 @@ void run_about() {
     // Version / codename — centered
     gfx->setTextSize(1);
     gfx->setTextColor(C_WHITE);
-    const char* version  = "Version 1.2.0";
-    const char* codename = "\"Multi-Device\"";
+    const char* version  = "Version 1.2.1";
+    const char* codename = "\"Court Jester\"";
     gfx->setCursor(CX - (int)strlen(version) * 3, infoY);
     gfx->print(version);
     gfx->setCursor(CX - (int)strlen(codename) * 3, infoY + 15);

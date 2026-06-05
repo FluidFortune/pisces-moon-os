@@ -27,6 +27,7 @@
 #include <HTTPClient.h>
 #include "nosql_store.h"
 #include "game_input.h"
+#include "pm_rss_cache.h"
 
 extern Arduino_GFX *gfx;
 
@@ -52,6 +53,7 @@ static String g_feed_name;
 struct DefaultFeed { const char* name; const char* url; };
 
 static const DefaultFeed DEFAULT_FEEDS[] = {
+    { "FLUID FORTUNE", "https://blog.fluidfortune.com/feed" },
     { "BBC WORLD",    "https://feeds.bbci.co.uk/news/world/rss.xml" },
     { "NPR",          "https://feeds.npr.org/1001/rss.xml" },
     { "AP TOP",       "https://rsshub.app/apnews/topics/apf-topnews" },
@@ -61,13 +63,30 @@ static constexpr int DEFAULT_FEEDS_N = sizeof(DEFAULT_FEEDS) / sizeof(DefaultFee
 
 static void seed_defaults_if_empty() {
     nosql_init("rss_feeds");
-    if (nosql_get_count("rss_feeds") > 0) return;
+    // Idempotent seed: ensure each DEFAULT_FEEDS entry is present.
+    // On a brand-new device the category is empty and all defaults
+    // get added in order. On a previously-booted device we walk the
+    // existing entries first, then add only any defaults whose URL
+    // isn't already stored. New defaults get appended to the end of
+    // the list (existing user ordering preserved), which means a
+    // mid-stream addition like FLUID FORTUNE shows up at position 1
+    // for new devices and at the bottom for already-seeded ones —
+    // acceptable until there's a feed-management UI to reorder.
+    int existing = nosql_get_count("rss_feeds");
+    String et, eu;
     for (int i = 0; i < DEFAULT_FEEDS_N; i++) {
+        bool already = false;
+        for (int j = 0; j < existing; j++) {
+            if (!nosql_get_entry("rss_feeds", j, et, eu)) continue;
+            if (eu == DEFAULT_FEEDS[i].url) { already = true; break; }
+        }
+        if (already) continue;
         nosql_save_entry("rss_feeds",
                          DEFAULT_FEEDS[i].name,
                          DEFAULT_FEEDS[i].url);
+        Serial.printf("[RSS] Seeded missing default: %s\n",
+                      DEFAULT_FEEDS[i].name);
     }
-    Serial.println("[RSS] Seeded default feeds");
 }
 
 // ─── RSS parser (shared) ───
@@ -358,14 +377,50 @@ static void portrait_loop() {
         gfx->setTextColor(0xFFE0);
         gfx->setCursor(40, 150);
         gfx->print("Loading...");
-        if (!fetch_feed(url)) {
-            gfx->setTextColor(0xF800);
-            gfx->setCursor(40, 180);
-            gfx->print("Fetch failed");
-            delay(2000);
-            continue;
+
+        bool fetched_ok = fetch_feed(url);
+        bool from_cache = false;
+
+        if (fetched_ok) {
+            // Persist freshest copy to SD so a subsequent offline
+            // visit has something to show.
+            PmRssCachedItem cache_buf[MAX_HEADLINES];
+            for (int i = 0; i < g_item_count; i++) {
+                cache_buf[i].title       = g_items[i].title;
+                cache_buf[i].description = g_items[i].description;
+            }
+            pm_rss_cache_save(name.c_str(), cache_buf, g_item_count);
+        } else {
+            // Fetch failed — fall back to cached headlines if any
+            // exist on SD. This keeps the reader useful offline
+            // (the kiosk's whole point of having an SD card).
+            PmRssCachedItem cache_buf[MAX_HEADLINES];
+            int loaded = pm_rss_cache_load(name.c_str(),
+                                           cache_buf, MAX_HEADLINES);
+            if (loaded > 0) {
+                g_item_count = loaded;
+                for (int i = 0; i < loaded; i++) {
+                    g_items[i].title       = cache_buf[i].title;
+                    g_items[i].description = cache_buf[i].description;
+                }
+                from_cache = true;
+            } else {
+                gfx->setTextColor(0xF800);
+                gfx->setCursor(40, 180);
+                gfx->print("Fetch failed");
+                gfx->setTextColor(0x8410);
+                gfx->setCursor(40, 200);
+                gfx->print("No cached copy");
+                delay(2000);
+                continue;
+            }
         }
-        p_show_headlines(name);
+
+        // Mark cached-mode visually — show the feed name with a
+        // "(cached)" suffix so the user knows the headlines aren't
+        // freshly pulled.
+        String display_name = from_cache ? (name + " (cached)") : name;
+        p_show_headlines(display_name);
     }
 }
 #endif // portrait

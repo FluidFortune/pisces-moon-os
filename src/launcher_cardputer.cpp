@@ -95,6 +95,16 @@ extern void run_pacman();
 extern void run_galaga();
 extern void run_tetris();
 extern void run_pole_position();
+extern void run_mario_bros();
+extern void run_breakout();
+extern void run_2048();
+extern void run_minesweeper();
+extern void run_connect4();
+extern void run_simon();
+extern void run_solitaire();
+extern void run_asteroids();
+extern void run_space_invaders();
+extern void run_frogger();
 extern void run_chess();
 extern void run_retro_pack();
 extern void run_terminal();
@@ -115,6 +125,7 @@ extern void run_micropython();
 extern void run_elf_browser();
 extern void run_gamepad_setup();
 extern void run_bridge();
+extern void run_ereader();
 extern bool readPagerBattery(int &percent, uint16_t &mv);
 
 // Local wrappers (matching the Pager pattern for app entry points
@@ -199,6 +210,7 @@ static const CpAppEntry APPS[] = {
     {"CLOCK",      "o", 2, run_clock},
     {"CALENDAR",   "c", 2, run_calendar},
     {"ETCH",       "/", 2, run_etch},
+    {"E-READER",   "R", 2, run_ereader},
 
     // ─── GAMES (Doom/SimCity excluded on CP) ─
     {"SNAKE",      "s", 3, run_snake},
@@ -206,6 +218,16 @@ static const CpAppEntry APPS[] = {
     {"GALAGA",     "G", 3, run_galaga},
     {"TETRIS",     "t", 3, run_tetris},
     {"POLE",       "P", 3, run_pole_position},
+    {"MARIO",      "M", 3, run_mario_bros},
+    {"BREAKOUT",   "B", 3, run_breakout},
+    {"2048",       "#", 3, run_2048},
+    {"MINES",      "*", 3, run_minesweeper},
+    {"CONNECT 4",  "4", 3, run_connect4},
+    {"SIMON",      "O", 3, run_simon},
+    {"SOLITAIRE",  "S", 3, run_solitaire},
+    {"ASTEROIDS",  "@", 3, run_asteroids},
+    {"INVADERS",   "I", 3, run_space_invaders},
+    {"FROGGER",    "F", 3, run_frogger},
     {"CHESS",      "K", 3, run_chess},
     {"RETRO",      "R", 3, run_retro_pack},
 

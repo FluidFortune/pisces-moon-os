@@ -32,10 +32,10 @@
  *
  * GPIO0 NOTE: GPIO0 (trackball click) is shared with the ES7210
  * microphone hardware. While the I2S mic is active, trackball click
- * is unavailable. Use SPACE key or the on-screen button instead.
+ * is unavailable. Use R to start/stop recording instead.
  *
  * Controls:
- *   SPACE / on-screen button = start / stop recording
+ *   R                        = start / stop recording
  *   Trackball UP/DOWN        = scroll recordings list
  *   Q / header tap           = exit (stops recording first)
  */
@@ -64,11 +64,51 @@ extern SdFat sd;
 
 // ─────────────────────────────────────────────
 //  HARDWARE
-// ─────────────────────────────────────────────
-#define ES7210_MCLK     48
-#define ES7210_LRCK     21
-#define ES7210_SCK      47
-#define ES7210_DIN      14
+//
+//  T-Deck Plus uses TWO separate I2S buses:
+//    I2S_NUM_0 → output (MAX98357A amp → speaker)   [audio_player.cpp]
+//    I2S_NUM_1 → input  (ES7210 4-mic array codec)   [this file]
+//
+//  The ES7210_* macros below are aliases over the standardized
+//  PIN_I2S_IN_* build flags so this file's diagnostic prints and
+//  comments stay readable. Pin values themselves live in
+//  platformio.ini — see v1.3 PIN_I2S_* standardization.
+// ──────────────────────────────────────────
+#ifdef DEVICE_TDECK_PLUS
+// T-Deck Plus has dedicated ES7210 4-mic codec on its IN_ bus.
+#define ES7210_MCLK     PIN_I2S_IN_MCLK
+#define ES7210_LRCK     PIN_I2S_IN_LRCK
+#define ES7210_SCK      PIN_I2S_IN_SCLK
+#define ES7210_DIN      PIN_I2S_IN_DIN
+#else
+// Single-bus devices (Pager, Cardputer) share one I2S bus. The codec
+// on those boards is NOT an ES7210, but the I2S RX setup is identical
+// — only the pins differ. We keep the ES7210_* macro spelling here
+// so the diagnostic prints further down the file still read naturally.
+//
+// Defensive fallback: not every device defines every pin. Cardputer ADV,
+// for example, has no PIN_I2S_MCLK — its ES8311 codec self-clocks or
+// uses an undocumented internal route. -1 (I2S_PIN_NO_CHANGE) tells the
+// IDF driver "don't configure this line" and the i2s_set_pin call still
+// succeeds. Devices that need a real MCLK pin override these by
+// defining the macro in platformio.ini build_flags.
+#ifndef PIN_I2S_MCLK
+#define PIN_I2S_MCLK (-1)
+#endif
+#ifndef PIN_I2S_SCLK
+#define PIN_I2S_SCLK (-1)
+#endif
+#ifndef PIN_I2S_LRCK
+#define PIN_I2S_LRCK (-1)
+#endif
+#ifndef PIN_I2S_DIN
+#define PIN_I2S_DIN (-1)
+#endif
+#define ES7210_MCLK     PIN_I2S_MCLK
+#define ES7210_LRCK     PIN_I2S_LRCK
+#define ES7210_SCK      PIN_I2S_SCLK
+#define ES7210_DIN      PIN_I2S_DIN
+#endif
 
 #define SAMPLE_RATE     16000
 #define SAMPLE_BITS     16
@@ -423,13 +463,13 @@ static void drawRecordButton() {
         gfx->drawRect(10, by, 300, 30, COL_REC);
         gfx->fillRect(130, by+9, 12, 12, COL_REC);
         gfx->setTextColor(COL_REC); gfx->setTextSize(1);
-        gfx->setCursor(148, by+11); gfx->print("STOP  [SPACE]");
+        gfx->setCursor(148, by+11); gfx->print("STOP  [R]");
     } else {
         gfx->fillRect(10, by, 300, 30, 0x1800);
         gfx->drawRect(10, by, 300, 30, COL_READY);
         gfx->fillCircle(135, by+15, 8, COL_REC);
         gfx->setTextColor(COL_READY); gfx->setTextSize(1);
-        gfx->setCursor(148, by+11); gfx->print("RECORD  [SPACE]");
+        gfx->setCursor(148, by+11); gfx->print("RECORD  [R]");
     }
 }
 
@@ -440,7 +480,7 @@ static void drawRecordingsList() {
     gfx->setTextSize(1); gfx->setTextColor(COL_DIM);
     gfx->setCursor(8, listY+2);
     if (recCount == 0) {
-        gfx->print("No recordings yet. Press SPACE to record.");
+        gfx->print("No recordings yet. Press R to record.");
         return;
     }
     gfx->printf("Recordings (%d)  |  DEL=delete", recCount);
@@ -589,16 +629,9 @@ static void run_audio_recorder_inner() {
             continue;
         }
 
-        // Record button tap
-        if (get_touch(&tx, &ty) && ty >= 44 && ty <= 74) {
-            while(get_touch(&tx,&ty)){delay(10);}
-            if (recording) { stopRecording(); drawFull(); }
-            else if (startRecording()) { drawFull(); }
-            continue;
-        }
-
-        // Space = toggle record
-        if (k == ' ') {
+        // R = toggle record on keyboard devices. C28P has its own
+        // touch-first media recorder and does not use this app path.
+        if (k == 'r' || k == 'R') {
             if (recording) { stopRecording(); drawFull(); }
             else if (startRecording()) { drawFull(); }
             continue;

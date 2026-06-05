@@ -1,0 +1,12 @@
+{
+  "category": "survival",
+  "count": 6,
+  "entries": [
+    { "id": 1, "title": "Rule of Threes", "tags": "priorities,basics,triage", "file": "entry_001.json" },
+    { "id": 2, "title": "Water: Finding and Disinfecting", "tags": "water,purification,boiling,hydration", "file": "entry_002.json" },
+    { "id": 3, "title": "Building a Fire", "tags": "fire,warmth,tinder,ignition", "file": "entry_003.json" },
+    { "id": 4, "title": "Emergency Shelter", "tags": "shelter,warmth,exposure,hypothermia", "file": "entry_004.json" },
+    { "id": 5, "title": "Signaling for Rescue", "tags": "signal,rescue,visibility,sos", "file": "entry_005.json" },
+    { "id": 6, "title": "Navigation Without a Compass", "tags": "navigation,direction,sun,stars", "file": "entry_006.json" }
+  ]
+}

@@ -33,13 +33,37 @@ extern Arduino_GFX *gfx;
 extern bool c28p_touch_read(int16_t *x, int16_t *y);
 extern void c28p_run_about();
 
-// Backlight PWM stub. The real implementation lives in the C28P HAL
-// once we know the actual backlight GPIO pin. Until then, this is a
-// no-op — the slider in settings saves the chosen level to NoSQL so
-// it persists across reboots, but the hardware doesn't yet respond.
-// TODO(v1.2.2): wire to actual LEDC channel once pin is identified.
-static void c28p_set_backlight(uint8_t level) {
-    (void)level;
+// Backlight PWM driver. main.cpp drives PIN_LCD_BL high at boot to
+// turn the screen on; we re-attach the pin to LEDC the first time
+// the user touches the brightness pips, then call ledcWrite on every
+// subsequent change. Five levels (1=lowest..5=brightest) map to
+// 51..255 duty cycle on an 8-bit PWM at 5 kHz.
+//
+// Floor of 16 is enforced so a level-1 setting never goes fully
+// dark — the only way to turn the C28P's screen off is the SLEEP
+// button (not yet wired in v1.2.1), not the BACKLIGHT slider.
+static void c28p_set_backlight(uint8_t pwm) {
+    static bool ledc_attached = false;
+    if (pwm < 16) pwm = 16;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+    if (!ledc_attached) {
+        // ESP32 Arduino 3.x: ledcAttach(pin, freq, resolution).
+        // 5 kHz keeps the PWM above audible range; 8-bit resolution
+        // gives us 256 duty levels, far more than the UI exposes.
+        ledcAttach(PIN_LCD_BL, 5000, 8);
+        ledc_attached = true;
+    }
+    ledcWrite(PIN_LCD_BL, pwm);
+#else
+    // ESP32 Arduino 2.x: explicit channel allocation. Channel 0 is
+    // safe because no other driver in the C28P build uses LEDC.
+    if (!ledc_attached) {
+        ledcSetup(0, 5000, 8);
+        ledcAttachPin(PIN_LCD_BL, 0);
+        ledc_attached = true;
+    }
+    ledcWrite(0, pwm);
+#endif
 }
 
 // ─── Setting helpers ───
@@ -47,7 +71,7 @@ static String settings_get(const String& key, const String& dflt) {
     nosql_init("settings");
     int total = nosql_get_count("settings");
     String t, c;
-    for (int i = 0; i < total; i++) {
+    for (int i = total - 1; i >= 0; i--) {
         if (!nosql_get_entry("settings", i, t, c)) continue;
         if (t == key) return c;
     }
@@ -248,27 +272,76 @@ static bool factory_reset_confirm() {
 }
 
 static void factory_reset_execute() {
-    // TODO(v1.2.2): wire up actual NoSQL category wipe once
-    // nosql_clear_category() is added to nosql_store. For v1.2.1
-    // this is a no-op stub — the confirmation flow works end-to-end
-    // but no data is actually erased. This is intentional rather
-    // than fragile: better to honestly say "not yet implemented"
-    // than risk wiping the wrong category.
+    // Wipe every NoSQL category the C28P touches. The category list
+    // is hard-coded rather than auto-discovered because directory
+    // walking /data/ would be more code than just naming the four
+    // categories we know about. If a future C28P app adds a new
+    // category, it must be added here too — same pattern as the
+    // SYSTEM app's storage stats screen.
+    //
+    // Notably NOT wiped:
+    //    /recordings    user voice memos (c28p_media)
+    //    /audio         user-supplied music
+    //    *.txt high-score files for games (mario_bros, tetris, etc)
+    //    *.bm bookmarks (e-Reader)
+    // These are user content the kiosk has no business erasing on
+    // a settings-screen tap. Anyone wanting a true card-wipe should
+    // reformat the card on a desktop.
+    static const char* const wipe_categories[] = {
+        "wardrive",
+        "ble_log",
+        "settings",
+        "anomaly_baseline",   // c28p_anomaly's known-AP baseline
+    };
+    static const int n_categories =
+        sizeof(wipe_categories) / sizeof(wipe_categories[0]);
+
     sys_draw_chrome();
     gfx->setTextSize(2);
     gfx->setTextColor(0xFFE0);
-    gfx->setCursor(40, 130);
-    gfx->print("Not yet");
-    gfx->setCursor(36, 160);
-    gfx->print("implemented");
+    gfx->setCursor(40, 80);
+    gfx->print("WIPING...");
     gfx->setTextSize(1);
     gfx->setTextColor(0x8410);
-    gfx->setCursor(20, 200);
-    gfx->print("Factory reset wiring lands");
-    gfx->setCursor(20, 214);
-    gfx->print("in v1.2.2 once nosql exposes");
-    gfx->setCursor(20, 228);
-    gfx->print("a per-category wipe API.");
+
+    int wiped = 0;
+    for (int i = 0; i < n_categories; i++) {
+        gfx->fillRect(0, 120, 240, 80, 0x0000);
+        gfx->setCursor(20, 130 + (i * 14));
+        gfx->printf("  %s", wipe_categories[i]);
+        if (nosql_clear_category(wipe_categories[i])) {
+            wiped++;
+            gfx->setTextColor(0x07E0);
+            gfx->setCursor(180, 130 + (i * 14));
+            gfx->print("OK");
+            gfx->setTextColor(0x8410);
+        } else {
+            gfx->setTextColor(0xF800);
+            gfx->setCursor(180, 130 + (i * 14));
+            gfx->print("FAIL");
+            gfx->setTextColor(0x8410);
+        }
+        delay(120);
+    }
+
+    // The settings we just nuked include the backlight + sound
+    // preferences. Reset the in-memory copies to their defaults so
+    // the settings panel doesn't redraw with stale values from
+    // before the wipe — those entries no longer exist on disk.
+    g_backlight_level = 3;
+    g_sound_on = true;
+    apply_backlight();
+
+    gfx->setTextSize(2);
+    gfx->setTextColor(0x07E0);
+    gfx->setCursor(40, 240);
+    gfx->printf("Wiped %d/%d", wiped, n_categories);
+    gfx->setTextSize(1);
+    gfx->setTextColor(0x8410);
+    gfx->setCursor(20, 270);
+    gfx->print("User content (recordings,");
+    gfx->setCursor(20, 282);
+    gfx->print("audio, game saves) preserved.");
     delay(2500);
 }
 

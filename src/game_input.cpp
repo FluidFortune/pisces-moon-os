@@ -9,6 +9,9 @@
 #ifdef DEVICE_C28P
 #include "c28p_dpad.h"
 #endif
+#ifdef DEVICE_MAXINE
+#include "maxine_dpad.h"
+#endif
 
 static bool keyIs(char key, char lower) {
     return key == lower || key == (char)(lower - 'a' + 'A');
@@ -31,7 +34,57 @@ bool pm_is_nes_quit_key(char key) {
 PMNesInput pm_read_nes_input(bool includeTrackball) {
     PMNesInput input = {};
 
+#if !defined(DEVICE_MAXINE)
     input.key = get_keypress();
+
+    // ────────────────────────────────────────────────────────
+    //  CARDPUTER ARROW-PUNCTUATION TRANSLATION
+    //
+    //  DO NOT REMOVE THIS BLOCK. IT IS NOT REDUNDANT WITH THE
+    //  Fn-LAYER HANDLING IN keyboard.cpp.
+    //
+    //  Background: the Cardputer's keycaps for `; , . /` are
+    //  PRINTED WITH ARROW ICONS. The hardware emits the punctuation
+    //  character when you press them unshifted, and emits arrow
+    //  PM_KEY codes only when Fn is held (matches the keycap
+    //  printing — Fn shows the secondary symbols).
+    //
+    //  Two pieces of code have to know about that:
+    //    1. launcher_cardputer.cpp (launcherKeyTranslate)
+    //    2. THIS FUNCTION
+    //
+    //  Without (2), the games receive raw `, . ; /` characters that
+    //  match no input mapping and feel broken. Users expect the
+    //  keycap-printed arrows to JUST WORK in games the same way
+    //  they JUST WORK in the launcher. Holding Fn while playing a
+    //  game is unergonomic and not what's printed on the keys.
+    //
+    //  This translation has been added and removed from the codebase
+    //  multiple times because it LOOKS like a duplicate of the Fn
+    //  layer logic. It is not. The Fn layer handles `Fn + ,`. This
+    //  handles plain `,`. Both are necessary because the keys are
+    //  PHYSICALLY THE SAME PHYSICAL KEYS but with different intent
+    //  (typing vs. navigating). Apps that need to TYPE punctuation
+    //  (notepad, calculator, terminal) call get_keypress() directly
+    //  and see the raw character. Games go through this function
+    //  and see the arrow.
+    //
+    //  If you find yourself thinking "this is redundant" or "this
+    //  belongs in keyboard.cpp" — stop. It does not. keyboard.cpp
+    //  cannot tell whether the caller is a game or a typing app.
+    //  game_input.cpp is the right place because by definition it's
+    //  only called from games.
+    // ────────────────────────────────────────────────────────
+#ifdef DEVICE_CARDPUTER_ADV
+    switch (input.key) {
+        case ',': input.key = PM_KEY_LEFT;  break;
+        case '/': input.key = PM_KEY_RIGHT; break;
+        case ';': input.key = PM_KEY_UP;    break;
+        case '.': input.key = PM_KEY_DOWN;  break;
+        default: break;
+    }
+#endif
+
     input.trackball = includeTrackball ? update_trackball_game() : TrackballState{0, 0, false};
 
     input.home = gamepad_poll();
@@ -56,6 +109,7 @@ PMNesInput pm_read_nes_input(bool includeTrackball) {
         input.down  = input.down  || (input.trackball.y == 1);
         input.a     = input.a     || input.trackball.clicked;
     }
+#endif // !DEVICE_MAXINE
 
 #ifdef DEVICE_C28P
     // C28P: OR in virtual D-pad touch state. The dpad layer writes
@@ -63,6 +117,10 @@ PMNesInput pm_read_nes_input(bool includeTrackball) {
     // Calling poll() also handles selective redraw of the on-screen
     // controller chrome when buttons change state.
     c28p_dpad_poll(&input);
+#endif
+#ifdef DEVICE_MAXINE
+    // Maxine: same virtual D-pad model as the C28P, scaled to 480x800.
+    maxine_dpad_poll(&input);
 #endif
 
     return input;

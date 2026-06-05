@@ -14,13 +14,12 @@
 //       redrawn, to keep the audio + game loop responsive.
 //
 //  Touch is polled via the FT6336G driver in c28p_boot.cpp.
-//  The FT6336G reports single-touch coordinates only in this
-//  driver — multi-touch (e.g. holding right + A simultaneously)
-//  is supported by the hardware but not yet by the driver. For
-//  Tetris this is acceptable — you don't need to hold a direction
-//  while pressing rotate. For Galaga (fire while moving) this
-//  will need multi-touch support, which is a small extension of
-//  the existing FT6336G driver.
+//  c28p_dpad_poll() reads BOTH touch points the FT6336G reports
+//  (via c28p_touch_read_multi), so holding a direction while
+//  pressing A/B registers as both buttons at once — required for
+//  Mario (jump while running) and Galaga (fire while moving). The
+//  single-touch c28p_touch_read() is still used by menu screens
+//  where only one press matters at a time.
 // ─────────────────────────────────────────────
 
 #ifdef DEVICE_C28P
@@ -34,10 +33,11 @@ extern Arduino_GFX *gfx;
 
 // ─────────────────────────────────────────────
 //  Touch driver — declared in c28p_boot.cpp.
-//  Single-touch polling; returns true if a finger is on screen
-//  and writes coords (0..239, 0..319) to *x, *y.
+//  c28p_touch_read():       single point (menus).
+//  c28p_touch_read_multi(): up to two points (gameplay D-pad).
 // ─────────────────────────────────────────────
 extern bool c28p_touch_read(int16_t* x, int16_t* y);
+extern int  c28p_touch_read_multi(int16_t* xs, int16_t* ys);
 
 // ─────────────────────────────────────────────
 //  Layout — derived from C28P_GAME_VIEW_*/C28P_DPAD_AREA_* in
@@ -57,6 +57,13 @@ static ButtonRect rect_right = {  84, 246, 30, 36 };
 static ButtonRect rect_a     = { 145, 220, 64, 40 };
 static ButtonRect rect_b     = { 145, 268, 64, 40 };
 
+// SELECT / song-cycle button — small note glyph in the gap between
+// the D-pad and the A/B buttons. Maps to PMNesInput.select, which
+// Tetris uses to cycle through its three songs. The C28P is touch-
+// only (no keyboard), so without this button input.select could
+// never be set and song selection was unreachable on this device.
+static ButtonRect rect_select = { 116, 248, 26, 34 };
+
 // ─────────────────────────────────────────────
 //  Colors — chosen to match the launcher tile aesthetic:
 //  dimmed when idle, fully saturated when pressed.
@@ -70,6 +77,8 @@ static ButtonRect rect_b     = { 145, 268, 64, 40 };
 #define BTN_A_PRESSED       0xFFFF    // white
 #define BTN_B_IDLE          0x07E0    // green
 #define BTN_B_PRESSED       0xFFFF    // white
+#define BTN_SEL_IDLE        0xFD20    // amber (song note, idle)
+#define BTN_SEL_PRESSED     0xFFFF    // white (song note, pressed)
 #define DPAD_DIVIDER        0x2104    // very dark gray divider line
 #define DPAD_LABEL          0xC618    // light gray text
 
@@ -77,7 +86,7 @@ static ButtonRect rect_b     = { 145, 268, 64, 40 };
 //  Pressed-state tracking — drives selective redraw.
 // ─────────────────────────────────────────────
 static bool was_up = false, was_down = false, was_left = false, was_right = false;
-static bool was_a  = false, was_b    = false;
+static bool was_a  = false, was_b    = false, was_select = false;
 static bool rendered_once = false;
 
 // ─────────────────────────────────────────────
@@ -135,6 +144,23 @@ static void draw_action_button(const ButtonRect& r, const char* label,
     gfx->print(label);
 }
 
+// Tiny eighth-note glyph for the SELECT/song button: filled note
+// head + stem + flag. Drawn centered on (cx, cy).
+static void draw_note_glyph(int16_t cx, int16_t cy, uint16_t color) {
+    gfx->fillCircle(cx - 3, cy + 6, 4, color);            // note head
+    gfx->fillRect(cx + 1, cy - 8, 2, 15, color);          // stem
+    gfx->fillTriangle(cx + 3, cy - 8, cx + 3, cy - 1,
+                      cx + 8, cy - 5, color);             // flag
+}
+
+static void draw_select_button(const ButtonRect& r, bool pressed) {
+    uint16_t bg   = pressed ? BTN_SEL_PRESSED : DPAD_BG_IDLE;
+    uint16_t note = pressed ? 0x0000 : BTN_SEL_IDLE;
+    gfx->fillRoundRect(r.x, r.y, r.w, r.h, 6, bg);
+    gfx->drawRoundRect(r.x, r.y, r.w, r.h, 6, DPAD_OUTLINE);
+    draw_note_glyph(r.x + r.w / 2, r.y + r.h / 2, note);
+}
+
 // ─────────────────────────────────────────────
 //  Render — initial draw of all chrome.
 // ─────────────────────────────────────────────
@@ -157,10 +183,13 @@ void c28p_dpad_render() {
     draw_action_button(rect_a, "A", false, BTN_A_IDLE);
     draw_action_button(rect_b, "B", false, BTN_B_IDLE);
 
+    // SELECT / song-cycle button (note glyph)
+    draw_select_button(rect_select, false);
+
     // Reset state tracking so the first poll() correctly detects
     // initial idle state for every button.
     was_up = was_down = was_left = was_right = false;
-    was_a = was_b = false;
+    was_a = was_b = was_select = false;
     rendered_once = true;
 }
 
@@ -184,25 +213,29 @@ bool c28p_dpad_touched() {
 bool c28p_dpad_poll(PMNesInput* input) {
     if (!rendered_once) c28p_dpad_render();
 
-    int16_t tx, ty;
-    bool touched = c28p_touch_read(&tx, &ty);
+    int16_t txs[2], tys[2];
+    int n = c28p_touch_read_multi(txs, tys);
 
     bool now_up    = false, now_down  = false;
     bool now_left  = false, now_right = false;
     bool now_a     = false, now_b     = false;
+    bool now_select = false;
 
-    if (touched) {
-        // Only test buttons in the control area — touches in the
-        // game viewport are ignored by the D-pad (games can do
-        // their own viewport-level touch handling if desired).
-        if (ty >= C28P_DPAD_AREA_Y) {
-            if (in_rect(tx, ty, rect_up))    now_up    = true;
-            if (in_rect(tx, ty, rect_down))  now_down  = true;
-            if (in_rect(tx, ty, rect_left))  now_left  = true;
-            if (in_rect(tx, ty, rect_right)) now_right = true;
-            if (in_rect(tx, ty, rect_a))     now_a     = true;
-            if (in_rect(tx, ty, rect_b))     now_b     = true;
-        }
+    // Hit-test EVERY active touch point and OR the results. This is
+    // what lets a direction press and an A/B press register in the
+    // same frame (two fingers) — the fix for Mario jump-while-running
+    // and Galaga fire-while-moving. Touches in the game viewport
+    // (above the control strip) are ignored by the D-pad.
+    for (int i = 0; i < n; i++) {
+        int16_t tx = txs[i], ty = tys[i];
+        if (ty < C28P_DPAD_AREA_Y) continue;
+        if (in_rect(tx, ty, rect_up))     now_up     = true;
+        if (in_rect(tx, ty, rect_down))   now_down   = true;
+        if (in_rect(tx, ty, rect_left))   now_left   = true;
+        if (in_rect(tx, ty, rect_right))  now_right  = true;
+        if (in_rect(tx, ty, rect_a))      now_a      = true;
+        if (in_rect(tx, ty, rect_b))      now_b      = true;
+        if (in_rect(tx, ty, rect_select)) now_select = true;
     }
 
     // OR the touch state into the input. This lets callers
@@ -214,6 +247,7 @@ bool c28p_dpad_poll(PMNesInput* input) {
     input->right = input->right || now_right;
     input->a     = input->a     || now_a;
     input->b     = input->b     || now_b;
+    input->select = input->select || now_select;
 
     // Selective redraw — only buttons whose state changed.
     if (now_up    != was_up)    draw_dpad_button(rect_up,    now_up,    draw_arrow_up);
@@ -222,12 +256,14 @@ bool c28p_dpad_poll(PMNesInput* input) {
     if (now_right != was_right) draw_dpad_button(rect_right, now_right, draw_arrow_right);
     if (now_a     != was_a)     draw_action_button(rect_a,   "A", now_a, BTN_A_IDLE);
     if (now_b     != was_b)     draw_action_button(rect_b,   "B", now_b, BTN_B_IDLE);
+    if (now_select != was_select) draw_select_button(rect_select, now_select);
 
     was_up    = now_up;    was_down  = now_down;
     was_left  = now_left;  was_right = now_right;
     was_a     = now_a;     was_b     = now_b;
+    was_select = now_select;
 
-    return now_up || now_down || now_left || now_right || now_a || now_b;
+    return now_up || now_down || now_left || now_right || now_a || now_b || now_select;
 }
 
 #endif // DEVICE_C28P

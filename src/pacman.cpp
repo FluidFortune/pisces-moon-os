@@ -27,10 +27,14 @@
 #include <freertos/semphr.h>
 #include "trackball.h"
 #include "game_input.h"
+#include "game_audio.h"
 #include "theme.h"
 #include "pacman.h"
 #ifdef DEVICE_C28P
 #include "c28p_dpad.h"
+#endif
+#ifdef DEVICE_MAXINE
+#include "maxine_dpad.h"
 #endif
 
 #ifdef DEVICE_TLORAPAGER
@@ -65,6 +69,19 @@ extern SemaphoreHandle_t spi_mutex;
 #define TS          6
 #define HUD_H       10
 #define MAZE_TOP    4
+#elif defined(DEVICE_MAXINE)
+// Maxine 480×800 portrait. Top 520px game area above the dpad chrome.
+// TS=14 → 28×14 = 392 wide (centered in 480 → 44px margins) and
+// 31×14 = 434 tall + HUD(22) + MAZE_TOP(20) = 476. Comfortable fit
+// in the 520px viewport with breathing room at the bottom for the
+// dpad chrome. A bigger maze + chunkier tiles read clearly on the
+// larger display without overscaling tiny sprites. HUD_H=22 leaves
+// room for size-2 text (16px tall) plus 3px padding top/bottom.
+#define SCREEN_W    480
+#define SCREEN_H    520
+#define TS          14
+#define HUD_H       22
+#define MAZE_TOP    24
 #else
 #define SCREEN_W    320
 #define SCREEN_H    240
@@ -204,7 +221,9 @@ static int viewX() {
 }
 
 static int viewY() {
-#ifdef DEVICE_C28P
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+    // Top-anchor on touch kiosks so the bottom rows stay reserved for
+    // the virtual D-pad chrome.
     return 0;
 #else
     int h = gfx->height();
@@ -481,6 +500,21 @@ static void drawHUD() {
     gfx->printf("H:%d", highScore);
     gfx->setCursor(vx + 112, vy);
     gfx->printf("L:%d", lives);
+#elif defined(DEVICE_MAXINE)
+    // Maxine: 480px wide HUD at vy=0, HUD_H=22. Spread out the fields
+    // across the wider screen and bump text to size 2 for legibility
+    // on the larger panel.
+    gfx->setTextSize(2);
+    gfx->setCursor(vx + 8, vy + 4);
+    gfx->printf("SC %d", score);
+    gfx->setCursor(vx + 180, vy + 4);
+    gfx->printf("HI %d", highScore);
+    gfx->setCursor(vx + 340, vy + 4);
+    gfx->printf("LV %d", stage);
+    // Lives as pac dots on the far right
+    for (int i = 0; i < lives && i < 5; i++) {
+        gfx->fillCircle(vx + SCREEN_W - 20 - i * 18, vy + 11, 6, COL_PACMAN);
+    }
 #else
     gfx->setCursor(vx + 6, vy + 2);
     gfx->printf("SC:%d", score);
@@ -850,11 +884,13 @@ static void movePac() {
         tile = T_EMPTY;
         score += 10;
         dotsRemaining--;
+        pm_game_audio_fx_dot();
         drawTile(pac.tx, pac.ty);
     } else if (tile == T_ENERGIZER) {
         tile = T_EMPTY;
         score += 50;
         dotsRemaining--;
+        pm_game_audio_fx_eat();
         drawTile(pac.tx, pac.ty);
         // Frighten all active ghosts
         int fTicks = FRIGHTENED_TICKS[min(stage - 1, 18)];
@@ -946,6 +982,17 @@ void run_pacman() {
     // Paint D-pad chrome below the game viewport
     c28p_dpad_render();
 #endif
+#ifdef DEVICE_MAXINE
+    // Paint Maxine's virtual D-pad below the game viewport (y >= 520).
+    // The maze + HUD live in the top 472px of a 520-tall window, so the
+    // dpad chrome at y>=520 is never overwritten by gameplay drawing.
+    maxine_dpad_render();
+#endif
+
+    // Bring up the audio HAL for arcade SFX (waka, power-pellet, ghost
+    // eat, death, stage-clear). Pac-Man arcade had no continuous music
+    // — it's SFX-driven, same as Mario Bros.
+    pm_game_audio_begin();
 
     while (lives > 0) {
         // Stage setup
@@ -954,6 +1001,11 @@ void run_pacman() {
 #ifdef DEVICE_C28P
         // C28P: only clear the top 200px game area, preserve D-pad chrome
         gfx->fillRect(0, 0, 240, 200, COL_BLACK);
+#elif defined(DEVICE_MAXINE)
+        // Maxine: clear only the top 520px game area. Bottom strip
+        // (y >= 520) holds the dpad chrome which must persist across
+        // stage transitions / death-respawn cycles.
+        gfx->fillRect(0, 0, 480, 520, COL_BLACK);
 #else
         gfx->fillScreen(COL_BLACK);
 #endif
@@ -1026,6 +1078,7 @@ void run_pacman() {
                         ghostEatMultiplier *= 2;
                         score += pts;
                         ghosts[g].state = GS_EATEN;
+                        pm_game_audio_fx_kick();
                         // Flash score
                         gfx->setCursor(tileX(ghosts[g].e.tx), tileY(ghosts[g].e.ty));
                         gfx->setTextColor(COL_SCORE);
@@ -1035,6 +1088,7 @@ void run_pacman() {
                     } else {
                         // Pac dies
                         died = true;
+                        pm_game_audio_fx_die();
                         deathAnimation();
                         lives--;
                         break;
@@ -1049,6 +1103,7 @@ void run_pacman() {
 
             // Check stage complete
             if (dotsRemaining <= 0) {
+                pm_game_audio_fx_phase();
                 stageCompleteFlash();
                 stage++;
                 // Speed up pac and ghosts per stage
@@ -1066,5 +1121,6 @@ void run_pacman() {
         highScore = score;
         saveHS(highScore);
     }
+    pm_game_audio_stop();
     showGameOver();
 }

@@ -784,13 +784,12 @@ static void IRAM_ATTR lora_bridge_rx_isr() {
     s_lora_rx_flag = true;
 }
 
-static bool lora_bridge_begin() {
-#if defined(PIN_LORA_CS) && defined(PIN_LORA_IRQ)
-    if (s_lora_ready) return true;
-    if (s_lora_init_attempted && s_lora_last_state != 0) return false;
-    s_lora_init_attempted = true;
+static bool lora_bridge_prepare_shared_spi() {
+    if (!spi_mutex || xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        Serial.println("[P4-BRIDGE] LoRa bridge init: SPI bus prep mutex timeout");
+        return false;
+    }
 
-    pi4ioe_cap_init();
     pinMode(PM_LORA_CS, OUTPUT);
     digitalWrite(PM_LORA_CS, HIGH);
 #ifdef PIN_SD_CS
@@ -800,6 +799,22 @@ static bool lora_bridge_begin() {
 #else
     cardputerSdSPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
 #endif
+
+    xSemaphoreGiveRecursive(spi_mutex);
+    return true;
+}
+
+static bool lora_bridge_begin() {
+#if defined(PIN_LORA_CS) && defined(PIN_LORA_IRQ)
+    if (s_lora_ready) return true;
+    if (s_lora_init_attempted && s_lora_last_state != 0) return false;
+    s_lora_init_attempted = true;
+
+    pi4ioe_cap_init();
+    if (!lora_bridge_prepare_shared_spi()) {
+        s_lora_last_state = -1003;
+        return false;
+    }
 
     s_lora_module = new Module(PM_LORA_CS, PM_LORA_IRQ, PM_LORA_RST, PM_LORA_BUSY,
                                cardputerSdSPI, s_lora_spi_settings);

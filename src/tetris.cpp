@@ -15,6 +15,9 @@
 #ifdef DEVICE_C28P
 #include "c28p_dpad.h"
 #endif
+#ifdef DEVICE_MAXINE
+#include "maxine_dpad.h"
+#endif
 
 #ifdef DEVICE_TLORAPAGER
 extern PMDispTLoRaPager *gfx;
@@ -46,6 +49,17 @@ static constexpr int VIEW_H = 200;
 static constexpr int CELL = 8;
 static constexpr int BOARD_X = 16;    // 16px left margin
 static constexpr int BOARD_Y = 22;    // 22px top margin — clears exit bar + breathing room
+#elif defined(DEVICE_MAXINE)
+// Maxine portrait (480x800) — game lives in the top 520px above the
+// virtual D-pad (MAXINE_GAME_VIEW_H). Same software model as the
+// C28P, scaled up. Playfield 240x480 (BW=10, BH=20, CELL=24), with
+// the side panel (NEXT + score/level/lines) to the right. The D-pad
+// layer owns y >= 520.
+static constexpr int VIEW_W = 480;
+static constexpr int VIEW_H = 520;
+static constexpr int CELL = 24;
+static constexpr int BOARD_X = 36;    // left margin
+static constexpr int BOARD_Y = 28;    // top margin
 #else
 static constexpr int VIEW_W = 320;
 static constexpr int VIEW_H = 240;
@@ -84,13 +98,12 @@ static int vx() {
 }
 
 static int vy() {
-#ifdef DEVICE_C28P
-    // C28P has a virtual D-pad in the bottom 120px. The game viewport
-    // MUST start at the top of the screen (y=0) rather than being
-    // vertically centered — otherwise the centered viewport overlaps
-    // the D-pad chrome at y=200-320, hiding the up/down arrows and
-    // action buttons. The C28P VIEW_H = 200 exactly matches the
-    // top region of the screen.
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+    // Touch kiosk (C28P / Maxine): a virtual D-pad occupies the bottom
+    // of the screen. The game viewport MUST start at the top (y=0)
+    // rather than being vertically centered — otherwise the centered
+    // viewport overlaps the D-pad chrome and hides its controls.
+    // VIEW_H is set to exactly the top game region for these boards.
     return 0;
 #else
     int h = gfx->height();
@@ -104,6 +117,10 @@ static void clearPhysicalScreen() {
     // holds the virtual D-pad chrome which must persist across game
     // events like game-over and launch-scene transitions.
     gfx->fillRect(0, 0, gfx->width(), 200, C_BLACK);
+#elif defined(DEVICE_MAXINE)
+    // Maxine: same idea, clear only the top game viewport so the
+    // virtual D-pad chrome below (y >= VIEW_H) survives.
+    gfx->fillRect(0, 0, gfx->width(), VIEW_H, C_BLACK);
 #else
     gfx->fillRect(0, 0, gfx->width(), gfx->height(), C_BLACK);
 #endif
@@ -142,13 +159,13 @@ static void drawBlock(int bx, int by, uint16_t color) {
     }
 }
 
-#ifdef DEVICE_C28P
-// C28P-only: paint an empty cell as black with no outline.
-// Used by the no-flicker redraw path — every cell in the board
-// gets painted every frame (occupied or not), so we never need
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+// Touch-kiosk no-flicker support: paint an empty cell as black with no
+// outline. Used by the no-flicker redraw path — every cell of the
+// board gets painted every frame (occupied or not), so we never need
 // to clear the playfield to black first. Eliminates the
-// flash-to-black gap that causes visible bounce on the 240x200
-// C28P viewport.
+// flash-to-black gap that causes visible refresh bounce on the RGB
+// panels (240x200 C28P, 480x520 Maxine). Same code, both boards.
 static void drawBlockEmpty(int bx, int by) {
     int x = vx() + BOARD_X + bx * CELL;
     int y = vy() + BOARD_Y + by * CELL;
@@ -223,27 +240,29 @@ static void drawLaunchScene() {
 static void drawGame() {
     int ox = vx();
     int oy = vy();
-#ifdef DEVICE_C28P
-    // No-flicker redraw path: do NOT clear the viewport or playfield
-    // before drawing. Every cell of the board gets painted every frame
-    // (occupied cells as their piece color, empty cells as black), and
-    // the falling piece overlays on top. Borders and the TETRIS label
-    // get painted unconditionally too — they're idempotent and cheap.
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+    // No-flicker redraw path (both touch-kiosk boards): do NOT clear
+    // the viewport or playfield before drawing. Every cell of the
+    // board gets painted every frame (occupied cells as their piece
+    // color, empty cells as black), and the falling piece overlays on
+    // top. Borders and the TETRIS label get painted unconditionally
+    // too — they're idempotent and cheap.
     // This eliminates the flash-to-black gap that causes visible
-    // refresh bounce on the 240x200 C28P viewport.
+    // refresh bounce on the RGB panels.
 #else
     clearView();
 #endif
     gfx->drawRect(ox + BOARD_X - 2, oy + BOARD_Y - 2, BW * CELL + 4, BH * CELL + 4, C_GREEN);
-#ifndef DEVICE_C28P
-    // C28P: the top 14px is the dpad's exit bar — don't clobber it.
+#if !defined(DEVICE_C28P) && !defined(DEVICE_MAXINE)
+    // C28P / Maxine: the top of the screen belongs to the dpad's
+    // exit bar / header strip — don't clobber it with a TETRIS label.
     gfx->setTextSize(1);
     gfx->setTextColor(C_GREEN);
     gfx->setCursor(ox + 6, oy + 5);
     gfx->print("TETRIS");
 #endif
 
-#ifdef DEVICE_C28P
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
     // Paint every cell of the board explicitly — no playfield clear.
     for (int y = 0; y < BH; y++) {
         for (int x = 0; x < BW; x++) {
@@ -393,9 +412,9 @@ static bool showGameOver() {
 #ifdef DEVICE_CARDPUTER_ADV
     gfx->setCursor(boxX + 16, boxY + 48);
     gfx->print("R/START RETRY");
-#elif defined(DEVICE_C28P)
-    // C28P is touch-only — map game-over actions to the on-screen
-    // D-pad's A and B buttons. A=retry (affirmative), B=exit.
+#elif defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+    // Touch-only kiosk (C28P / Maxine) — map game-over actions to the
+    // on-screen D-pad's A and B buttons. A=retry (affirmative), B=exit.
     gfx->setCursor(boxX + 18, boxY + 48);
     gfx->print("A RETRY    B EXIT");
 #else
@@ -404,7 +423,7 @@ static bool showGameOver() {
 #endif
     while (true) {
         PMNesInput input = pm_read_nes_input(true);
-#ifdef DEVICE_C28P
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
         // Touch-only: A=retry, B=exit. Ignore key/start (no keyboard).
         if (input.b) return false;
         if (input.a) return true;
@@ -425,6 +444,11 @@ void run_tetris() {
     // pm_read_nes_input() poll calls handle press-state redraw
     // selectively from here on.
     c28p_dpad_render();
+#endif
+#ifdef DEVICE_MAXINE
+    // Maxine: paint the (scaled) virtual D-pad chrome below the
+    // game viewport, same as the C28P.
+    maxine_dpad_render();
 #endif
     drawLaunchScene();
 
@@ -448,11 +472,6 @@ void run_tetris() {
             if (input.quit) {
                 pm_game_audio_stop();
                 return;
-            }
-            if (input.select) {
-                song = (song == PM_SONG_KOROBEINIKI) ? PM_SONG_SUGAR_PLUM : PM_SONG_KOROBEINIKI;
-                pm_game_audio_start(song);
-                redraw = true;
             }
             if (input.start) {
                 if (!waitPaused()) {

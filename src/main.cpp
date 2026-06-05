@@ -22,8 +22,11 @@
 #include <Wire.h>
 #include <SD.h>
 #include <SdFat.h>           
+#ifdef DEVICE_C28P
+#include <SD_MMC.h>           // SDIO 4-bit driver — C28P SD card lives on its own SDMMC peripheral, not SPI
+#endif
 #include <TinyGPSPlus.h>     
-#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P)
+#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
 #include <Arduino_GFX_Library.h>
 #endif
 #ifdef DEVICE_TLORAPAGER
@@ -32,8 +35,12 @@
 #ifdef DEVICE_C28P
     #include "c28p_boot.h"
 #endif
+#ifdef DEVICE_MAXINE
+    #include "maxine_boot.h"
+#endif
 #include <XPowersLib.h>
 #include <esp_task_wdt.h>    // WDT feed — prevents Guru Meditation during long setup()
+#include <esp_system.h>      // esp_reset_reason() boot breadcrumb for crash captures
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h> // SemaphoreHandle_t — spi_mutex for SD bus arbitration
 #include <soc/gpio_struct.h> // GPIO matrix introspection (func_out_sel_cfg)
@@ -185,6 +192,15 @@ const unsigned long WIFI_TIMEOUT_MS = 5000;  // 5 seconds max for autoconnect
 #define BOARD_I2C_SCL     PIN_I2C_SCL
 #endif // DEVICE_C28P
 
+#ifdef DEVICE_MAXINE
+// Sunton ESP32-8048S050C — ST7262 800x480 parallel RGB panel,
+// operated in PORTRAIT (480x800 logical). GT911 touch on I2C.
+// Pins resolved from platformio.ini -DPIN_RGB_* / -DPIN_TOUCH_* defines.
+// NOTE: RGB pin map is UNVERIFIED hypothesis — confirm at bring-up.
+#define BOARD_I2C_SDA     PIN_TOUCH_SDA
+#define BOARD_I2C_SCL     PIN_TOUCH_SCL
+#endif // DEVICE_MAXINE
+
 // --- DRIVER INSTANTIATION ---
 #ifdef DEVICE_TDECK_PLUS
 Arduino_DataBus *bus = new Arduino_HWSPI(BOARD_TFT_DC, BOARD_TFT_CS, BOARD_TFT_SCK, BOARD_TFT_MOSI, BOARD_TFT_MISO, &SPI, true);
@@ -232,6 +248,33 @@ Arduino_GFX *gfx = new Arduino_ILI9341(bus, BOARD_TFT_RST,
                                         0 /* portrait */, true /* IPS */);
 #endif
 
+#ifdef DEVICE_MAXINE
+// Sunton ESP32-8048S050C: ST7262 800x480 RGB parallel panel.
+// The native panel is 800x480 LANDSCAPE; we build the RGB panel at
+// its native dimensions and the rest of the OS treats it as portrait
+// (480x800) via SCREEN_W/SCREEN_H. The Arduino_RGB_Display is created
+// at native 800x480 with rotation handled at the draw layer through
+// the SCREEN_* constants.
+//
+// ⚠ RGB DATA/SYNC PINS + TIMINGS BELOW ARE AN UNVERIFIED HYPOTHESIS
+//   from 8048-family community configs. Confirm against the board at
+//   bring-up. Pixel clock kept conservative (14 MHz) per the Sunton
+//   reference's DMA/PSRAM-bottleneck note.
+Arduino_ESP32RGBPanel *maxine_rgbpanel = new Arduino_ESP32RGBPanel(
+    PIN_RGB_DE, PIN_RGB_VSYNC, PIN_RGB_HSYNC, PIN_RGB_PCLK,
+    PIN_RGB_R0, PIN_RGB_R1, PIN_RGB_R2, PIN_RGB_R3, PIN_RGB_R4,
+    PIN_RGB_G0, PIN_RGB_G1, PIN_RGB_G2, PIN_RGB_G3, PIN_RGB_G4, PIN_RGB_G5,
+    PIN_RGB_B0, PIN_RGB_B1, PIN_RGB_B2, PIN_RGB_B3, PIN_RGB_B4,
+    1 /* hsync_polarity */, 8 /* hsync_front_porch */, 4 /* hsync_pulse_width */, 8 /* hsync_back_porch */,
+    1 /* vsync_polarity */, 8 /* vsync_front_porch */, 4 /* vsync_pulse_width */, 8 /* vsync_back_porch */,
+    1 /* pclk_active_neg */, 14000000L /* prefer_speed */);
+// Native 800x480; rotation=3 presents portrait (480x800) with the
+// connector oriented for desk use. Tune rotation at bring-up.
+Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
+    800 /* native width */, 480 /* native height */, maxine_rgbpanel,
+    3 /* rotation -> portrait */, true /* auto_flush */);
+#endif
+
 // --- MULTI-THREADING HANDLES ---
 TaskHandle_t GhostTask;
 
@@ -254,6 +297,22 @@ SemaphoreHandle_t spi_mutex = nullptr;
 // and many readers (apps), and the value transitions exactly once
 // from false → true.
 volatile bool g_sd_ready = false;
+
+static const char* pm_reset_reason_str() {
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:   return "POWERON";
+        case ESP_RST_EXT:       return "EXT_RESET";
+        case ESP_RST_SW:        return "SW_RESET";
+        case ESP_RST_PANIC:     return "PANIC";
+        case ESP_RST_INT_WDT:   return "INT_WDT";
+        case ESP_RST_TASK_WDT:  return "TASK_WDT";
+        case ESP_RST_WDT:       return "OTHER_WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT";
+        case ESP_RST_SDIO:      return "SDIO";
+        default:                return "UNKNOWN";
+    }
+}
 
 #ifdef DEVICE_TLORAPAGER
 // Background task that mounts SD after boot completes.
@@ -514,6 +573,25 @@ static bool cp_boot_needs_scroll(int needed_h) {
 
 static void drawBootHeader() {
     int16_t W = bootW();
+#ifdef DEVICE_MAXINE
+    // Maxine: scaled header for 480-wide panel. Size 3 text, taller
+    // header bar with breathing room above so the title doesn't get
+    // chewed by the panel edge / overscan.
+    const int TOP_MARGIN = 16;             // gap from screen top to header
+    const int HEADER_H   = 44;             // total header bar height
+    gfx->fillRect(0, TOP_MARGIN, W, HEADER_H, BOOT_HEADER_BG);
+    gfx->drawFastHLine(0, TOP_MARGIN + HEADER_H, W, BOOT_DIVIDER);
+    gfx->setTextSize(3);
+    gfx->setTextColor(BOOT_OK);
+    gfx->setCursor(16, TOP_MARGIN + 10);
+    gfx->print("PISCES MOON OS");
+    gfx->setTextSize(2);
+    gfx->setTextColor(BOOT_SECTION);
+    const char *bios_mx = "BIOS v1.2.1 / ESP32-S3";
+    gfx->setCursor(max(280, W - (int)strlen(bios_mx) * 12 - 16), TOP_MARGIN + 14);
+    gfx->print(bios_mx);
+    bootY = TOP_MARGIN + HEADER_H + 12;    // start body well below the divider
+#else
     gfx->fillRect(0, 0, W, 14, BOOT_HEADER_BG);
     gfx->drawFastHLine(0, 14, W, BOOT_DIVIDER);
     gfx->setTextSize(1);
@@ -525,9 +603,23 @@ static void drawBootHeader() {
     gfx->setCursor(max(96, W - (int)strlen(bios) * 6 - 4), 4);
     gfx->print(bios);
     bootY = 18;
+#endif
 }
 
 static void drawBootSection(const char* name) {
+#ifdef DEVICE_MAXINE
+    int16_t W_mx = bootW();
+    gfx->drawFastHLine(0, bootY, W_mx, BOOT_DIVIDER);
+    bootY += 6;
+    gfx->setTextColor(BOOT_SECTION);
+    gfx->setTextSize(2);
+    gfx->setCursor(12, bootY);
+    gfx->print("// ");
+    gfx->print(name);
+    bootY += 22;
+    gfx->drawFastHLine(0, bootY, W_mx, BOOT_DIVIDER);
+    bootY += 6;
+#else
 #ifdef DEVICE_CARDPUTER_ADV
     // Record the section in the ring buffer for replay.
     CpBootEntry e = {};
@@ -556,10 +648,45 @@ static void drawBootSection(const char* name) {
     gfx->drawFastHLine(0, bootY, W, BOOT_DIVIDER);
     bootY += 2;
 #endif
+#endif // DEVICE_MAXINE else
 }
 
 static void drawBootLine(const char* timestamp, const char* label,
                          const char* detail, int tagType, const char* tagText) {
+#ifdef DEVICE_MAXINE
+    int16_t W_mx = bootW();
+    gfx->setTextSize(2);
+    gfx->setTextColor(BOOT_TS);
+    gfx->setCursor(12, bootY);
+    gfx->print(timestamp);
+    gfx->setTextColor(BOOT_LABEL);
+    gfx->setCursor(96, bootY);
+    gfx->print(label);
+    if (detail != nullptr) {
+        gfx->setTextColor(BOOT_ADDR);
+        // Detail to the right of label, leaving room for the tag pill.
+        gfx->setCursor(max(240, W_mx - 220), bootY);
+        gfx->print(detail);
+    }
+    uint16_t tagFg_mx, tagBg_mx;
+    switch (tagType) {
+        case 1:  tagFg_mx = BOOT_ACTIVE; tagBg_mx = BOOT_ACTIVE_BG; break;
+        case 2:  tagFg_mx = BOOT_WARN;   tagBg_mx = BOOT_WARN_BG;   break;
+        case 3:  tagFg_mx = BOOT_FAIL;   tagBg_mx = BOOT_FAIL_BG;   break;
+        default: tagFg_mx = BOOT_OK;     tagBg_mx = BOOT_OK_BG;     break;
+    }
+    int tagCharW_mx = 12;                          // size-2 char width
+    int tagW_mx = max(60, (int)(strlen(tagText) * tagCharW_mx) + 14);
+    int tagH_mx = 22;                              // size-2 char height + padding
+    int tagX_mx = W_mx - tagW_mx - 8;
+    int tagY_mx = bootY - 2;
+    gfx->fillRect(tagX_mx, tagY_mx, tagW_mx, tagH_mx, tagBg_mx);
+    gfx->drawRect(tagX_mx, tagY_mx, tagW_mx, tagH_mx, tagFg_mx);
+    gfx->setTextColor(tagFg_mx);
+    gfx->setCursor(tagX_mx + 7, bootY);
+    gfx->print(tagText);
+    bootY += 26;
+#else
 #ifdef DEVICE_CARDPUTER_ADV
     // Record the line in the ring buffer for replay.
     CpBootEntry e = {};
@@ -609,10 +736,26 @@ static void drawBootLine(const char* timestamp, const char* label,
     gfx->print(tagText);
     bootY += 10;
 #endif
+#endif // DEVICE_MAXINE else
 }
 
 static void drawBootProgress(int percent) {
     int16_t W = bootW();
+#ifdef DEVICE_MAXINE
+    int barX_mx = 12, barY_mx = bootY + 6, barW_mx = W - 24, barH_mx = 14;
+    gfx->drawRect(barX_mx, barY_mx, barW_mx, barH_mx, BOOT_DIVIDER);
+    int fillW_mx = (barW_mx - 2) * percent / 100;
+    gfx->fillRect(barX_mx + 1, barY_mx + 1, fillW_mx, barH_mx - 2, BOOT_PROGRESS);
+    gfx->setTextColor(BOOT_SECTION);
+    gfx->setTextSize(2);
+    gfx->setCursor(12, barY_mx + 22);
+    gfx->print("LOADING PISCES SHELL");
+    char pctStr_mx[8];
+    snprintf(pctStr_mx, sizeof(pctStr_mx), "%d%%", percent);
+    gfx->setCursor(W - 60, barY_mx + 22);
+    gfx->print(pctStr_mx);
+    bootY = barY_mx + 44;
+#else
     int barX = 4, barY = bootY + 2, barW = W - 8, barH = 5;
     gfx->drawRect(barX, barY, barW, barH, BOOT_DIVIDER);
     int fillW = (barW - 2) * percent / 100;
@@ -626,10 +769,24 @@ static void drawBootProgress(int percent) {
     gfx->setCursor(W - 20, barY + 7);
     gfx->print(pctStr);
     bootY = barY + 17;
+#endif // DEVICE_MAXINE else
 }
 
 static void drawBootFooter() {
     int16_t W = bootW();
+#ifdef DEVICE_MAXINE
+    int16_t footerY_mx = bootH() - 30;
+    gfx->fillRect(0, footerY_mx, W, 30, BOOT_HEADER_BG);
+    gfx->drawFastHLine(0, footerY_mx, W, BOOT_DIVIDER);
+    gfx->setTextSize(2);
+    gfx->setTextColor(BOOT_SECTION);
+    gfx->setCursor(12, footerY_mx + 8);
+    gfx->print("CORE1 READY / CORE0 ACTIVE");
+    gfx->setTextColor(BOOT_OK);
+    const char *ok_mx = "[ BOOT OK ]";
+    gfx->setCursor(W - (int)strlen(ok_mx) * 12 - 12, footerY_mx + 8);
+    gfx->print(ok_mx);
+#else
     int16_t footerY = bootH() - 11;
     gfx->fillRect(0, footerY, W, 11, BOOT_HEADER_BG);
     gfx->drawFastHLine(0, footerY, W, BOOT_DIVIDER);
@@ -640,6 +797,7 @@ static void drawBootFooter() {
     gfx->setTextColor(BOOT_OK);
     gfx->setCursor(W - 72, footerY + 3);
     gfx->print("[ BOOT OK ]");
+#endif // DEVICE_MAXINE else
 }
 
 // ─────────────────────────────────────────────
@@ -651,6 +809,74 @@ void drawCircuitBackground() {
     gfx->fillScreen(0x0000);
     uint16_t gridColor  = 0x0120;
     uint16_t traceColor = 0x0300;
+#ifdef DEVICE_MAXINE
+    // ── Maxine 480x800 cyberpunk background ──────────────
+    // The original layout was drawn for ~320x240; on 480x800 most of the
+    // canvas was empty black. Here we tile the grid across the whole
+    // surface and draw a deterministic but visually busy network of
+    // PCB traces + solder pads across the FULL height of the panel.
+    // Uses a pseudo-random walk seeded with constants so the layout is
+    // identical every boot (no flicker on retry) while still feeling
+    // organic and not gridded-up.
+    const int gridStep = 24;
+    for (int x = 0; x < W; x += gridStep) gfx->drawFastVLine(x, 0, H, gridColor);
+    for (int y = 0; y < H; y += gridStep) gfx->drawFastHLine(0, y, W, gridColor);
+
+    uint16_t padColor = 0x0460;
+
+    // Horizontal trace bands every ~80 pixels down the entire height,
+    // with alternating staircases that step left or right at each band.
+    // Each band has its own length and offset so the pattern reads as
+    // "circuitry" rather than a regular grid.
+    int seed = 0x9E37;   // any non-zero constant — we just want repeatability
+    int y = 28;
+    bool stepRight = true;
+    while (y < H - 30) {
+        // Pseudo-random walk: cheap LCG to get varying segment lengths.
+        seed = seed * 1103515245 + 12345;
+        int xStart = ((seed >> 8) & 0xFF) % (W / 4);   // 0..W/4
+        seed = seed * 1103515245 + 12345;
+        int seg1   = 80 + ((seed >> 8) & 0x7F);        // 80..207 px
+        seed = seed * 1103515245 + 12345;
+        int riseH  = 16 + ((seed >> 8) & 0x1F);        // 16..47 px vertical jog
+        seed = seed * 1103515245 + 12345;
+        int seg2   = 80 + ((seed >> 8) & 0x9F);        // 80..239 px
+
+        int x1 = xStart;
+        int x2 = min(W - 8, x1 + seg1);
+        gfx->drawFastHLine(x1, y, x2 - x1, traceColor);
+
+        // Vertical jog
+        int yJog = stepRight ? (y + riseH) : (y - riseH);
+        if (yJog < 4) yJog = 4;
+        if (yJog > H - 4) yJog = H - 4;
+        gfx->drawFastVLine(x2, min(y, yJog), abs(yJog - y), traceColor);
+
+        // Continue horizontal at the new y
+        int x3 = min(W - 4, x2 + seg2);
+        gfx->drawFastHLine(x2, yJog, x3 - x2, traceColor);
+
+        // Solder pads at the corners
+        gfx->fillRect(x2 - 2, y - 2, 5, 5, padColor);
+        gfx->fillRect(x2 - 2, yJog - 2, 5, 5, padColor);
+        if (x3 < W - 8) gfx->fillRect(x3 - 2, yJog - 2, 5, 5, padColor);
+
+        // Step down with a varying gap so the bands don't line up.
+        seed = seed * 1103515245 + 12345;
+        y += 56 + ((seed >> 8) & 0x3F);     // 56..119 px between bands
+        stepRight = !stepRight;
+    }
+
+    // A few longer vertical "bus" traces near the edges to anchor the
+    // composition and make the canvas feel like a real board, not a
+    // collection of disconnected wires.
+    gfx->drawFastVLine(28,      40, H - 80, traceColor);
+    gfx->drawFastVLine(W - 28,  40, H - 80, traceColor);
+    gfx->fillRect(26,     38,  5, 5, padColor);
+    gfx->fillRect(26,     H - 46, 5, 5, padColor);
+    gfx->fillRect(W - 30, 38,  5, 5, padColor);
+    gfx->fillRect(W - 30, H - 46, 5, 5, padColor);
+#else
     for (int x = 0; x < W; x += 20) gfx->drawFastVLine(x, 0, H, gridColor);
     for (int y = 0; y < H; y += 20) gfx->drawFastHLine(0, y, W, gridColor);
     gfx->drawFastHLine(0,   10, 80,  traceColor);
@@ -681,6 +907,7 @@ void drawCircuitBackground() {
     gfx->fillRect(158, 218, 4, 4, padColor);
     gfx->fillRect(178, 208, 4, 4, padColor);
     gfx->fillRect(258, 193, 4, 4, padColor);
+#endif
 }
 
 void drawOctagonFrame() {
@@ -733,7 +960,101 @@ void showRainbowSplash() {
 
     int centerX = W / 2;
 
-#ifdef DEVICE_CARDPUTER_ADV
+#ifdef DEVICE_MAXINE
+    // ── Maxine 480×800 splash layout ───────────────────
+    // Big screen, big proportions. Layout top-to-bottom:
+    //   chip icon centered around y = H/2 - 220 (~180)
+    //   title baseline at y = H/2 - 130 (~270), size 6, ~48px chars
+    //   line1 "Powered by Gemini." at y = H/2 - 30 (~370), size 3
+    //   line2 "Limited only by your imagination." at y = H/2 + 10 (~410), size 2
+    //   edition tagline "MAXINE EDITION" at y = H/2 + 110 (~510), size 4
+    //   version footer at y = H - 60 (~740), size 2
+    //
+    // The chip icon helper draws at a fixed scale; on the big panel
+    // we draw it twice (offset) to give it visual weight instead of
+    // looking like a postage stamp lost in space. Quick and faithful.
+    drawChipIcon(centerX - 24, H / 2 - 220);
+    drawChipIcon(centerX + 24, H / 2 - 220);
+    delay(200);
+
+    const char* title = "Pisces Moon.";
+    const char* line1 = "Powered by Gemini.";
+    const char* line2 = "Limited only by your imagination.";
+    uint16_t spectrum[] = {
+        0xF800, 0xFD20, 0xFFE0, 0x07E0, 0x07FF, 0x001F, 0xF81F, 0xFFFF,
+    };
+    int specLen = 8;
+
+    const int titleSize  = 6;
+    const int titleCharW = 36;   // size-6 ≈ 36px/char
+    int titleY = H / 2 - 130;
+    int titleX = (W - (int)strlen(title) * titleCharW) / 2;
+
+    for (int cycle = 0; cycle < 12; cycle++) {
+        gfx->setCursor(titleX, titleY);
+        gfx->setTextSize(titleSize);
+        for (int i = 0; i < (int)strlen(title); i++) {
+            gfx->setTextColor(spectrum[(i + cycle) % specLen]);
+            gfx->print(title[i]);
+        }
+        delay(80);
+    }
+
+    gfx->setCursor(titleX, titleY);
+    gfx->setTextSize(titleSize);
+    uint16_t finalColors[] = {
+        0xF81F, 0x001F, 0x07FF, 0x07E0, 0xFFE0, 0xFD20,
+        0xFFFF, 0xF800, 0xFD20, 0x07E0, 0x07FF, 0xFFFF,
+    };
+    for (int i = 0; i < (int)strlen(title); i++) {
+        gfx->setTextColor(finalColors[i]);
+        gfx->print(title[i]);
+    }
+
+    delay(300);
+
+    // "Powered by Gemini." — size 3 (~18 px/char)
+    gfx->setTextSize(3);
+    int l1x = (W - (int)strlen(line1) * 18) / 2;
+    gfx->setTextColor(0xFFFF);
+    gfx->setCursor(l1x, H / 2 - 30);
+    gfx->print(line1);
+    delay(400);
+
+    // "Limited only by your imagination." — size 2 (~12 px/char); the
+    // string is long, so this scale is what fits the 480-wide canvas
+    // comfortably without crowding the edges.
+    gfx->setTextSize(2);
+    int l2x = (W - (int)strlen(line2) * 12) / 2;
+    gfx->setTextColor(0xC618);
+    gfx->setCursor(l2x, H / 2 + 10);
+    gfx->print(line2);
+    delay(400);
+
+    // Edition tagline — the explicit "MAXINE EDITION" callout. Bright
+    // cyan against the dark canvas, large enough to feel like a stamp
+    // rather than a footnote.
+    const char* edition = "MAXINE EDITION";
+    gfx->setTextSize(4);
+    gfx->setTextColor(0x07FF);
+    int ex = (W - (int)strlen(edition) * 24) / 2;
+    gfx->setCursor(ex, H / 2 + 110);
+    gfx->print(edition);
+    delay(400);
+
+    // Version footer, size 2 so it's legible at this distance from the
+    // user, anchored to the bottom-right with breathing room.
+    gfx->setTextSize(2);
+    gfx->setTextColor(0x0480);
+    const char* version = "v1.2.1 MULTI-DEVICE";
+    int vx = W - (int)strlen(version) * 12 - 16;
+    gfx->setCursor(vx, H - 60);
+    gfx->print(version);
+
+    esp_task_wdt_reset();
+    delay(2500);
+    esp_task_wdt_reset();
+#elif defined(DEVICE_CARDPUTER_ADV)
     // ── Cardputer 240×135 splash layout ──────────────────────
     // Tight vertical budget — order top-to-bottom:
     //   chip icon centered at y=22  (icon is ~16px tall, sits y=14-30)
@@ -1183,6 +1504,8 @@ void setup() {
     // ~half-second of boot output to a still-enumerating host.
     delay(1500);
     Serial.println("[SYSTEM] === BOOT ===");
+    Serial.printf("[SYSTEM] Reset reason: %s (%d)\n",
+                  pm_reset_reason_str(), (int)esp_reset_reason());
     esp_task_wdt_reset();
 
     // ── SPI Bus Treaty — create the shared mutex FIRST ─────
@@ -1309,6 +1632,39 @@ void setup() {
     // failures are localizable without on-screen UI.
     c28p_setup();
 #endif // DEVICE_C28P
+
+#ifdef DEVICE_MAXINE
+    // ── Maxine display init (ST7262 RGB parallel panel) ──────────────
+    // RGB panels have no SPI CS / backlight-flush dance like the SPI
+    // displays. gfx->begin() brings up the RGB peripheral + framebuffer
+    // (in PSRAM). Backlight is driven directly via PIN_RGB_BL.
+    pinMode(PIN_RGB_BL, OUTPUT);
+    digitalWrite(PIN_RGB_BL, LOW);   // off during init
+    if (!gfx->begin()) {
+        Serial.println("[HAL] Maxine gfx->begin() FAILED — check RGB pins/timings");
+    }
+    gfx->fillScreen(0x0000);
+    digitalWrite(PIN_RGB_BL, HIGH);  // backlight on after init
+    Serial.println("[HAL] Maxine RGB display init complete");
+
+    // I2C bus for the GT911 touch controller.
+    Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
+    Wire.setClock(400000);
+
+    // SD card on dedicated SPI bus (10/11/12/13). RGB panel uses parallel
+    // GPIO, not SPI, so the SD card has the SPI peripheral entirely to
+    // itself — no shared-bus arbitration needed. Pull CS HIGH first to
+    // avoid the card responding to display init noise that doesn't apply
+    // here, then SPI.begin() claims the bus.
+    pinMode(PIN_SD_CS, OUTPUT);
+    digitalWrite(PIN_SD_CS, HIGH);
+    SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI);
+    delay(50);
+    Serial.println("[HAL] Maxine SPI bus configured for SD card");
+
+    // Hand off to maxine_boot.cpp for GT911 touch init.
+    maxine_setup();
+#endif // DEVICE_MAXINE
 
 #ifdef DEVICE_TLORAPAGER
     // ── T-LoraPager boot sequence ──────────────────────────
@@ -1769,8 +2125,71 @@ void setup() {
         drawBootLine("00:07", "VAULT INIT", nullptr, dbOk ? 0 : 3, dbOk ? "OK" : "FAIL");
         delay(80);
     }
+#elif defined(DEVICE_MAXINE)
+    // ── Maxine: SD on dedicated SPI bus (pins 10/11/12/13) ──────────────
+    // The RGB display is parallel — no shared SPI bus, no contention.
+    // SD ownership of the bus is exclusive; mount synchronously at boot
+    // so NoSQL is available to all apps at first launch (data reader,
+    // settings, RSS feed seeding, wardrive logging, anomaly baseline).
+    //
+    // CS was driven HIGH and SPI.begin() was called in the Maxine display
+    // init block above; this branch just performs the actual mount.
+    bool sdMounted = false;
+    for (int attempt = 1; attempt <= 2 && !sdMounted; attempt++) {
+        digitalWrite(PIN_SD_CS, HIGH);
+        sdMounted = ghost_partition_mount_public(PIN_SD_CS, SPI);
+        if (!sdMounted && attempt < 2) {
+            Serial.printf("[SD] Maxine mount attempt %d/2 failed — retrying\n", attempt);
+            delay(500);
+        }
+    }
+    g_sd_ready = sdMounted;
+    drawBootLine("00:06", "SD_CARD0 GPIO:10", nullptr, sdMounted ? 0 : 3, sdMounted ? "OK" : "FAIL");
+    delay(80);
+    if (sdMounted) {
+        bool dbOk = init_database();
+        drawBootLine("00:07", "VAULT INIT", nullptr, dbOk ? 0 : 3, dbOk ? "OK" : "FAIL");
+        delay(80);
+    }
+#elif defined(DEVICE_C28P)
+    // ── C28P: SD card on dedicated SDIO 4-bit peripheral ───────────────
+    // The C28P routes its SD card to the ESP32-S3's SDMMC controller via
+    // CLK/CMD/D0-D3 (pins 38/40/39/41/48/47), NOT through SPI. SdFat 2.2.3
+    // doesn't speak SDIO on ESP32-S3, so the global `SdFat sd` is left
+    // unmounted on this target. We mount through Arduino's SD_MMC library
+    // instead, which exposes the standard fs::FS interface (open, exists,
+    // openNextFile, etc.) over SDIO.
+    //
+    // Apps that need SD on C28P must use SD_MMC (not `sd`). The e-Reader
+    // has device-specific code paths for this. The audio file player and
+    // any other SD-using app on C28P needs the same treatment when ported.
+    SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD,
+                   PIN_SD_D0, PIN_SD_D1, PIN_SD_D2, PIN_SD_D3);
+    // begin args: mountpoint, mode1bit=false (use full 4-bit width),
+    // format_if_mount_failed=false (NEVER auto-format a user's card),
+    // max_files=5 (enough for app + bookmark + few open handles)
+    bool sdMounted = SD_MMC.begin("/sdcard", false, false, BOARD_MAX_SDMMC_FREQ, 5);
+    if (!sdMounted) {
+        // Some cards need a moment after power-on before they respond to
+        // SDIO commands. Retry once after a settle delay.
+        delay(500);
+        sdMounted = SD_MMC.begin("/sdcard", false, false, BOARD_MAX_SDMMC_FREQ, 5);
+    }
+    g_sd_ready = sdMounted;
+    drawBootLine("00:06", "SD_MMC SDIO 4-bit", nullptr, sdMounted ? 0 : 3, sdMounted ? "OK" : "FAIL");
+    delay(80);
+    if (sdMounted) {
+        uint64_t cardSizeMB = SD_MMC.cardSize() / (1024ULL * 1024ULL);
+        Serial.printf("[HAL] C28P SD mounted via SDIO 4-bit: %llu MB\n", cardSizeMB);
+        // No VAULT init on C28P (init_database depends on SdFat sd, not
+        // SD_MMC). The kiosk apps that use the vault (data_reader,
+        // gemini logs, wardrive) either aren't in the C28P build or
+        // need a separate SD_MMC-backed implementation. Future work.
+        drawBootLine("00:07", "VAULT INIT", "SD_MMC", 2, "SKIPPED");
+        delay(80);
+    }
 #else
-    // ── T-LoraPager: defer SD mount entirely ─────────────────────────
+    // ── T-LoraPager: defer SD mount entirely ──────────────────────────────────────
     // T-LoraPager has four peripherals on one shared SPI bus and the
     // card frequently doesn't respond on cold-boot for ~3-5 seconds.
     // Apps that need SD (wardrive, audio, file manager, Gemini chat
@@ -1788,7 +2207,7 @@ void setup() {
 
     drawBootSection("PROCESS SPAWN");
 
-#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P)
+#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
     // Cardputer ADV (no PSRAM): defer wardrive task spawn until user
     // explicitly launches the wardrive app. The task's NimBLE init
     // claims ~48KB of internal SRAM which the device cannot afford
@@ -1796,8 +2215,9 @@ void setup() {
     // headroom. run_wardrive() will call init_wardrive_core() on
     // first entry. T-Deck and Pager keep boot-spawn behavior.
     //
-    // C28P (desk kiosk): no GPS, no mobility — wardrive is not part
-    // of the C28P focus and the symbol isn't linked in this build.
+    // C28P / Maxine (desk kiosk): no GPS, no mobility — wardrive is
+    // not part of the kiosk focus and the symbol isn't linked in
+    // these builds.
     drawBootLine("00:08", "WARDRIVE_CORE",         nullptr, 2, "DEFERRED");
     delay(60);
 #else
@@ -1810,7 +2230,7 @@ void setup() {
     // wardrive owns BLE startup/order.
     drawBootLine("00:09", "GAMEPAD_BLE",           nullptr, 2, "SKIPPED");
 
-#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P)
+#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
     // ── Cardputer ADV: SKIP Gemini boot-time init ────────────────────
     // The Gemini client allocates HTTPS context, JSON history buffer,
     // and NoSQL "gemini" category at init — ~15KB total. On the no-
@@ -1833,7 +2253,7 @@ void setup() {
 
     // CRITICAL: render line FIRST, then call auto_connect_wifi() wrapper
     // WiFi SDK calls corrupt GFX cursor if text follows on same line
-#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P)
+#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
     // ── Cardputer ADV / C28P: SKIP autoconnect ───────────────────────
     // On the no-PSRAM Cardputer, WiFi STA mode consumes ~52KB and
     // bringing it up at boot leaves insufficient memory for the
@@ -1869,18 +2289,18 @@ void setup() {
     esp_task_wdt_reset();
 
     delay(200);
-#ifndef DEVICE_C28P
+#if !defined(DEVICE_C28P) && !defined(DEVICE_MAXINE)
     // Ghost Engine (Core 0 background task) — spawned on devices that
-    // run wardrive. On C28P (no GPS, no field intelligence focus,
-    // wardrive.cpp not in the v1.2.1 src_filter), the Engine is not
+    // run wardrive. On C28P / Maxine (no GPS, no field intelligence
+    // focus, wardrive.cpp not in their src_filter), the Engine is not
     // spawned and the wardrive_active flag is not defined.
     xTaskCreatePinnedToCore(core0GhostTask, "GhostTask", 10000, NULL, 1, &GhostTask, 0);
     wardrive_active = true;   // Ghost Engine starts immediately — never stops
     drawBootLine("00:12", "CORE_0_GHOST",          nullptr, 1, "ACTIVE");
 #else
     drawBootLine("00:12", "CORE_0_GHOST",          nullptr, 2, "SKIPPED");
-    Serial.println("[SYSTEM] C28P: Ghost Engine not spawned — "
-                   "wardrive subsystem not in v1.2.1 build for this target");
+    Serial.println("[SYSTEM] C28P/Maxine: Ghost Engine not spawned — "
+                   "wardrive subsystem not in build for this target");
 #endif
     delay(60);
 
@@ -1910,7 +2330,7 @@ void setup() {
     // C28P: Ghost Partition is not part of the kiosk threat model
     // (no field-intelligence use case on a desk fixture). The
     // ghost_partition.cpp file is excluded from the C28P src_filter.
-#ifndef DEVICE_C28P
+#if !defined(DEVICE_C28P) && !defined(DEVICE_MAXINE)
     ghost_partition_run_pin_screen();
 #endif
     esp_task_wdt_reset();
@@ -1923,6 +2343,10 @@ void loop() {
     // It never returns — the loop() body below only runs on the other
     // devices.
     c28p_launcher();
+#elif defined(DEVICE_MAXINE)
+    // Maxine uses its own touch launcher (maxine_boot.cpp), scaled to
+    // 480x800. Never returns.
+    maxine_launcher();
 #else
     run_launcher();
 #endif

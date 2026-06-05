@@ -37,17 +37,116 @@
 #include "theme.h"
 #include "gamepad.h"
 #include "chess.h"
+#if defined(DEVICE_MAXINE) || defined(DEVICE_C28P)
+// ──────────────────────────────────────────────────────────────
+//  Touch-only kiosk stubs for symbols chess.cpp calls directly
+//  but which aren't linked into the Maxine / C28P builds.
+//
+//  WHY chess needs stubs at all: the T-Deck input loop polls
+//  get_touch(), get_keypress(), update_trackball{,_game}(), and
+//  gamepad_*() unconditionally each frame. We don't want to
+//  scatter #ifdef branches through that loop, so we provide
+//  no-op definitions that satisfy the linker and read as "no
+//  input" at runtime. Chess's device-specific touch path then
+//  injects the real input via c28p_touch_read / maxine_touch_read.
+//
+//  Split between the two devices:
+//    Maxine — needs ALL the stubs (no keyboard/trackball/gamepad
+//             .cpp files in maxine src_filter).
+//    C28P   — c28p_boot.cpp already provides get_keypress,
+//             init_trackball, update_trackball_game, g_gamepad,
+//             and the gamepad_* functions. Redefining them
+//             here would multiply-define. We only add the two
+//             chess specifically uses that c28p_boot doesn't:
+//             get_touch and update_trackball (non-game variant).
+// ──────────────────────────────────────────────────────────────
+bool get_touch(int16_t* x, int16_t* y) { (void)x; (void)y; return false; }
+TrackballState update_trackball() { return TrackballState{0, 0, false}; }
+#endif
+
+#ifdef DEVICE_MAXINE
+// Note: maxine_dpad.h is intentionally NOT included. Chess on Maxine
+// is a full-screen touch-native app — every input is a tap on the
+// board or a tap in the header / panel strip, never a directional
+// press. The maxine dpad chrome that pac-man, galaga, and pole
+// position paint at y >= 520 is deliberately absent here, which
+// frees the full 800px of vertical real estate for the chess UI.
+extern bool maxine_touch_read(int16_t* x, int16_t* y);
+
+// Maxine-only stubs (C28P provides these in c28p_boot.cpp).
+char get_keypress() { return 0; }
+void init_trackball() {}
+TrackballState update_trackball_game() { return TrackballState{0, 0, false}; }
+GamepadState g_gamepad = {};
+bool gamepad_poll() { return false; }
+#endif
+
+#ifdef DEVICE_C28P
+// C28P single-touch driver, defined non-static in c28p_boot.cpp.
+// Returns true if a finger is currently down, writing display
+// coords (0..239, 0..319) into *x and *y.
+extern bool c28p_touch_read(int16_t* x, int16_t* y);
+#endif
 
 extern Arduino_GFX *gfx;
 
 // ─────────────────────────────────────────────
 //  BOARD GEOMETRY
 // ─────────────────────────────────────────────
+#ifdef DEVICE_MAXINE
+// Maxine 480x800 portrait, full-screen touch-native app (no virtual
+// dpad — chess is all taps). Layout:
+//    y=0..29     30-px header strip (tap-to-quit hot zone with
+//                "< EXIT" / "CHESS" affordance painted by drawFull).
+//    y=30..445   416-px board (SQ=52 * 8), x=32..448 centered.
+//    y=446..461  16-px gap holds the a..h file labels (size-2).
+//    y=462..799  338-px panel filling the rest of the screen: turn
+//                indicator, AI mode, check status, controls hints.
+//
+// Earlier versions reserved y >= 520 for maxine_dpad chrome. That
+// reservation is gone — without a dpad to host, the bottom 280px
+// becomes additional panel real estate instead of being painted
+// over by the dpad layer.
+#define SQ          52
+#define BOARD_X     32
+#define BOARD_Y     30
+#define PANEL_X     0
+#define PANEL_W     480
+#define PANEL_Y     (BOARD_Y + SQ*8 + 16)
+#define PANEL_H     (800 - PANEL_Y)
+#define SCREEN_W_C  480
+#define SCREEN_H_C  800
+#elif defined(DEVICE_C28P)
+// C28P 240x320 portrait, touch-only. Chess takes over the entire
+// screen (no virtual dpad: every input is a tap, not a d-pad press).
+// Layout:
+//    y=0..13     14-px header strip (tap-to-quit hot zone)
+//    y=14..237   224-px board (8 * SQ=28), x=14..238 centered
+//    y=238..247  10-px gap holds the a..h file labels (size-1)
+//    y=248..319  72-px panel: turn indicator, AI cycle button,
+//                check status, control hints
+// SQ=28 was picked over 26 (T-Deck) to use the extra width C28P
+// has: the board fills the screen edge-to-edge with a 1px margin
+// outside the rank labels, giving comfortable tap targets for an
+// adult fingertip on a 2.8" display.
+#define SQ          28
+#define BOARD_X     14
+#define BOARD_Y     14
+#define PANEL_X     0
+#define PANEL_W     240
+#define PANEL_Y     248
+#define PANEL_H     72
+#define SCREEN_W_C  240
+#define SCREEN_H_C  320
+#else
 #define SQ          26          // Square size px
 #define BOARD_X     16          // Board left edge
 #define BOARD_Y      8          // Board top edge
 #define PANEL_X    (BOARD_X + SQ*8 + 4)  // Right panel x = 228
 #define PANEL_W    (320 - PANEL_X - 2)   // ~90px
+#define SCREEN_W_C  320
+#define SCREEN_H_C  240
+#endif
 
 // ─────────────────────────────────────────────
 //  COLORS
@@ -672,6 +771,20 @@ static void drawSquare(int row, int col, bool highlight = false, bool cursor = f
 }
 
 // Draw a piece glyph at screen position
+//
+// Pieces were authored for SQ=26 with literal pixel offsets. On
+// Maxine SQ is 52 (exactly 2x), so we scale every offset by CPS
+// so the pieces occupy the same fraction of each square on both
+// targets without any artwork rework. CPS = SQ/26 = 1 on T-Deck
+// and C28P, 2 on Maxine.
+//
+// NOTE — the identifier is CPS (Chess Piece Scale), not PS, because
+// xtensa/config/specreg.h #define's PS as 230 (the Processor State
+// register address). That macro is included transitively via
+// Arduino.h -> FreeRTOS.h -> portable.h -> portmacro.h, and a bare
+// `PS` token would be substituted to `230` before the compiler
+// sees this declaration. Two-letter prefix on the chess-specific
+// constant avoids the collision.
 static void drawPiece(int row, int col, int piece) {
     if (piece == EMPTY) return;
     int x = BOARD_X + col * SQ + SQ/2;
@@ -679,66 +792,67 @@ static void drawPiece(int row, int col, int piece) {
     int pt = absP(piece);
     int clr = (piece > 0) ? COL_WHITE_P : COL_BLACK_P;
     int out = (piece > 0) ? COL_OUTLINE : 0x632C;
+    constexpr int CPS = SQ / 26;
 
     switch (pt) {
         case PAWN:
-            gfx->fillCircle(x, y-4, 4, clr);
-            gfx->drawCircle(x, y-4, 4, out);
-            gfx->fillRect(x-3, y-1, 6, 6, clr);
-            gfx->fillRect(x-5, y+4, 10, 3, clr);
-            gfx->drawRect(x-5, y+4, 10, 3, out);
+            gfx->fillCircle(x, y-4*CPS, 4*CPS, clr);
+            gfx->drawCircle(x, y-4*CPS, 4*CPS, out);
+            gfx->fillRect(x-3*CPS, y-1*CPS, 6*CPS, 6*CPS, clr);
+            gfx->fillRect(x-5*CPS, y+4*CPS, 10*CPS, 3*CPS, clr);
+            gfx->drawRect(x-5*CPS, y+4*CPS, 10*CPS, 3*CPS, out);
             break;
         case KNIGHT:
             // Horse-head stylized
-            gfx->fillRect(x-5, y-2, 10, 10, clr);
-            gfx->fillRect(x-3, y-7, 7, 7, clr);
-            gfx->fillRect(x-6, y-4, 4, 5, clr);
-            gfx->drawRect(x-6, y-7, 11, 19, out);
-            gfx->fillRect(x-5, y+7, 10, 2, clr);
-            gfx->drawRect(x-5, y+7, 10, 2, out);
+            gfx->fillRect(x-5*CPS, y-2*CPS, 10*CPS, 10*CPS, clr);
+            gfx->fillRect(x-3*CPS, y-7*CPS, 7*CPS, 7*CPS, clr);
+            gfx->fillRect(x-6*CPS, y-4*CPS, 4*CPS, 5*CPS, clr);
+            gfx->drawRect(x-6*CPS, y-7*CPS, 11*CPS, 19*CPS, out);
+            gfx->fillRect(x-5*CPS, y+7*CPS, 10*CPS, 2*CPS, clr);
+            gfx->drawRect(x-5*CPS, y+7*CPS, 10*CPS, 2*CPS, out);
             // Eye
-            gfx->fillCircle(x+1, y-4, 1, (piece>0)?0x0000:0xFFFF);
+            gfx->fillCircle(x+1*CPS, y-4*CPS, 1*CPS, (piece>0)?0x0000:0xFFFF);
             break;
         case BISHOP:
-            gfx->fillTriangle(x, y-9, x-4, y+7, x+4, y+7, clr);
-            gfx->drawTriangle(x, y-9, x-4, y+7, x+4, y+7, out);
-            gfx->fillCircle(x, y-9, 2, clr);
-            gfx->drawCircle(x, y-9, 2, out);
-            gfx->fillRect(x-5, y+7, 10, 2, clr);
-            gfx->drawRect(x-5, y+7, 10, 2, out);
+            gfx->fillTriangle(x, y-9*CPS, x-4*CPS, y+7*CPS, x+4*CPS, y+7*CPS, clr);
+            gfx->drawTriangle(x, y-9*CPS, x-4*CPS, y+7*CPS, x+4*CPS, y+7*CPS, out);
+            gfx->fillCircle(x, y-9*CPS, 2*CPS, clr);
+            gfx->drawCircle(x, y-9*CPS, 2*CPS, out);
+            gfx->fillRect(x-5*CPS, y+7*CPS, 10*CPS, 2*CPS, clr);
+            gfx->drawRect(x-5*CPS, y+7*CPS, 10*CPS, 2*CPS, out);
             break;
         case ROOK:
-            gfx->fillRect(x-5, y-8, 10, 16, clr);
-            gfx->drawRect(x-5, y-8, 10, 16, out);
+            gfx->fillRect(x-5*CPS, y-8*CPS, 10*CPS, 16*CPS, clr);
+            gfx->drawRect(x-5*CPS, y-8*CPS, 10*CPS, 16*CPS, out);
             // Battlements
-            gfx->fillRect(x-5, y-10, 3, 4, clr);
-            gfx->fillRect(x,   y-10, 3, 4, clr);
-            gfx->fillRect(x+2, y-10, 3, 4, clr);
-            gfx->fillRect(x-5, y+7, 10, 3, clr);
-            gfx->drawRect(x-5, y+7, 10, 3, out);
+            gfx->fillRect(x-5*CPS, y-10*CPS, 3*CPS, 4*CPS, clr);
+            gfx->fillRect(x,       y-10*CPS, 3*CPS, 4*CPS, clr);
+            gfx->fillRect(x+2*CPS, y-10*CPS, 3*CPS, 4*CPS, clr);
+            gfx->fillRect(x-5*CPS, y+7*CPS, 10*CPS, 3*CPS, clr);
+            gfx->drawRect(x-5*CPS, y+7*CPS, 10*CPS, 3*CPS, out);
             break;
         case QUEEN:
-            gfx->fillCircle(x, y-6, 5, clr);
-            gfx->drawCircle(x, y-6, 5, out);
-            gfx->fillRect(x-5, y-2, 10, 10, clr);
-            gfx->drawRect(x-5, y-2, 10, 10, out);
-            gfx->fillRect(x-6, y+7, 12, 3, clr);
-            gfx->drawRect(x-6, y+7, 12, 3, out);
+            gfx->fillCircle(x, y-6*CPS, 5*CPS, clr);
+            gfx->drawCircle(x, y-6*CPS, 5*CPS, out);
+            gfx->fillRect(x-5*CPS, y-2*CPS, 10*CPS, 10*CPS, clr);
+            gfx->drawRect(x-5*CPS, y-2*CPS, 10*CPS, 10*CPS, out);
+            gfx->fillRect(x-6*CPS, y+7*CPS, 12*CPS, 3*CPS, clr);
+            gfx->drawRect(x-6*CPS, y+7*CPS, 12*CPS, 3*CPS, out);
             // Crown points
-            gfx->fillCircle(x-4, y-9, 2, clr); gfx->drawCircle(x-4, y-9, 2, out);
-            gfx->fillCircle(x+4, y-9, 2, clr); gfx->drawCircle(x+4, y-9, 2, out);
-            gfx->fillCircle(x,   y-11,2, clr); gfx->drawCircle(x,   y-11,2, out);
+            gfx->fillCircle(x-4*CPS, y-9*CPS, 2*CPS, clr); gfx->drawCircle(x-4*CPS, y-9*CPS, 2*CPS, out);
+            gfx->fillCircle(x+4*CPS, y-9*CPS, 2*CPS, clr); gfx->drawCircle(x+4*CPS, y-9*CPS, 2*CPS, out);
+            gfx->fillCircle(x,       y-11*CPS, 2*CPS, clr); gfx->drawCircle(x,       y-11*CPS, 2*CPS, out);
             break;
         case KING:
-            gfx->fillRect(x-5, y-2, 10, 10, clr);
-            gfx->drawRect(x-5, y-2, 10, 10, out);
+            gfx->fillRect(x-5*CPS, y-2*CPS, 10*CPS, 10*CPS, clr);
+            gfx->drawRect(x-5*CPS, y-2*CPS, 10*CPS, 10*CPS, out);
             // Cross
-            gfx->fillRect(x-1, y-9, 3, 8, clr);
-            gfx->fillRect(x-4, y-7, 9, 3, clr);
-            gfx->drawRect(x-1, y-9, 3, 8, out);
-            gfx->drawRect(x-4, y-7, 9, 3, out);
-            gfx->fillRect(x-6, y+7, 12, 3, clr);
-            gfx->drawRect(x-6, y+7, 12, 3, out);
+            gfx->fillRect(x-1*CPS, y-9*CPS, 3*CPS, 8*CPS, clr);
+            gfx->fillRect(x-4*CPS, y-7*CPS, 9*CPS, 3*CPS, clr);
+            gfx->drawRect(x-1*CPS, y-9*CPS, 3*CPS, 8*CPS, out);
+            gfx->drawRect(x-4*CPS, y-7*CPS, 9*CPS, 3*CPS, out);
+            gfx->fillRect(x-6*CPS, y+7*CPS, 12*CPS, 3*CPS, clr);
+            gfx->drawRect(x-6*CPS, y+7*CPS, 12*CPS, 3*CPS, out);
             break;
     }
 }
@@ -781,6 +895,20 @@ static void drawBoard() {
     }
 
     // Rank / file coords
+#ifdef DEVICE_MAXINE
+    // Maxine: size-2 text for the a-h / 8-1 labels so they read on
+    // the larger panel. Centered against the larger SQ/2 mid-points.
+    gfx->setTextSize(2);
+    gfx->setTextColor(COL_COORD);
+    for (int i = 0; i < 8; i++) {
+        // Files a-h along bottom
+        gfx->setCursor(BOARD_X + i*SQ + SQ/2 - 6, BOARD_Y + 8*SQ + 2);
+        gfx->print((char)('a' + i));
+        // Ranks 8-1 along left
+        gfx->setCursor(BOARD_X - 20, BOARD_Y + i*SQ + SQ/2 - 8);
+        gfx->print(8 - i);
+    }
+#else
     gfx->setTextSize(1);
     gfx->setTextColor(COL_COORD);
     for (int i = 0; i < 8; i++) {
@@ -791,9 +919,119 @@ static void drawBoard() {
         gfx->setCursor(BOARD_X - 10, BOARD_Y + i*SQ + SQ/2 - 4);
         gfx->print(8 - i);
     }
+#endif
 }
 
 static void drawPanel() {
+#ifdef DEVICE_MAXINE
+    // Maxine: panel is a horizontal strip BELOW the board, not a
+    // vertical strip beside it. Lay out the same fields left-to-right
+    // across the 480px width: turn indicator | AI | check status |
+    // captured pieces | controls hint.
+    gfx->fillRect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, COL_BG);
+    gfx->drawFastHLine(0, PANEL_Y, 480, 0x4208);
+
+    gfx->setTextSize(2);
+
+    // Turn indicator (leftmost)
+    gfx->setCursor(8, PANEL_Y + 6);
+    gfx->setTextColor(whiteToMove ? COL_WHITE_P : 0xAD55);
+    gfx->print(whiteToMove ? "WHITE" : "BLACK");
+    gfx->setTextColor(COL_TEXT);
+    gfx->print(" TURN");
+
+    // AI personality
+    gfx->setCursor(8, PANEL_Y + 30);
+    gfx->setTextColor(0x07FF);
+    gfx->print("AI:");
+    gfx->setTextColor(0xFD20);
+    gfx->setCursor(54, PANEL_Y + 30);
+    gfx->print(AI_NAMES[aiPersonality]);
+
+    // Check status (middle)
+    gfx->setTextSize(2);
+    if (whiteInCheck) {
+        gfx->setTextColor(COL_CHECK);
+        gfx->setCursor(200, PANEL_Y + 6);
+        gfx->print("W IN CHECK");
+    } else if (blackInCheck) {
+        gfx->setTextColor(COL_CHECK);
+        gfx->setCursor(200, PANEL_Y + 6);
+        gfx->print("B IN CHECK");
+    }
+
+    // Controls hint (right)
+    gfx->setTextSize(1);
+    gfx->setTextColor(0xAD55);
+    gfx->setCursor(340, PANEL_Y + 8);
+    gfx->print("TAP A PIECE THEN");
+    gfx->setCursor(340, PANEL_Y + 18);
+    gfx->print("TAP A SQUARE");
+    gfx->setCursor(340, PANEL_Y + 32);
+    gfx->print("A KEY = AI MODE");
+    gfx->setCursor(340, PANEL_Y + 42);
+    gfx->print("Q / EXIT = QUIT");
+    return;
+#endif
+
+#ifdef DEVICE_C28P
+    // C28P: 240x72 panel below the board. Horizontal layout, four
+    // zones top-to-bottom:
+    //    row 1 (y+4) : "WHITE TURN" / "BLACK TURN" (size-2 left)
+    //                  + check badge (size-2 right, red, if any)
+    //    row 2 (y+26): "AI: <name>" rendered as a TAPPABLE button.
+    //                  Tap zone = the full 240px row, ~22px tall.
+    //                  Tapping it cycles aiPersonality.
+    //    row 3 (y+52): "TAP PIECE > SQUARE" hint (size-1)
+    //    row 4 (y+62): "TAP TOP TO EXIT" hint (size-1)
+    gfx->fillRect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, COL_BG);
+    gfx->drawFastHLine(0, PANEL_Y, 240, 0x4208);
+
+    // Row 1 — turn indicator + check status
+    gfx->setTextSize(2);
+    gfx->setCursor(4, PANEL_Y + 4);
+    gfx->setTextColor(whiteToMove ? COL_WHITE_P : 0xAD55);
+    gfx->print(whiteToMove ? "WHITE" : "BLACK");
+    gfx->setTextColor(COL_TEXT);
+    gfx->print(" TURN");
+    if (whiteInCheck) {
+        gfx->setTextColor(COL_CHECK);
+        gfx->setCursor(150, PANEL_Y + 4);
+        gfx->print("CHECK!");
+    } else if (blackInCheck) {
+        gfx->setTextColor(COL_CHECK);
+        gfx->setCursor(150, PANEL_Y + 4);
+        gfx->print("CHECK!");
+    }
+
+    // Row 2 — AI personality button (tappable, cycles on tap).
+    // Draw it as a button (filled rect with border) so the user
+    // realizes it's interactive.
+    gfx->fillRect(2, PANEL_Y + 24, 236, 22, 0x2104);
+    gfx->drawRect(2, PANEL_Y + 24, 236, 22, 0x07FF);
+    gfx->setTextSize(2);
+    gfx->setTextColor(0x07FF);
+    gfx->setCursor(8, PANEL_Y + 28);
+    gfx->print("AI:");
+    gfx->setTextColor(0xFD20);
+    gfx->setCursor(46, PANEL_Y + 28);
+    gfx->print(AI_NAMES[aiPersonality]);
+    // Cycle hint (right side of button)
+    gfx->setTextSize(1);
+    gfx->setTextColor(0x8410);
+    gfx->setCursor(200, PANEL_Y + 32);
+    gfx->print("TAP");
+
+    // Row 3 + 4 — controls
+    gfx->setTextSize(1);
+    gfx->setTextColor(0xAD55);
+    gfx->setCursor(4, PANEL_Y + 52);
+    gfx->print("TAP PIECE > TAP SQUARE");
+    gfx->setCursor(4, PANEL_Y + 62);
+    gfx->print("TAP TOP STRIP TO EXIT");
+    return;
+#endif
+
     gfx->fillRect(PANEL_X, 0, PANEL_W, 240, COL_BG);
     gfx->drawFastVLine(PANEL_X-1, 0, 240, 0x4208);
 
@@ -869,12 +1107,59 @@ static void drawPanel() {
 }
 
 static void drawFull() {
+    // Chess is a full-screen app on every device — no chrome that
+    // any other layer is responsible for preserving — so a plain
+    // fillScreen is safe regardless of target.
     gfx->fillScreen(0x0000);
     drawBoard();
     drawPanel();
+#ifdef DEVICE_MAXINE
+    // Paint the tap-to-quit affordance in the top 30px header strip.
+    // Without this hint, users on Maxine have no visible way to leave
+    // chess before game-over (no physical keyboard, no dpad, no
+    // gamepad — only the touchscreen). Left-aligned "< EXIT" with a
+    // centered "CHESS" title makes the header read as intentional UI
+    // rather than dead space.
+    gfx->setTextSize(2);
+    gfx->setTextColor(0xAD55);
+    gfx->setCursor(8, 8);
+    gfx->print("< EXIT");
+    gfx->setTextColor(0xFFE0);
+    gfx->setCursor(200, 8);
+    gfx->print("CHESS");
+#endif
 }
 
 static void showMessage(const char* line1, const char* line2 = nullptr) {
+#ifdef DEVICE_MAXINE
+    // Maxine: scale the popup to be legible against the much larger
+    // board. Center horizontally inside the board area; size-3 title,
+    // size-2 subtitle. Wrapped in a block so the bx/by/bw/bh locals
+    // don't collide with the T-Deck path's same-named variables
+    // below — even though only one path runs at a time, the compiler
+    // sees both declarations in the same function scope.
+    {
+        const int bw = 360, bh = 130;
+        const int bx = (480 - bw) / 2;
+        const int by = (BOARD_Y + SQ*8 / 2) - bh/2;
+        gfx->fillRect(bx, by, bw, bh, 0x18C3);
+        gfx->drawRect(bx, by, bw, bh, 0xFFE0);
+        gfx->setTextSize(3);
+        gfx->setTextColor(0xFFE0);
+        int title_w = (int)strlen(line1) * 18;   // size-3 ~18px/char
+        gfx->setCursor(bx + (bw - title_w) / 2, by + 22);
+        gfx->print(line1);
+        if (line2) {
+            gfx->setTextSize(2);
+            gfx->setTextColor(0xFFFF);
+            int sub_w = (int)strlen(line2) * 12;
+            gfx->setCursor(bx + (bw - sub_w) / 2, by + 70);
+            gfx->print(line2);
+        }
+        delay(2500);
+    }
+    return;
+#endif
     int bx = BOARD_X + 10, by = BOARD_Y + 80;
     gfx->fillRect(bx, by, 190, 60, 0x18C3);
     gfx->drawRect(bx, by, 190, 60, 0xFFE0);
@@ -929,6 +1214,13 @@ static bool tryPlayerMove(int toRow, int toCol) {
 void run_chess() {
     aiPersonality = AI_CLUB; // Default: Club player
 
+    // Chess on every device is full-screen: no maxine_dpad_render()
+    // or c28p_dpad_render() call here. Every input is a tap, so
+    // there's no virtual dpad chrome to reserve a strip for. Compare
+    // pacman / galaga / pole_position which paint dpad chrome before
+    // entering their game loop because they need real-time
+    // directional input.
+
     while (true) { // New game loop
         initBoard();
         playerIsWhite = true;
@@ -954,12 +1246,42 @@ void run_chess() {
                     char k = get_keypress();
                     TrackballState tb = update_trackball_game();
 
-                    // Header tap = quit
+                    // Header tap = quit. Each device has its own hot
+                    // zone: T-Deck top 40px, C28P top 14px, Maxine
+                    // top 30px. Below that is either the board, the
+                    // gap, or the panel — taps there mean something
+                    // else (board = move, panel = AI cycle, etc).
                     int16_t tx, ty;
+#if defined(DEVICE_C28P)
+                    // C28P: top 14px strip is the quit hot zone.
+                    // Anything below is either the board or the panel.
+                    if (c28p_touch_read(&tx, &ty) && ty < 14) {
+                        // Debounce: wait for release before quitting.
+                        int16_t rx, ry;
+                        while (c28p_touch_read(&rx, &ry)) { delay(10); yield(); }
+                        quit = true; break;
+                    }
+#elif defined(DEVICE_MAXINE)
+                    // Maxine: top 30px strip is the quit hot zone.
+                    // The "< EXIT" hint painted by drawFull() lives
+                    // in this strip so the affordance is visible.
+                    // Using a fresh pair of locals (mqx/mqy) rather
+                    // than reusing tx/ty so this branch is self
+                    // contained and the board-tap branch below can
+                    // continue to use tx/ty for the T-Deck path.
+                    int16_t mqx, mqy;
+                    if (maxine_touch_read(&mqx, &mqy) && mqy < 30) {
+                        // Debounce: wait for release before quitting.
+                        int16_t rx, ry;
+                        while (maxine_touch_read(&rx, &ry)) { delay(10); yield(); }
+                        quit = true; break;
+                    }
+#else
                     if (get_touch(&tx, &ty) && ty < 40) {
                         while(get_touch(&tx,&ty)){delay(10);}
                         quit = true; break;
                     }
+#endif
                     if (k == 'q' || k == 'Q') { quit = true; break; }
 
                     // Gamepad HOME/START = quit
@@ -981,6 +1303,47 @@ void run_chess() {
 
                     // Touch on board = move cursor to tapped square and confirm
                     bool touchConfirm = false;
+#ifdef DEVICE_MAXINE
+                    // Maxine has no T-Deck-style touch driver; route through
+                    // maxine_touch_read instead. Tap inside the board area
+                    // moves the cursor to that square and confirms.
+                    int16_t mtx, mty;
+                    if (maxine_touch_read(&mtx, &mty) &&
+                        mtx >= BOARD_X && mty >= BOARD_Y &&
+                        mtx < BOARD_X + SQ*8 && mty < BOARD_Y + SQ*8) {
+                        // Debounce: wait for release
+                        int16_t dx, dy;
+                        while (maxine_touch_read(&dx, &dy)) { delay(5); yield(); }
+                        cursorCol = (mtx - BOARD_X) / SQ;
+                        cursorRow = (mty - BOARD_Y) / SQ;
+                        touchConfirm = true;
+                    }
+#elif defined(DEVICE_C28P)
+                    // C28P: tap inside the board area moves cursor and confirms.
+                    // Tap on the AI button row (PANEL_Y+24..PANEL_Y+45) cycles
+                    // the AI personality — since there's no 'A' key on this
+                    // device, the button is the only way to change difficulty.
+                    int16_t ctx, cty;
+                    if (c28p_touch_read(&ctx, &cty)) {
+                        // Board tap
+                        if (ctx >= BOARD_X && cty >= BOARD_Y &&
+                            ctx < BOARD_X + SQ*8 && cty < BOARD_Y + SQ*8) {
+                            int16_t rx, ry;
+                            while (c28p_touch_read(&rx, &ry)) { delay(5); yield(); }
+                            cursorCol = (ctx - BOARD_X) / SQ;
+                            cursorRow = (cty - BOARD_Y) / SQ;
+                            touchConfirm = true;
+                        }
+                        // AI cycle button tap
+                        else if (cty >= PANEL_Y + 24 && cty < PANEL_Y + 46) {
+                            int16_t rx, ry;
+                            while (c28p_touch_read(&rx, &ry)) { delay(5); yield(); }
+                            aiPersonality = (aiPersonality + 1) % 6;
+                            drawPanel();
+                            continue;
+                        }
+                    }
+#else
                     if (get_touch(&tx, &ty) && tx >= BOARD_X && ty >= BOARD_Y &&
                         tx < BOARD_X + SQ*8 && ty < BOARD_Y + SQ*8) {
                         while(get_touch(&tx,&ty)){delay(5);}
@@ -988,6 +1351,7 @@ void run_chess() {
                         cursorRow = (ty - BOARD_Y) / SQ;
                         touchConfirm = true;
                     }
+#endif
 
                     // Select / move — trackball click, SPACE, ENTER, or touch on board
                     bool confirm = tb.clicked || gamepad_pressed(GP_A) ||
@@ -1052,6 +1416,20 @@ void run_chess() {
                 }
 
                 // Show "thinking" indicator
+#ifdef DEVICE_MAXINE
+                // Maxine: panel sits below the board. Write thinking into
+                // the right portion of the panel where the controls hint
+                // lives (overwrite hint temporarily during AI think).
+                gfx->fillRect(340, PANEL_Y + 8, 140, 40, COL_BG);
+                gfx->setCursor(340, PANEL_Y + 14);
+                gfx->setTextColor(0xFD20);
+                gfx->setTextSize(2);
+                gfx->print("THINKING");
+                for (int d = 0; d < 3; d++) {
+                    gfx->print(".");
+                    delay(200);
+                }
+#else
                 gfx->setCursor(PANEL_X+2, 170);
                 gfx->setTextColor(0xFD20);
                 gfx->setTextSize(1);
@@ -1060,6 +1438,7 @@ void run_chess() {
                     gfx->print(".");
                     delay(200);
                 }
+#endif
 
                 Move ai = selectAIMove(BLACK);
                 if (ai.fromRow < 0) { gameOver = true; break; }
@@ -1074,15 +1453,28 @@ void run_chess() {
 
                 if (whiteInCheck) {
                     // Brief flash
+#ifdef DEVICE_MAXINE
+                    // No discrete CHECK badge on Maxine; the next drawPanel()
+                    // call paints "W IN CHECK" in red across the middle of
+                    // the panel strip. Just pause briefly so the player
+                    // notices the state change.
+                    delay(500);
+#else
                     gfx->setCursor(PANEL_X+2, 170);
                     gfx->fillRect(PANEL_X+2, 168, PANEL_W-4, 12, COL_BG);
                     gfx->setTextColor(COL_CHECK);
                     gfx->print("CHECK!");
                     delay(500);
+#endif
                 }
 
                 // Clear thinking indicator
+#ifdef DEVICE_MAXINE
+                // Restore the controls hint area
+                gfx->fillRect(340, PANEL_Y + 6, 140, 44, COL_BG);
+#else
                 gfx->fillRect(PANEL_X+2, 168, PANEL_W-4, 20, COL_BG);
+#endif
                 drawBoard();
                 drawPanel();
             }
@@ -1098,14 +1490,33 @@ void run_chess() {
             char k = get_keypress();
             TrackballState tb = update_trackball();
             int16_t tx, ty;
+#if defined(DEVICE_MAXINE)
+            // Maxine: any touch anywhere starts a new game.
+            if (k || tb.clicked || maxine_touch_read(&tx, &ty)) {
+                newGame = true; break;
+            }
+#elif defined(DEVICE_C28P)
+            // C28P: any tap restarts the game (matching T-Deck's
+            // behavior). The 10-second timeout is the only way out
+            // — if the player wants to leave chess after game-over,
+            // they just don't tap.
+            if (k || tb.clicked || c28p_touch_read(&tx, &ty)) {
+                newGame = true; break;
+            }
+#else
             if (k || tb.clicked || (get_touch(&tx,&ty) && ty < 40)) {
                 newGame = true; break;
             }
+#endif
             delay(50);
         }
         if (!newGame) break;
         gameOver = false;
     }
 
+    // Full-screen clear on exit on every device — chess never had
+    // any chrome below (Maxine) or beside (T-Deck) the board that
+    // the caller is responsible for preserving, so the cleanup is
+    // identical everywhere.
     gfx->fillScreen(0x0000);
 }

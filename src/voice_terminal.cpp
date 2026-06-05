@@ -16,15 +16,15 @@
 //    5. Play /tmp_tts.mp3 through speaker via ESP32-audioI2S
 //
 //  Per-device:
-//    C28P / Heltec V4 (portrait 240x320, ES8311, touch):
+//    C28P (portrait 240x320, ES8311, touch):
 //      - Mic capture via ES8311 ADC on PIN_I2S_DIN
 //      - Touch-and-hold big red button to record
 //    T-Deck Plus (landscape 320x240, ES7210 mic + ES8311 spk, keyboard):
 //      - Mic capture via separate ES7210 I2S pins (legacy)
-//      - SPACE key to record
+//      - R key to record
 //    T-LoRa Pager (landscape 480x222, ES8311, encoder + keyboard):
 //      - Mic capture via ES8311 ADC
-//      - Encoder click or 'r' key to record
+//      - R key to record
 //    Cardputer ADV (landscape 240x135, ES8311 via M5 library):
 //      - Mic capture NOT YET IMPLEMENTED — auto-falls-back to keyboard mode
 //
@@ -85,7 +85,7 @@ extern volatile bool wifi_in_use;
 #define VT_DMA_BUF_COUNT 8
 #define VT_DMA_BUF_LEN   1024
 #define VT_READ_BYTES    4096
-#define VT_MAX_REC_MS    8000UL   // 8 second cap
+#define VT_MAX_REC_MS    30000UL  // 30 second cap
 
 // Which I2S port the mic uses (TX speaker uses I2S_NUM_0 on most devices)
 #if defined(DEVICE_TDECK_PLUS)
@@ -202,9 +202,9 @@ static void vtDrawHeader() {
     gfx->print("< EXIT");
 }
 
-// Where the conversation area ends — record button on touch devices,
+// Where the conversation area ends — record button on the C28P,
 // status line on keyboard/button devices.
-#if defined(DEVICE_C28P) || defined(DEVICE_HELTEC_V4)
+#if defined(DEVICE_C28P)
   #define VT_CONV_BOTTOM   VT_RECBTN_Y
 #else
   #define VT_CONV_BOTTOM   VT_STATUS_Y
@@ -241,8 +241,8 @@ static void vtDrawConversation() {
 }
 
 static void vtDrawStatus(const String& msg, uint16_t color, bool recording) {
-#if defined(DEVICE_C28P) || defined(DEVICE_HELTEC_V4)
-    // Big record button (touch-and-hold) on portrait devices
+#if defined(DEVICE_C28P)
+    // Big record button (touch-and-hold) on the C28P.
     int btn_y = VT_RECBTN_Y;
     uint16_t fill = recording ? COL_RECORD : 0x18C3;
     uint16_t border = recording ? COL_RED : COL_DIM;
@@ -605,7 +605,7 @@ static void vtPlayTTS(const char* mp3Path) {
 //  PER-DEVICE RECORD TRIGGER
 // ─────────────────────────────────────────────
 
-#if defined(DEVICE_C28P) || defined(DEVICE_HELTEC_V4)
+#if defined(DEVICE_C28P)
 // Touch-and-hold the big record button
 static bool g_touchHeld = false;
 static bool touch_should_stop() {
@@ -634,22 +634,26 @@ static bool wait_for_record_press_and_record(const char* wavPath) {
 }
 #endif
 
+#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_TLORAPAGER)
+static uint32_t keyboardRecordStartMs = 0;
+#define VT_KEY_STOP_DEBOUNCE_MS 500UL
+#endif
+
 #if defined(DEVICE_TDECK_PLUS)
-// SPACE held = recording
-static bool space_should_stop() {
-    // get_keypress() is non-blocking; in v1 the SPACE was checked once
-    // and recording ran for a fixed window. Adapt: poll keyboard, stop
-    // when SPACE is no longer held. The original keyboard.cpp doesn't
-    // expose held-state cleanly; emulate with a short fixed window.
-    return false;  // recording runs until VT_MAX_REC_MS expires
+// R starts recording; a later R/Q press stops it, otherwise VT_MAX_REC_MS caps it.
+static bool tdeck_keyboard_should_stop() {
+    if (millis() - keyboardRecordStartMs < VT_KEY_STOP_DEBOUNCE_MS) return false;
+    char k = get_keypress();
+    return (k == 'r' || k == 'R' || k == 'q' || k == 'Q');
 }
 #endif
 
 #if defined(DEVICE_TLORAPAGER)
-// Encoder click or 'r' = start; release/timeout = stop
-static bool tlp_should_stop() {
+// R starts recording; a later R/back/quit press stops it.
+static bool tlp_keyboard_should_stop() {
+    if (millis() - keyboardRecordStartMs < VT_KEY_STOP_DEBOUNCE_MS) return false;
     PMNesInput input = pm_read_nes_input(true);
-    return !(input.a || input.key == 'r' || input.key == 'R');
+    return (input.quit || input.b || input.key == 'r' || input.key == 'R');
 }
 #endif
 
@@ -692,12 +696,17 @@ void run_voice_terminal() {
     }
 #endif
 
+#if defined(DEVICE_C28P)
+    const char* recordPrompt = "Touch to record";
+#else
+    const char* recordPrompt = "Press R to record";
+#endif
     vtAddLine("[READY]", vtKeyboardMode ?
               "Type prompt + ENTER" :
-              "Press to record");
+              recordPrompt);
     vtRedraw("Ready", COL_GREEN, false);
 
-#if defined(DEVICE_C28P) || defined(DEVICE_HELTEC_V4)
+#if defined(DEVICE_C28P)
     // Touch loop
     while (true) {
         int16_t tx, ty;
@@ -740,10 +749,11 @@ void run_voice_terminal() {
     while (true) {
         PMNesInput input = pm_read_nes_input(true);
         if (input.quit || input.b) break;
-        if (input.a || input.key == 'r' || input.key == 'R') {
+        if (input.key == 'r' || input.key == 'R') {
             vtRedraw("Recording...", COL_RECORD, true);
             const char* wav = "/vt_rec.wav";
-            if (vtRecord(wav, tlp_should_stop)) {
+            keyboardRecordStartMs = millis();
+            if (vtRecord(wav, tlp_keyboard_should_stop)) {
                 vtRedraw("Transcribing...", COL_AMBER, false);
                 String t = vtSpeechToText(wav);
                 sd.remove(wav);
@@ -765,14 +775,15 @@ void run_voice_terminal() {
         delay(30); yield();
     }
 #elif defined(DEVICE_TDECK_PLUS)
-    // SPACE-triggered v1-style loop (keep the existing behavior)
+    // R-triggered keyboard loop.
     while (true) {
         char k = get_keypress();
         if (k == 'q' || k == 'Q') break;
-        if (k == ' ' && !vtKeyboardMode) {
+        if ((k == 'r' || k == 'R') && !vtKeyboardMode) {
             vtRedraw("Recording...", COL_RECORD, true);
             const char* wav = "/vt_rec.wav";
-            if (vtRecord(wav, space_should_stop)) {
+            keyboardRecordStartMs = millis();
+            if (vtRecord(wav, tdeck_keyboard_should_stop)) {
                 vtRedraw("Transcribing...", COL_AMBER, false);
                 String t = vtSpeechToText(wav);
                 sd.remove(wav);
