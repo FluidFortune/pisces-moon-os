@@ -26,7 +26,7 @@
 #include <SD_MMC.h>           // SDIO 4-bit driver — C28P SD card lives on its own SDMMC peripheral, not SPI
 #endif
 #include <TinyGPSPlus.h>     
-#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE) || defined(DEVICE_C5)
 #include <Arduino_GFX_Library.h>
 #endif
 #ifdef DEVICE_TLORAPAGER
@@ -37,6 +37,14 @@
 #endif
 #ifdef DEVICE_MAXINE
     #include "maxine_boot.h"
+#endif
+
+#ifdef DEVICE_C5
+// C5 bring-up entry points live in c5_boot.cpp; no header file yet,
+// declared extern below at each call site. hal_c5.h supplies the
+// pin macros (PIN_LCD_*, PIN_TOUCH_*, PIN_SD_*, PIN_I2C_*) consumed
+// by the BOARD_* aliases in this file.
+#include "hal_c5.h"
 #endif
 #include <XPowersLib.h>
 #include <esp_task_wdt.h>    // WDT feed — prevents Guru Meditation during long setup()
@@ -201,6 +209,26 @@ const unsigned long WIFI_TIMEOUT_MS = 5000;  // 5 seconds max for autoconnect
 #define BOARD_I2C_SCL     PIN_TOUCH_SCL
 #endif // DEVICE_MAXINE
 
+#ifdef DEVICE_C5
+// NM-CYD-C5 (RockBase "Colorful") — ESP32-C5, single-core RISC-V.
+// ST7789 2.8" 240x320 (portrait via rotation), XPT2046 resistive touch
+// on SHARED SPI bus with LCD and SD. SPI Bus Treaty mutex required for
+// every bus access. Pin assignments confirmed from RockBase README
+// pinout table; LCD DC/RST/BL are CYD-family defaults pending demo
+// source verification.
+#define BOARD_TFT_BL      PIN_LCD_BL
+#define BOARD_TFT_DC      PIN_LCD_DC
+#define BOARD_TFT_CS      PIN_LCD_CS
+#define BOARD_TFT_MOSI    PIN_LCD_MOSI
+#define BOARD_TFT_MISO    PIN_LCD_MISO
+#define BOARD_TFT_SCK     PIN_LCD_SCK
+#define BOARD_TFT_RST     PIN_LCD_RST
+
+#define BOARD_SD_CS       PIN_SD_CS
+#define BOARD_I2C_SDA     PIN_I2C_SDA
+#define BOARD_I2C_SCL     PIN_I2C_SCL
+#endif // DEVICE_C5
+
 // --- DRIVER INSTANTIATION ---
 #ifdef DEVICE_TDECK_PLUS
 Arduino_DataBus *bus = new Arduino_HWSPI(BOARD_TFT_DC, BOARD_TFT_CS, BOARD_TFT_SCK, BOARD_TFT_MOSI, BOARD_TFT_MISO, &SPI, true);
@@ -246,6 +274,32 @@ Arduino_DataBus *bus = new Arduino_HWSPI(BOARD_TFT_DC, BOARD_TFT_CS,
                                           BOARD_TFT_MISO, &SPI, true);
 Arduino_GFX *gfx = new Arduino_ILI9341(bus, BOARD_TFT_RST,
                                         0 /* portrait */, true /* IPS */);
+#endif
+
+#ifdef DEVICE_C5
+// C5: ST7789 240×320, native portrait orientation. Shared SPI bus
+// carries LCD (CS=23) + XPT2046 touch (CS=1) + SD card (CS=10), all
+// on GPIO 6/2/7 — the SPI Bus Treaty mutex coordinates access.
+//
+// Rotation 0 = no rotation = native 240×320 portrait, USB-C at the
+// bottom (matches the C28P orientation). The XPT2046 touch driver
+// in c5_boot.cpp produces 240×320 portrait coords directly, so it
+// matches without further transformation. If the panel comes up
+// upside-down (USB-C at top), change rotation to 2 — the touch
+// driver's C5_ROTATE_TO_PORTRAIT constant would then need to swap
+// to a 180° transform to stay aligned.
+//
+// IPS=false: the NM-CYD-C5 panel is a TN panel, not IPS. Arduino_GFX's
+// IPS flag controls whether INVON (0x21) gets sent during init.
+// Setting IPS=true on a TN panel inverts the colors (black↔white,
+// red↔cyan, etc.) — which is exactly the symptom we hit at first
+// boot. Keep this false on the NM-CYD-C5.
+Arduino_DataBus *bus = new Arduino_HWSPI(BOARD_TFT_DC, BOARD_TFT_CS,
+                                          BOARD_TFT_SCK, BOARD_TFT_MOSI,
+                                          BOARD_TFT_MISO, &SPI, true);
+Arduino_GFX *gfx = new Arduino_ST7789(bus, BOARD_TFT_RST,
+                                       0 /* native portrait, no rotation */,
+                                       false /* TN panel, not IPS */);
 #endif
 
 #ifdef DEVICE_MAXINE
@@ -599,7 +653,11 @@ static void drawBootHeader() {
     gfx->setCursor(4, 4);
     gfx->print("PISCES MOON OS");
     gfx->setTextColor(BOOT_SECTION);
+#ifdef DEVICE_C5
+    const char *bios = "BIOS v1.2.0 / ESP32-C5";
+#else
     const char *bios = "BIOS v1.2.0 / ESP32-S3";
+#endif
     gfx->setCursor(max(96, W - (int)strlen(bios) * 6 - 4), 4);
     gfx->print(bios);
     bootY = 18;
@@ -1633,6 +1691,82 @@ void setup() {
     c28p_setup();
 #endif // DEVICE_C28P
 
+#ifdef DEVICE_C5
+    // ── C5 display init ────────────────────────────────────────
+    // NM-CYD-C5: ST7789 240×320 portrait on a SHARED SPI bus that also
+    // carries the XPT2046 resistive touch IC and the SD card. Three CS
+    // lines (23 LCD, 1 touch, 10 SD) selectively address each device.
+    //
+    // Pre-flight: drive ALL chip-selects HIGH so no device contests the
+    // bus while SPI.begin() configures the pads. Then SPI.begin() with
+    // explicit pin assignments — the C5's GPIO matrix can remap freely,
+    // but Arduino-ESP32 won't infer the right pins on this novel chip
+    // without being told.
+    pinMode(BOARD_TFT_CS, OUTPUT); digitalWrite(BOARD_TFT_CS, HIGH);
+    pinMode(PIN_TOUCH_CS, OUTPUT); digitalWrite(PIN_TOUCH_CS, HIGH);
+    pinMode(BOARD_SD_CS,  OUTPUT); digitalWrite(BOARD_SD_CS,  HIGH);
+
+    SPI.begin(BOARD_TFT_SCK, BOARD_TFT_MISO, BOARD_TFT_MOSI);
+    pinMode(BOARD_TFT_BL, OUTPUT);
+    digitalWrite(BOARD_TFT_BL, LOW);   // off during flush — prevents white flash
+
+    gfx->begin();
+    gfx->fillScreen(0x0000);
+    gfx->fillScreen(0x0000);
+    delay(50);
+    digitalWrite(BOARD_TFT_BL, HIGH);  // backlight on after init
+    Serial.println("[HAL] C5 display init complete (ST7789, shared SPI)");
+    Serial.flush();
+
+    // ── DIAGNOSTIC: narrow down post-display-init crash ───────────────
+    // First-boot of the NM-CYD-C5 was crashing immediately after the
+    // display-init print with a load-access-fault at address 0x3 deep in
+    // ROM. Pinpointing required these step-by-step prints. They cost
+    // nothing at runtime (a few µs of UART per boot) and the diagnostic
+    // detail saves a lot of pain when we eventually port the C5 to other
+    // CYD-family boards. Leave them in.
+    Serial.println("[C5-DIAG] step 1: post-display-init");
+    Serial.flush();
+    delay(10);
+
+    // I2C bus on QWIIC connector (CN1) — GPIO 9 SDA / 8 SCL. The Wire
+    // bus is independent of the SPI bus, so no Treaty implications. The
+    // XPT2046 touch IC is on SPI, NOT I2C (unlike the C28P's FT6336G),
+    // so this bus is just for whatever the operator hangs off QWIIC.
+    //
+    // ⚠ GPIO 9 is ALSO the BOOT button on the NM-CYD-C5 (PIN_BOOT_BTN=9
+    // in platformio.ini) and is a boot strapping pin on ESP32-C5. Re-
+    // configuring it as I2C SDA after the boot ROM has used it for boot-
+    // mode selection has been observed to crash the arduino-esp32 3.3.6
+    // Wire driver on this chip. We gate Wire.begin() behind a build flag
+    // so the build can choose: enable I2C on QWIIC and accept that the
+    // boot button is gone, or skip I2C entirely (default).
+    //
+    // Define PISCES_C5_ENABLE_I2C in build_flags to opt in.
+#ifdef PISCES_C5_ENABLE_I2C
+    Serial.println("[C5-DIAG] step 2a: about to Wire.begin(9, 8)");
+    Serial.flush();
+    Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
+    Serial.println("[C5-DIAG] step 2b: Wire.begin returned");
+    Serial.flush();
+    Wire.setClock(400000);
+    Serial.println("[C5-DIAG] step 2c: Wire.setClock returned");
+    Serial.flush();
+#else
+    Serial.println("[C5-DIAG] step 2: skipping Wire.begin (QWIIC I2C disabled —"
+                   " build with -DPISCES_C5_ENABLE_I2C to enable)");
+    Serial.flush();
+#endif
+
+    // Hand off to c5_boot.cpp for board probe + XPT2046 touch init.
+    Serial.println("[C5-DIAG] step 3: about to call c5_setup()");
+    Serial.flush();
+    extern void c5_setup();
+    c5_setup();
+    Serial.println("[C5-DIAG] step 4: c5_setup() returned");
+    Serial.flush();
+#endif // DEVICE_C5
+
 #ifdef DEVICE_MAXINE
     // ── Maxine display init (ST7262 RGB parallel panel) ──────────────
     // RGB panels have no SPI CS / backlight-flush dance like the SPI
@@ -1817,7 +1951,11 @@ void setup() {
 #endif
     esp_task_wdt_reset();
 
+#ifdef DEVICE_C5
+    drawBootLine("00:03", "CPU ESP32-C5 240MHz", nullptr, 0, "DONE");
+#else
     drawBootLine("00:03", "CPU ESP32-S3 240MHz", nullptr, 0, "DONE");
+#endif
     delay(80);
 #ifdef DEVICE_TDECK_PLUS
     drawBootLine("00:04", "I2C SDA:18 SCL:8",    nullptr, 0, "OK");
@@ -2152,7 +2290,7 @@ void setup() {
         delay(80);
     }
 #elif defined(DEVICE_C28P)
-    // ── C28P: SD card on dedicated SDIO 4-bit peripheral ───────────────
+    // ── C28P: SD card on dedicated SDIO 4-bit peripheral ─────────────
     // The C28P routes its SD card to the ESP32-S3's SDMMC controller via
     // CLK/CMD/D0-D3 (pins 38/40/39/41/48/47), NOT through SPI. SdFat 2.2.3
     // doesn't speak SDIO on ESP32-S3, so the global `SdFat sd` is left
@@ -2188,6 +2326,37 @@ void setup() {
         drawBootLine("00:07", "VAULT INIT", "SD_MMC", 2, "SKIPPED");
         delay(80);
     }
+#elif defined(DEVICE_C5)
+    // ── C5: SD on shared SPI bus (CS=10) ──────────────────────────────
+    // SD shares GPIO 6/2/7 with the LCD and the XPT2046 touch IC; the
+    // Treaty mutex coordinates access at runtime. We mount through SdFat
+    // (the global `sd`) so the rest of Pisces Moon's filesystem layer
+    // sees the card on the standard interface.
+    //
+    // Pre-flight: re-assert every CS HIGH so the card doesn't pick up
+    // residual transactions from the LCD init, then mount with up to 3
+    // attempts (matches the Cardputer pattern — cards can need a moment
+    // after the bus first carries traffic).
+    bool sdMounted = false;
+    for (int attempt = 1; attempt <= 3 && !sdMounted; attempt++) {
+        digitalWrite(BOARD_TFT_CS, HIGH);
+        digitalWrite(PIN_TOUCH_CS, HIGH);
+        digitalWrite(BOARD_SD_CS,  HIGH);
+        SdSpiConfig cfg(BOARD_SD_CS, SHARED_SPI, SD_SCK_MHZ(10), &SPI);
+        sdMounted = sd.begin(cfg);
+        if (!sdMounted && attempt < 3) {
+            Serial.printf("[SD] C5 mount attempt %d/3 failed — retrying\n", attempt);
+            delay(500);
+        }
+    }
+    g_sd_ready = sdMounted;
+    drawBootLine("00:06", "SD_CARD0 GPIO:10", nullptr, sdMounted ? 0 : 3, sdMounted ? "OK" : "FAIL");
+    delay(80);
+    if (sdMounted) {
+        bool dbOk = init_database();
+        drawBootLine("00:07", "VAULT INIT", nullptr, dbOk ? 0 : 3, dbOk ? "OK" : "FAIL");
+        delay(80);
+    }
 #else
     // ── T-LoraPager: defer SD mount entirely ──────────────────────────────────────
     // T-LoraPager has four peripherals on one shared SPI bus and the
@@ -2207,7 +2376,7 @@ void setup() {
 
     drawBootSection("PROCESS SPAWN");
 
-#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE) || defined(DEVICE_C5)
     // Cardputer ADV (no PSRAM): defer wardrive task spawn until user
     // explicitly launches the wardrive app. The task's NimBLE init
     // claims ~48KB of internal SRAM which the device cannot afford
@@ -2218,6 +2387,13 @@ void setup() {
     // C28P / Maxine (desk kiosk): no GPS, no mobility — wardrive is
     // not part of the kiosk focus and the symbol isn't linked in
     // these builds.
+    //
+    // C5 (single-core kiosk): the dual-band scanner is fleet-unique
+    // and we DO want it as a launcher-driven app, but the task is
+    // not spawned at boot — single-core means an always-on radio
+    // task would compete with the UI before the user has even tapped
+    // a tile. Spawn lazily when the user enters the 5G SCAN or
+    // WARDRIVE app, same pattern as the other kiosks.
     drawBootLine("00:08", "WARDRIVE_CORE",         nullptr, 2, "DEFERRED");
     delay(60);
 #else
@@ -2230,7 +2406,7 @@ void setup() {
     // wardrive owns BLE startup/order.
     drawBootLine("00:09", "GAMEPAD_BLE",           nullptr, 2, "SKIPPED");
 
-#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE) || defined(DEVICE_C5)
     // ── Cardputer ADV: SKIP Gemini boot-time init ────────────────────
     // The Gemini client allocates HTTPS context, JSON history buffer,
     // and NoSQL "gemini" category at init — ~15KB total. On the no-
@@ -2253,7 +2429,7 @@ void setup() {
 
     // CRITICAL: render line FIRST, then call auto_connect_wifi() wrapper
     // WiFi SDK calls corrupt GFX cursor if text follows on same line
-#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE) || defined(DEVICE_C5)
     // ── Cardputer ADV / C28P: SKIP autoconnect ───────────────────────
     // On the no-PSRAM Cardputer, WiFi STA mode consumes ~52KB and
     // bringing it up at boot leaves insufficient memory for the
@@ -2289,11 +2465,12 @@ void setup() {
     esp_task_wdt_reset();
 
     delay(200);
-#if !defined(DEVICE_C28P) && !defined(DEVICE_MAXINE)
+#if !defined(DEVICE_C28P) && !defined(DEVICE_MAXINE) && !defined(DEVICE_C5)
     // Ghost Engine (Core 0 background task) — spawned on devices that
-    // run wardrive. On C28P / Maxine (no GPS, no field intelligence
-    // focus, wardrive.cpp not in their src_filter), the Engine is not
-    // spawned and the wardrive_active flag is not defined.
+    // run wardrive. On C28P / Maxine / C5 (no GPS, no field intelligence
+    // focus, OR single-core), the Engine is not spawned at boot. The C5
+    // single-core variant lives in c5_wardrive_engine.cpp and is
+    // launched only when the user enters the 5G SCAN / WARDRIVE app.
     xTaskCreatePinnedToCore(core0GhostTask, "GhostTask", 10000, NULL, 1, &GhostTask, 0);
     wardrive_active = true;   // Ghost Engine starts immediately — never stops
     drawBootLine("00:12", "CORE_0_GHOST",          nullptr, 1, "ACTIVE");
@@ -2330,7 +2507,7 @@ void setup() {
     // C28P: Ghost Partition is not part of the kiosk threat model
     // (no field-intelligence use case on a desk fixture). The
     // ghost_partition.cpp file is excluded from the C28P src_filter.
-#if !defined(DEVICE_C28P) && !defined(DEVICE_MAXINE)
+#if !defined(DEVICE_C28P) && !defined(DEVICE_MAXINE) && !defined(DEVICE_C5)
     ghost_partition_run_pin_screen();
 #endif
     esp_task_wdt_reset();
@@ -2347,6 +2524,13 @@ void loop() {
     // Maxine uses its own touch launcher (maxine_boot.cpp), scaled to
     // 480x800. Never returns.
     maxine_launcher();
+#elif defined(DEVICE_C5)
+    // C5 uses its own touch launcher (c5_boot.cpp), 240×320 portrait
+    // via 90° rotation. XPT2046 resistive touch on shared SPI. Never
+    // returns — single-core means the launcher loop owns the main
+    // thread and the wardrive task time-slices around it.
+    extern void c5_launcher();
+    c5_launcher();
 #else
     run_launcher();
 #endif

@@ -23,6 +23,7 @@
 //    T-LoraPager:   LCD + LoRa + SD + NFC        (4)
 //    Cardputer ADV: LCD + LoRa + SD (when ready) (3)
 //    C28P:          LCD + SDIO                   (2) — no LoRa, no NFC
+//    C5:            LCD + XPT2046 touch + SD     (3) — ALL on one SPI
 //
 //  Plus Ghost Engine Core 0 contention on all devices.
 //  The Ghost Engine is always running. The Treaty is why
@@ -242,9 +243,11 @@ static inline void xl9555_boot_sequence() {
     !defined(DEVICE_TLORAPAGER) && \
     !defined(DEVICE_CARDPUTER_ADV) && \
     !defined(DEVICE_C28P) && \
-    !defined(DEVICE_MAXINE)
+    !defined(DEVICE_MAXINE) && \
+    !defined(DEVICE_C5)
   #error "No device target defined. Set DEVICE_TDECK_PLUS, \
-DEVICE_TLORAPAGER, DEVICE_CARDPUTER_ADV, DEVICE_C28P, or DEVICE_MAXINE in platformio.ini."
+DEVICE_TLORAPAGER, DEVICE_CARDPUTER_ADV, DEVICE_C28P, DEVICE_MAXINE, \
+or DEVICE_C5 in platformio.ini."
 #endif
 
 #endif // SPI_TREATY_H

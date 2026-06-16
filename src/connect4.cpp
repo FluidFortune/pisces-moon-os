@@ -21,6 +21,10 @@
 #include "c28p_dpad.h"
 extern bool c28p_touch_read(int16_t* x, int16_t* y);
 #endif
+#ifdef DEVICE_C5
+#include "c5_dpad.h"
+extern bool c5_touch_read(int16_t* x, int16_t* y);
+#endif
 #ifdef DEVICE_MAXINE
 #include "maxine_dpad.h"
 extern bool maxine_touch_read(int16_t* x, int16_t* y);
@@ -36,7 +40,7 @@ extern Arduino_GFX *gfx;
 static constexpr int VIEW_W = 240, VIEW_H = 135;
 #elif defined(DEVICE_TLORAPAGER)
 static constexpr int VIEW_W = 480, VIEW_H = 222;
-#elif defined(DEVICE_C28P)
+#elif defined(DEVICE_C28P) || defined(DEVICE_C5)
 static constexpr int VIEW_W = 240, VIEW_H = 200;
 #elif defined(DEVICE_MAXINE)
 static constexpr int VIEW_W = 480, VIEW_H = 520;
@@ -46,7 +50,7 @@ static constexpr int VIEW_W = 320, VIEW_H = 240;
 
 static int vx() { int w = gfx->width(); return (w > VIEW_W) ? (w - VIEW_W) / 2 : 0; }
 static int vy() {
-#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_C28P) || defined(DEVICE_C5) || defined(DEVICE_MAXINE)
     return 0;
 #else
     int h = gfx->height(); return (h > VIEW_H) ? (h - VIEW_H) / 2 : 0;
@@ -225,6 +229,9 @@ void run_connect4() {
 #ifdef DEVICE_C28P
     c28p_dpad_render();
 #endif
+#ifdef DEVICE_C5
+    c5_dpad_render();
+#endif
 #ifdef DEVICE_MAXINE
     maxine_dpad_render();
 #endif
@@ -254,10 +261,12 @@ void run_connect4() {
                 delay(120);
             }
 
-#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_C28P) || defined(DEVICE_C5) || defined(DEVICE_MAXINE)
             int16_t tx, ty;
 #ifdef DEVICE_C28P
             bool t = c28p_touch_read(&tx, &ty);
+#elif defined(DEVICE_C5)
+            bool t = c5_touch_read(&tx, &ty);
 #else
             bool t = maxine_touch_read(&tx, &ty);
 #endif

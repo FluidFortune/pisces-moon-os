@@ -505,7 +505,170 @@ Single-bus devices (C28P, T-LoRa Pager, Cardputer ADV, Maxine) are unchanged —
 - **`nosql_remove_entry()`** — the Notes/Contacts/Calendar delete model uses a parallel `*_tombstones` category as a workaround for NoSQL's append-only API. A real per-entry remove would retire the tombstone pattern entirely.
 - **Factory reset wipe list** — the new `notes_tombstones / contacts_tombstones / calendar_tombstones` categories should be added to `nosql_clear_category()`'s wipe list so leftover tombstones don't survive a reset and confuse fresh entries that land on the same abs_idx.
 - **Heltec V4** — still pending hardware bring-up.
-- **ESP32-C5 board** — acquired, single-core RISC-V variant planning queued.
+- **ESP32-C5 board** — acquired, single-core RISC-V variant planning queued. *(→ brought up in the 2026-06-09 addendum below; this item is now closed.)*
+
+---
+
+## Addendum — 2026-06-09 (session: NM-CYD-C5 bring-up + fleet-wide WiFi UX)
+
+Full bring-up of the NM-CYD-C5 (RockBase "Colorful") as a fleet-class kiosk target, plus a cross-device WiFi UX overhaul that closes two long-standing gaps in the OS: touch kiosks couldn't enter WiFi credentials without a phone, and keyboard devices couldn't get past captive portals because they have no browser. Both problems are now solved in v1.2.1.
+
+The C5 is the first RISC-V board in the fleet (single-core 240 MHz, contrasted with the dual-core Xtensa S3 family on T-Deck Plus / T-LoRa Pager / Cardputer ADV / C28P / Maxine) and the first board with dual-band Wi-Fi 6 — the rest of the fleet's radios are 2.4 GHz only. That 5 GHz capability is exposed as a CYBER → 5G SCAN sub-tile, giving the operator visibility into the AP population every other Pisces Moon device is blind to.
+
+### New device target — NM-CYD-C5 (`[env:c5]`)
+
+- **SoC:** ESP32-C5-WROOM-1 (single-core RISC-V HP core, 240 MHz), 16 MB flash, 8 MB PSRAM.
+- **Radio:** Wi-Fi 6 dual-band (2.4 + 5 GHz), Bluetooth LE 5.3, IEEE 802.15.4.
+- **Display:** 2.8" ST7789 240×320 portrait IPS panel, shared SPI bus.
+- **Touch:** XPT2046 resistive controller on SPI (CS=1, IRQ pulled up).
+- **Storage:** MicroSD on shared SPI (CS=10) via SdFat.
+- **Form factor:** desk-fixture / kiosk, identical shell silhouette to the C28P. Hosts the C5 chip set including a CN1 "extend" connector for I2C peripherals on GPIO 9/8.
+- **Single-core implication:** the Ghost Engine's dual-core wardrive architecture (radio task on CPU0, UI on CPU1) does not apply directly. The C5 wardrive engine (`c5_wardrive_engine.cpp`) is a cooperative single-task loop that yields between scan windows.
+- **PSRAM build flag handling:** RISC-V toolchain rejects `-mfix-esp32-psram-cache-issue` (Xtensa erratum, doesn't apply on RISC-V). New `build_flags_psram_riscv` block in `[common]` provides the same `BOARD_HAS_PSRAM` / `CONFIG_SPIRAM_USE_MALLOC=1` flags minus the erratum flag. Documented inline in `platformio.ini`.
+
+### Touch driver (`src/c5_boot.cpp`)
+
+XPT2046 resistive touch via shared SPI. Every read takes the SPI Treaty mutex, defends against stale LCD / SD CS lines, and validates with a two-read stability gate (±20 ADC counts on each axis) before returning.
+
+Calibration is **edge-based, not range-based.** Earlier prototype used `RAW_X_MIN / RAW_X_MAX` plus a separate `ROTATE_TO_PORTRAIT` flag — a representation that couldn't cleanly express the NM-CYD-C5's inverted X axis (raw ADC counts DOWN as you move right, not up). The new representation stores four constants — `RAW_X_AT_LEFT / _AT_RIGHT / _AT_TOP / _AT_BOTTOM` — the raw ADC value at each physical screen edge. The mapping in `c5_touch_read()` is then a single signed linear interpolation per axis: if `RAW_X_AT_LEFT > RAW_X_AT_RIGHT` (as it is on this panel), the denominator is negative and the integer math gives the right answer without a separate rotation flag.
+
+Hardcoded defaults are from corner-tap calibration on Eric's panel (TL: x=3533 y=339 / TR: x=496 y=351 / BL: x=3592 y=3607 / BR: x=515 y=3676 averaged per edge):
+
+```
+RAW_X_AT_LEFT   = 3562    // raw_x at pixel_x = 0
+RAW_X_AT_RIGHT  =  505    // raw_x at pixel_x = SCREEN_W-1
+RAW_Y_AT_TOP    =  345    // raw_y at pixel_y = 0
+RAW_Y_AT_BOTTOM = 3641    // raw_y at pixel_y = SCREEN_H-1
+```
+
+Other C5 units may need their own corner-tap calibration via SYSTEM → CALIBRATE — these values are a reasonable starting point but every resistive panel is slightly different.
+
+### Launcher (`src/c5_boot.cpp`)
+
+12-tile 3×4 portrait grid, fleet-parity with the C28P + Maxine layouts:
+
+```
+Row 0: SYSTEM   | CYBER     | WEATHER
+Row 1: UTILITIES| PERSONAL  | REFERENCE
+Row 2: GPS      | RSS       | CLASSICS
+Row 3: ARCADE   | PUZZLES   | TETRIS   (HERO)
+```
+
+C5-specific substitutions from the C28P template: slot 6 is GPS (C28P has MEDIA — no audio hardware on the C5), slot 7 is RSS (C28P has WEATHER, which moved to slot 2). 5G SCAN — the C5's signature feature — is a sub-item under CYBER alongside WARDRIVE since both are WiFi-scanning workflows.
+
+### 5G SCAN (`src/c5_boot.cpp::c5_run_5g_scan`)
+
+File-static helper under CYBER. Saves current WiFi mode + band mode on entry, sets `WIFI_BAND_MODE_5G_ONLY` via `esp_wifi_set_band_mode`, runs a blocking `WiFi.scanNetworks(false, true)` (typically 2-3 s), renders results sorted by RSSI desc with the same color-coded RSSI bands as wardrive (>-55 green, >-70 yellow, >-82 amber, else red). REFRESH re-scans; EXIT restores the prior mode and band setting before returning to the launcher.
+
+This is intentionally a simpler UI than the full async wardrive engine — it answers the single question *"what 5 GHz networks are around me right now"*. The continuous-log + PMU1-fan-out flow stays in `c5_wardrive_engine.cpp`.
+
+### All 16 games — C5 touch-dpad ports
+
+Every game in the fleet now has a C5 branch alongside its C28P branch. Pattern is the same across all 16: extend the existing `#elif defined(DEVICE_C28P)` viewport block to `|| defined(DEVICE_C5)` (same 240×320 panel + 240×200 game viewport + 240×120 dpad strip), include `c5_dpad.h` alongside `c28p_dpad.h`, swap `c28p_dpad_render()` for `c5_dpad_render()` under `#ifdef DEVICE_C5`, and where the game needs direct touch (paddle drag, swipe, long-press, etc.) dispatch the touch reader via `#ifdef`:
+
+- Touch-needing games (paddle/swipe/tap): breakout, 2048, minesweeper, connect4, simon, solitaire, chess.
+- Dpad-only games: snake, asteroids, space invaders, frogger, pacman, galaga, pole position, mario bros, donkey kong.
+
+**Chess** got a small helper refactor (`kiosk_touch()` dispatching C28P ↔ C5) to avoid ~120 lines of `#ifdef` duplication across the chess UI's many tap-handlers.
+
+**Mario Bros + Donkey Kong** use SD_MMC on C28P (its SD wire is on the dedicated SDIO peripheral) but the rest of the fleet — including C5 — uses SdFat on shared SPI. Both files keep the existing `#ifdef DEVICE_C28P → SD_MMC` / `#else → SdFat` split. The C5 falls into the `#else` branch automatically because its SD is on the same SPI bus as the LCD and touch controller.
+
+### Touch keyboard WiFi setup — cross-kiosk (`src/kiosk_wifi_setup.cpp`)
+
+Started as a C5-specific `c5_wifi_setup.cpp` (the SYSTEM → WIFI stub needed to do something useful), then promoted to a fleet-wide kiosk helper covering C5, C28P, and Maxine. The original `c5_wifi_setup.cpp` is archived at `docs/archive/c5_wifi_setup.cpp.v1.2.1-pre-generalize` for posterity.
+
+Device differences are absorbed by two dispatch blocks at the top of the file:
+
+1. **Touch reader dispatch.** `kiosk_touch_read()` is a static inline that resolves to `c5_touch_read` / `c28p_touch_read` / `maxine_touch_read` per `#ifdef`. All three drivers return portrait pixel coordinates via the same `(int16_t*, int16_t*) → bool` signature, so the inline is trivially uniform.
+2. **`K_SCALE` multiplier.** Set to `1` on C5 and C28P (both 240×320 panels), `2` on Maxine (480×800). Every geometry constant and every `gfx->setTextSize()` call multiplies by `K_SCALE`, so Maxine renders the same 5-row keyboard at doubled key size + doubled text size + doubled gaps. No separate layout pass for Maxine.
+
+**Two screens, same on every device:**
+
+*Screen 1 — Scan list.* Active-connection banner at the top. Dual-band scan on C5 (2.4 + 5 GHz in one list), single-band 2.4 GHz on C28P + Maxine. Results sorted by RSSI desc, asterisk (`*`) prefix on SSIDs the `/wifi.cfg` keyring already knows the password for. SCAN AGAIN refreshes; DISCONNECT / FORGET appear when associated. Open networks tapped from the list skip the keyboard and connect directly. Known-password networks pre-fill the password entry so reconnect is one tap of DONE.
+
+*Screen 2 — Password entry with on-screen keyboard.* Five rows: numbers (10×24), top letters (10×24), middle letters (9×24 indented), SHIFT + 7 mid keys + BKSP (40+7×22+46), and SYM-toggle + `.` + SPACE + `@` + DONE (40+24+104+24+48). SHIFT is one-shot (auto-releases after one character). SYM swaps the alphabet rows for symbol pages (`! @ # $ % ^ & * ( )` / `- _ = + ; : ' " ?` / `\ | / { } [ ]`); the numbers row stays put across both pages. Password field defaults to masked dots with a SHOW/HIDE toggle on the right side of the input box — changes color when toggled so shoulder-surfers can't read what was typed if the user briefly peeked.
+
+DONE calls `WiFi.begin()` and polls `WiFi.status()` for up to 12 seconds with a dot-spinner animation. On success, `save_wifi_config()` persists the credential via the device-agnostic `wifi_manager` API and the flow returns to the scan list with the new network active. On failure, the user is bounced back into the password screen with their typed password preserved — a single-character typo is one tap away from fixed, not a full retype.
+
+**Wiring:**
+- C5 SYSTEM submenu's `WIFI` item now calls `kiosk_run_wifi_setup()` directly. A backwards-compat alias `void c5_run_wifi_setup() { kiosk_run_wifi_setup(); }` preserves the existing forward decl in `c5_boot.cpp` so v1.3 can drop the alias without urgency.
+- C28P `c28p_run_wifi_setup()` (in `c28p_apps.cpp`) gained a MANUAL button (cyan) between CONNECT and PORTAL, re-spacing the four buttons to 32px height with 6px gaps. MANUAL routes to `kiosk_run_wifi_setup()`.
+- Maxine `maxine_run_wifi_setup()` (in `maxine_apps.cpp`) gained a 4th MANUAL button alongside CONNECT / PORTAL / FORGET, re-spaced to 60px height with 10px gaps. MANUAL routes through the same shared file with `K_SCALE=2` selected automatically.
+
+All three kiosks now have first-class home-network setup that doesn't require a phone. The existing PORTAL (WiFiManager phone-driven AP config) is preserved on C28P + Maxine as an alternative for users who prefer it.
+
+### QR phone bridge for captive portals (`src/wifi_share_qr.cpp`)
+
+New app for the three keyboard-equipped devices (T-Deck Plus, T-LoRa Pager, Cardputer ADV). Solves the *Starbucks WiFi* problem: the device can JOIN an open SSID just fine from its physical keyboard via `wifi_connect.cpp`, but it can't authenticate a captive-portal browser-bridge because it has no browser.
+
+**The fix:** generate a STANDARD WiFi-config QR code from the live connection (falling back to the keyring), display it on-screen, let the user scan it on their phone. The phone joins the same network independently, handles the captive portal in its own browser, and from there the user can either just use the phone for whatever they actually needed the internet for, or turn on the phone's hotspot and re-point the device at the phone's tethered SSID (no captive portal in the way of that).
+
+**QR payload format** (industry-standard, recognized by iOS Camera and Android Settings):
+
+```
+WIFI:S:<ssid>;T:<WPA|WEP|nopass>;P:<password>;;
+```
+
+`T:WPA` covers WPA / WPA2 / WPA3 — phones figure out which actual protocol to use during the join. `T:nopass` marks open networks.
+
+**Library:** `ricmoo/QRCode @ ^0.0.1` (header-only C library, ~106 bytes per v3 QR). Added to `lib_deps` for `[env:tdeck_plus]`, `[env:tlorapager]`, and `[env:cardputer_adv]`. Touch-kiosk builds don't compile `wifi_share_qr.cpp` (it's outside their `build_src_filter` and gated by `#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_TLORAPAGER) || defined(DEVICE_CARDPUTER_ADV)` anyway), so the QRCode library is never linked on C5/C28P/Maxine.
+
+**Version 4 QR (33×33 modules)** at ECC_LOW gives ~114-char alphanumeric capacity — comfortable headroom for a 32-char SSID + 63-char WPA password + format overhead (~110 chars). Per-device module size: 5 px on T-Deck Plus (320×240) and T-LoRa Pager (480×222), 3 px on Cardputer ADV (240×135 — tight but still scannable from a phone held ~6 inches away). 4-module quiet-zone padding on a white background per QR spec.
+
+**Discovery:** the WIFI SCANNER's header bar now reads `WIFI SCANNER | R:RESCAN S:QR | <exit-key>`. Press `S` (or `s`) from the scanner to invoke `run_wifi_share_qr()`. Touch-kiosks haven't gotten the QR bridge yet — deferred until someone actually hits a captive portal on a C5 / C28P / Maxine in the wild.
+
+### `platformio.ini` summary of touched envs
+
+- **New** `[env:c5]` with full src_filter (12-tile launcher app list), `build_flags_psram_riscv`, custom platform URL (`pioarduino/platform-espressif32 v55.03.36`) for ESP32-C5 support, and `+<kiosk_wifi_setup.cpp>` in the filter.
+- `[env:c28p]` gained `+<kiosk_wifi_setup.cpp>`.
+- `[env:maxine]` gained `+<kiosk_wifi_setup.cpp>`.
+- `[env:tdeck_plus]` lib_deps gained `ricmoo/QRCode @ ^0.0.1`.
+- `[env:tlorapager]` now carries its own `lib_deps` block (`${common.lib_deps}` + `ricmoo/QRCode @ ^0.0.1`) where previously it inherited common implicitly via `extends = common`. The local block continues to chain through `${common.lib_deps}` so nothing is dropped.
+- `[env:cardputer_adv]` lib_deps gained `ricmoo/QRCode @ ^0.0.1`.
+
+### Carried forward to v1.2.2 (or v1.3 proper)
+
+- **C5↔Elecrow PMU1 physical cable** — waiting on P5 connector identification (JST-GH 1.25mm vs JST-PH 2.0mm). Wiring map known (C5 GPIO5→Elecrow white/RX, C5 GPIO4←Elecrow yellow/TX, GND straight, never bridge VCC).
+- **`c5_data_reader.cpp`** to unstub SURVIVAL / MEDICAL / HISTORY under REFERENCE. `data_reader.cpp` uses `get_touch / get_keypress / update_trackball` unconditionally; needs a touch-only port.
+- **WEATHER location-picker UI** — currently hardcoded Pasadena, CA in `weather.cpp::DEFAULT_LAT/LON`. The on-screen keyboard component shipped in this addendum makes a proper picker straightforward in v1.2.2.
+- **Calibration persistence to NVS** on C5 — currently the user must paste serial `[CAL]` output back into `c5_boot.cpp` source. A Settings tile that writes the four edge constants to NVS would mean no source edits on inter-board swaps.
+- **Touch-kiosk QR bridge** — the captive-portal QR feature is keyboard-device-only in v1.2.1. Adding it to C5 / C28P / Maxine is a small new file + a menu item once a user hits a real captive portal on a touch kiosk.
+- **v1.3 cleanup:** drop the `c5_run_wifi_setup` backward-compat alias in `kiosk_wifi_setup.cpp` once the C5 launcher calls `kiosk_run_wifi_setup` directly.
+
+### Fleet link + parity audit (same session)
+
+A static cross-build audit (every launcher-referenced symbol mapped to its defining file, checked against each env's `build_src_filter`) closed out three gaps:
+
+- **Maxine missing `ereader.cpp`** — the E-READER entry was pre-staged in `maxine_open_tools` on 2026-06-01 but the src_filter entry never landed, producing the `undefined reference to run_ereader()` link error on the next fresh Maxine build. Fixed: `+<ereader.cpp>` added to the Maxine filter.
+- **`c5_run_5g_scan` extern/static mismatch** in `c5_boot.cpp` — forward-declared `extern`, defined `static` in the same TU. Compile error on C5. Fixed by removing the bogus forward decl (the static definition precedes all its callers).
+- **Maxine missing DONKEY KONG** — `donkey_kong.cpp` has carried full Maxine support (480×520 viewport, `maxine_dpad_render`, Maxine game-over paths) since the 2026-06-01 arcade rewrite, but was never added to the Maxine filter or GAMES menu. Fixed: filter entry + menu row + header include. Maxine GAMES is now 17 titles, matching C28P/C5 coverage.
+
+Parity additions for the C5 (both reuse existing portrait code, same pattern as weather.cpp):
+
+- **RSS is now real on C5.** `rss.cpp`'s portrait branch extended from `C28P || HELTEC_V4` to include `DEVICE_C5`, with a `p_touch()` inline dispatching `c5_touch_read` vs `c28p_touch_read` (mirroring weather.cpp's approach). `+<rss.cpp>` added to the C5 filter (`pm_rss_cache.cpp` was already there, so offline headline caching works day one). Launcher slot 7 now calls `run_rss()`; the RSS stub is deleted.
+- **ABOUT is now real on C5.** Compact 240×320 device-info screen (`c5_run_about` in c5_boot.cpp) showing version, hardware summary, the 5 GHz fleet-first line, and authorship — parity with the C28P/Maxine ABOUT screens. Stub deleted.
+
+Remaining intentional per-device exclusions, confirmed as agreed (not gaps):
+
+| App | Excluded on | Reason |
+|---|---|---|
+| MEDIA (recorder + library) | Maxine, C5 | No microphone (Maxine), no audio path at all (C5: PM_NO_AUDIO_IN/OUT) |
+| AUDIO player | Maxine, C5 | Maxine is tone-out only; C5 has no audio hardware |
+| AI voice terminal | Maxine, C5 | Requires mic + speaker + Gemini client wiring |
+| MIC TEST | Maxine, C5 | No microphone |
+| CALIBRATE | C28P, Maxine | Capacitive touch — no calibration needed (resistive-only tool) |
+| 5G SCAN | everything except C5 | 2.4 GHz-only radios |
+| GPS tile | — | C5-only tile, stubbed pending PMU1/P4 link hardware (weekend item) |
+| WARDRIVE on C5 | — | Stub pending single-core engine UI; `c5_wardrive_engine.cpp` scaffold exists |
+| SURVIVAL/MEDICAL/HISTORY on C5 | — | Pending `c5_data_reader.cpp` touch port (documented in platformio.ini DEFERRED block) |
+
+Keyboard devices (T-Deck Plus, T-LoRa Pager, Cardputer ADV) compile all of `src/` with no filter, so they are structurally immune to the missing-filter-entry failure mode that bit Maxine.
+
+### Closing v1.2.1
+
+v1.2.1 ships with every touch kiosk (C5, C28P, Maxine) having a real on-screen keyboard for WiFi setup, every keyboard device (T-Deck Plus, T-LoRa Pager, Cardputer ADV) having a captive-portal answer, and the fleet at full parity on the core WiFi setup story across six supported devices. The C5 brings RISC-V and dual-band Wi-Fi 6 into the family as net-new capabilities no other Pisces Moon device has.
+
+This is the natural endpoint for v1.2.1. Feature work for v1.2.2 starts from the carried-forward list above; bug fixes that turn up during field testing of this addendum's changes land as point releases in the 1.2.1.x lane if needed.
 
 ---
 

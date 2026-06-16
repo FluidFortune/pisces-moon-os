@@ -92,6 +92,9 @@
 #include <FS.h>
 #include <SD_MMC.h>
 #else
+#ifdef DEVICE_C5
+#include "c5_dpad.h"
+#endif
 #include <SdFat.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -163,11 +166,12 @@ static constexpr int PLAT_YS[N_PLATS] = { 50, 88, 126, 164, 210 };
 static constexpr int POW_X    = (VIEW_W - POW_W) / 2;
 // POW sits low & centered, punched from the bottom floor (arcade).
 static constexpr int POW_Y    = PLAT_YS[N_PLATS - 1] - PLAYER_H - POW_H - 6;
-#elif defined(DEVICE_C28P)
+#elif defined(DEVICE_C28P) || defined(DEVICE_C5)
 // C28P 240×320 portrait. Game viewport is the top 200px (the bottom
 // 120px holds the virtual D-pad chrome). HUD lives in a 14px strip
 // inside the dpad's exit bar at y=0..13; the play field starts at
 // y=14. Five platforms fit comfortably in 186px of play area.
+// C5 uses identical geometry — same panel, same dpad layout.
 static constexpr int VIEW_W   = 240;
 static constexpr int VIEW_H   = 200;
 static constexpr int HUD_H    = 14;
@@ -232,33 +236,43 @@ static constexpr int SPAWN_LX = PIPE_W + 4;                 // left pipe column
 static constexpr int SPAWN_RX = VIEW_W - PIPE_W - 4;        // right pipe column
 
 // ─────────────────────────────────────────────
-//  PLATFORM GAPS (arcade-style descent)
+//  PLATFORM LAYOUT (authentic Mario Bros board)
 //
-//  Each floating platform has a hole. An entity whose CENTER passes
-//  over the hole falls through to the platform below. This is the
-//  defining 1983-arcade behavior: enemies emerge from the top pipes
-//  and snake DOWN through the structure, giving the player a chance
-//  to flip them from below at every level — and the player can drop
-//  through gaps to chase them. The bottom floor has NO gap.
+//  The arcade board is NOT a stack of identical full-width slabs.
+//  Tiers ALTERNATE horizontally:
+//    • EVEN tiers — two side platforms, solid out to the screen
+//      edges, with an open gap in the CENTER.
+//    • ODD tiers  — one platform in the CENTER, with open gaps at
+//      BOTH ends (the screen edges are open here).
+//  The bottom floor (last tier) is solid all the way across.
 //
-//  Gaps alternate sides by platform parity so a walker descends in a
-//  zig-zag instead of straight down one column (even rows: hole to
-//  the right of center; odd rows: hole to the left).
+//  Because the center platform is WIDER than the center gap above
+//  it, an entity descends in a zig-zag: it walks off a side platform
+//  into the center gap and lands on the center platform below, then
+//  walks off the center platform's end and lands on a side platform
+//  below, and so on — exactly the arcade flow. Enemies emerge from
+//  the top pipes onto the top side platforms and snake down; the
+//  player can drop through the same gaps to chase them.
 // ─────────────────────────────────────────────
-static constexpr int PLAT_GAP_W = ENEMY_W * 3;
+static constexpr float GAP_SIDE_FRAC    = 0.40f;  // side platforms: 0..0.40W and 0.60W..W
+static constexpr float CENTER_HALF_FRAC = 0.25f;  // center platform: 0.25W..0.75W
 
-static inline int plat_gap_left(int i) {
-    int left_pos  = VIEW_W / 4 - PLAT_GAP_W / 2;          // ~25% across
-    int right_pos = (VIEW_W * 3) / 4 - PLAT_GAP_W / 2;    // ~75% across
-    return (i & 1) ? left_pos : right_pos;
-}
+static inline bool tier_is_center(int i) { return (i & 1) != 0; }
 
-// True if a given center-x sits over the hole in floating platform i.
-// The bottom floor (i == N_PLATS-1) is solid and always returns false.
-static inline bool over_gap(float center_x, int plat_i) {
-    if (plat_i < 0 || plat_i >= N_PLATS - 1) return false;
-    float gl = (float)plat_gap_left(plat_i);
-    return center_x >= gl && center_x < gl + (float)PLAT_GAP_W;
+// Is center_x over SOLID platform on tier i?  false = over a gap or
+// off the end (the entity falls). The bottom floor is solid across.
+static inline bool plat_solid_at(int i, float center_x) {
+    if (i < 0 || i >= N_PLATS) return false;
+    if (i == N_PLATS - 1) return true;                       // solid floor
+    float w = (float)VIEW_W;
+    if (tier_is_center(i)) {
+        float cl = w * (0.5f - CENTER_HALF_FRAC);
+        float cr = w * (0.5f + CENTER_HALF_FRAC);
+        return center_x >= cl && center_x < cr;              // solid center only
+    }
+    float gl = w * GAP_SIDE_FRAC;
+    float gr = w * (1.0f - GAP_SIDE_FRAC);
+    return center_x < gl || center_x >= gr;                  // solid sides only
 }
 
 // ─────────────────────────────────────────────
@@ -276,7 +290,7 @@ static int vx() {
     return (w > VIEW_W) ? (w - VIEW_W) / 2 : 0;
 }
 static int vy() {
-#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_C28P) || defined(DEVICE_C5) || defined(DEVICE_MAXINE)
     return 0;
 #else
     int h = gfx->height();
@@ -641,7 +655,7 @@ static int find_platform_crossed(float prev_y, float curr_y, int h, float center
     int   best   = -1;
     float best_py = 1e9f;
     for (int i = 0; i < N_PLATS; i++) {
-        if (over_gap(center_x, i)) continue;   // fall through the hole
+        if (!plat_solid_at(i, center_x)) continue;   // over a gap / off the end
         float py = (float)PLAT_YS[i];
         // Feet crossed PLAT_YS[i] going down this frame iff prev
         // was at-or-above py and curr is at-or-below py.
@@ -903,7 +917,7 @@ static void update_player(float dt, const PMNesInput& in) {
         // hole we're under is skipped — the head passes through it.
         float pcx = p_x + (float)PLAYER_W / 2;
         for (int i = 0; i < N_PLATS - 1; i++) {  // exclude floor
-            if (over_gap(pcx, i)) continue;
+            if (!plat_solid_at(i, pcx)) continue;
             float plat_bottom = (float)PLAT_YS[i] + (float)PLAT_T;
             if (prev_head_y >= plat_bottom && p_y < plat_bottom) {
                 apply_platform_punch(i);
@@ -998,7 +1012,7 @@ static void update_enemy(int slot, float dt) {
     // Walk-off-gap: a grounded walker whose center is over the hole in
     // its platform drops through it, descending the structure exactly
     // like the arcade. The bottom floor has no hole (over_gap false).
-    if (e.plat >= 0 && over_gap(e.x + (float)ENEMY_W / 2, e.plat)) {
+    if (e.plat >= 0 && !plat_solid_at(e.plat, e.x + (float)ENEMY_W / 2)) {
         e.plat = -1;
     }
 
@@ -1098,23 +1112,27 @@ static void draw_background_static() {
         gfx->fillRect(vx() + VIEW_W - 3, scr_y((float)HUD_H), 3, pipe_h, COL_PIPE_DARK);
         gfx->fillRect(vx() + VIEW_W - PIPE_W, scr_y((float)HUD_H), PIPE_W, 4, COL_PIPE_DARK);
     }
-    // Floating platforms (not the floor). Each has a hole (see
-    // plat_gap_left / over_gap) so enemies snake down the structure
-    // and the player can drop through to chase them — so each platform
-    // is drawn as TWO segments with the gap left empty between them.
+    // Floating platforms (not the floor). Authentic Mario Bros layout:
+    // tiers alternate between two side platforms (even tiers — solid to
+    // the edges, center gap) and one center platform (odd tiers — open
+    // gaps at both ends), per plat_solid_at(). Drawing and collision
+    // share that one definition, so a hole is exactly where it looks.
     uint16_t pa = ice_active ? COL_ICE : COL_PLATFORM_A;
     uint16_t pb = ice_active ? 0x65BF : COL_PLATFORM_B;
     for (int i = 0; i < N_PLATS - 1; i++) {
-        int y  = scr_y((float)PLAT_YS[i]);
-        int gl = plat_gap_left(i);          // gap left edge (game x)
-        int gr = gl + PLAT_GAP_W;           // gap right edge (game x)
-        // Left segment: [0, gl)
-        if (gl > 0) {
+        int y = scr_y((float)PLAT_YS[i]);
+        if (tier_is_center(i)) {
+            // One centered platform, open gaps at both ends.
+            int cl = (int)((float)VIEW_W * (0.5f - CENTER_HALF_FRAC));
+            int cr = (int)((float)VIEW_W * (0.5f + CENTER_HALF_FRAC));
+            gfx->fillRect(vx() + cl, y, cr - cl, PLAT_T, pa);
+            gfx->drawFastHLine(vx() + cl, y + PLAT_T - 1, cr - cl, pb);
+        } else {
+            // Two side platforms, solid to the screen edges, center gap.
+            int gl = (int)((float)VIEW_W * GAP_SIDE_FRAC);
+            int gr = (int)((float)VIEW_W * (1.0f - GAP_SIDE_FRAC));
             gfx->fillRect(vx(), y, gl, PLAT_T, pa);
             gfx->drawFastHLine(vx(), y + PLAT_T - 1, gl, pb);
-        }
-        // Right segment: [gr, VIEW_W)
-        if (gr < VIEW_W) {
             gfx->fillRect(vx() + gr, y, VIEW_W - gr, PLAT_T, pa);
             gfx->drawFastHLine(vx() + gr, y + PLAT_T - 1, VIEW_W - gr, pb);
         }
@@ -1246,7 +1264,7 @@ static bool wait_for_start() {
     gfx->print(title);
     gfx->setTextSize(1);
     gfx->setTextColor(0xFFFF);
-#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_C28P) || defined(DEVICE_C5) || defined(DEVICE_MAXINE)
     const char* sub = "TAP A TO START";
 #else
     const char* sub = "PRESS A / SPACE TO START";
@@ -1300,6 +1318,9 @@ void run_mario_bros() {
 #ifdef DEVICE_C28P
     c28p_dpad_render();
 #endif
+#ifdef DEVICE_C5
+    c5_dpad_render();
+#endif
 #ifdef DEVICE_MAXINE
     maxine_dpad_render();
 #endif
@@ -1309,7 +1330,7 @@ void run_mario_bros() {
     // Title screen — bail out cleanly if the player quits before
     // starting the run.
     if (!wait_for_start()) {
-#if defined(DEVICE_C28P)
+#if defined(DEVICE_C28P) || defined(DEVICE_C5)
         gfx->fillRect(0, 0, VIEW_W, VIEW_H, 0);   // game viewport only
 #elif defined(DEVICE_MAXINE)
         gfx->fillRect(0, 0, VIEW_W, VIEW_H, 0);
@@ -1391,7 +1412,7 @@ void run_mario_bros() {
     pm_game_audio_stop();
     show_game_over();
 
-#if defined(DEVICE_C28P)
+#if defined(DEVICE_C28P) || defined(DEVICE_C5)
     gfx->fillRect(0, 0, VIEW_W, VIEW_H, 0);
 #elif defined(DEVICE_MAXINE)
     gfx->fillRect(0, 0, VIEW_W, VIEW_H, 0);

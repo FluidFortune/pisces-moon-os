@@ -136,6 +136,13 @@
 #include "pm_input.h"
 #include <NimBLEDevice.h>
 #include <NimBLEScan.h>
+#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_TLORAPAGER) || defined(DEVICE_CARDPUTER_ADV)
+// LoRa integration — third radio observed by the wardrive task.
+// Headers brought in only on devices that physically have an SX1262.
+#include <SPI.h>
+#include <RadioLib.h>
+#include "pm_lora_pins.h"
+#endif
 #ifdef DEVICE_CARDPUTER_ADV
 #include <esp_err.h>
 #include <esp_event.h>
@@ -769,6 +776,297 @@ static void flushBLEQueue(const char* log_file) {
     if (flushed > 0) vTaskDelay(pdMS_TO_TICKS(1));
 }
 
+// ─────────────────────────────────────────────────────────────
+//  wardrive_log_observation() — public single-row append for
+//  non-WiFi/BLE sources (the RF Sniffer's LoRa/Meshtastic rows).
+//
+//  Writes into the SAME /wardrive_NNNN.csv session file as the WiFi
+//  and BLE writers, in the identical WiGLE-style row format, under the
+//  same SPI Bus Treaty mutex. Timestamp, lat/lon and altitude come from
+//  the live GPS so the row is consistent with the rest of the session
+//  and only lands when a fix is present. Creates/rotates the session
+//  file lazily via ensure_session_file() if a session isn't open yet
+//  (e.g. the RF Sniffer is the first thing the user opened on Cardputer,
+//  where the Ghost Engine task isn't spawned at boot).
+// ─────────────────────────────────────────────────────────────
+bool wardrive_log_observation(const char* mac, const char* ssid,
+                              const char* authMode, int channel,
+                              int rssi, const char* type) {
+    if (sd_in_use) return false;
+    if (!gps.location.isValid()) return false;     // wardrive rows are GPS-tagged
+    if (!ensure_session_file()) return false;       // create/rotate if needed
+    if (!spi_mutex) return false;
+    if (xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+
+    bool ok = false;
+    FsFile file = sd.open(_current_log_file, O_WRITE | O_APPEND);
+    if (file) {
+        file.printf("%s,%s,%s,%s,%d,%d,%.6f,%.6f,%.1f,%d,%s\n",
+            mac, ssid, authMode, gps_timestamp().c_str(),
+            channel, rssi,
+            gps.location.lat(), gps.location.lng(),
+            gps.altitude.meters(), 10, type);
+        file.close();
+        ok = true;
+    }
+    xSemaphoreGiveRecursive(spi_mutex);
+    return ok;
+}
+
+#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_TLORAPAGER) || defined(DEVICE_CARDPUTER_ADV)
+// ─────────────────────────────────────────────────────────────
+//  LoRa observation — third radio in the wardrive task
+//
+//  Passive Meshtastic LongFast receiver. The SX1262 is initialized once
+//  when the task is first armed (lazy, so a wardrive-deferred Cardputer
+//  boot doesn't pay for it until the user enters WarDrive), runs in
+//  promiscuous receive (no dest filter, no dedup), and emits one CSV
+//  row per heard packet via wardrive_log_observation() as Type=LORA.
+//
+//  This RX path is INDEPENDENT of the WiFi/BLE toggle. The SX1262 sits
+//  on its own SPI bus (or shares with SD via the Treaty mutex on
+//  Cardputer); it never competes with the WiFi scanner or NimBLE for
+//  airtime. The task drains the DIO1-flagged interrupt each loop pass
+//  and continues whatever WiFi/BLE work it was doing.
+//
+//  Meshtastic header (16 bytes little-endian) is the same struct used
+//  by mesh_messenger.cpp — we only read the cleartext header (origin
+//  NodeID, hop_limit/hop_start, channel hash). No payload decryption.
+//
+//  Per-node throttle: in a dense mesh a single node can emit several
+//  packets per second. The CSV writer is throttled per-node by
+//  WARDRIVE_LORA_PER_NODE_MS to keep the session log readable.
+// ─────────────────────────────────────────────────────────────
+#ifdef DEVICE_CARDPUTER_ADV
+extern SPIClass cardputerSdSPI;   // HSPI bus shared with SD on Cardputer
+#endif
+
+// Region LongFast default frequencies. US default; expand via build
+// flag later if needed. Same modem params as mesh_messenger.cpp.
+#define WARDRIVE_LORA_FREQ_MHZ   906.875f
+#define WARDRIVE_LORA_BW_KHZ     250.0f
+#define WARDRIVE_LORA_SF         11
+#define WARDRIVE_LORA_CR         5         // 4/5
+#define WARDRIVE_LORA_SYNC       0x2B      // Meshtastic
+#define WARDRIVE_LORA_PREAMBLE   16
+#define WARDRIVE_LORA_TX_UNUSED  2         // never keyed; begin() needs a value
+
+// Per-node throttle and table size. Sized down on no-PSRAM Cardputer.
+#ifdef DEVICE_NO_PSRAM
+  #define WARDRIVE_LORA_MAX_NODES 24
+#else
+  #define WARDRIVE_LORA_MAX_NODES 96
+#endif
+#define WARDRIVE_LORA_PER_NODE_MS 5000UL   // re-log a given node every 5s
+
+// Meshtastic packet header (cleartext, 16 bytes little-endian).
+struct __attribute__((packed)) WdMeshHeader {
+    uint32_t dest;
+    uint32_t from;
+    uint32_t id;
+    uint8_t  flags;       // [2:0]=hop_limit, [3]=want_ack, [4]=via_mqtt, [7:5]=hop_start
+    uint8_t  channel;
+    uint8_t  nextHop;
+    uint8_t  relayNode;
+};
+
+static SPISettings   lora_spi_settings(2000000, MSBFIRST, SPI_MODE0);
+static Module*       lora_module       = nullptr;
+static SX1262*       lora_radio        = nullptr;
+static volatile bool lora_rx_flag      = false;
+static bool          lora_ready        = false;
+static bool          lora_init_tried   = false;
+static uint32_t      lora_my_node_id   = 0;
+static uint32_t      lora_pkt_total    = 0;
+
+struct WdLoraThrottle {
+    uint32_t nodeId;
+    uint32_t lastLogMs;
+};
+static WdLoraThrottle lora_throttle[WARDRIVE_LORA_MAX_NODES];
+static int            lora_throttle_count = 0;
+
+static void IRAM_ATTR wdLoraRxISR() { lora_rx_flag = true; }
+
+static uint32_t wdLoraSelfNodeId() {
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_BT);
+    return ((uint32_t)mac[2] << 24) | ((uint32_t)mac[3] << 16) |
+           ((uint32_t)mac[4] << 8)  |  (uint32_t)mac[5];
+}
+
+// Returns true if this node should be logged now (and updates its
+// throttle slot). False if it was logged too recently or the table is
+// full. The table is small enough that a linear scan is cheap.
+static bool wdLoraShouldLog(uint32_t nodeId) {
+    uint32_t now = millis();
+    for (int i = 0; i < lora_throttle_count; i++) {
+        if (lora_throttle[i].nodeId == nodeId) {
+            if (now - lora_throttle[i].lastLogMs < WARDRIVE_LORA_PER_NODE_MS) {
+                return false;
+            }
+            lora_throttle[i].lastLogMs = now;
+            return true;
+        }
+    }
+    if (lora_throttle_count < WARDRIVE_LORA_MAX_NODES) {
+        lora_throttle[lora_throttle_count].nodeId = nodeId;
+        lora_throttle[lora_throttle_count].lastLogMs = now;
+        lora_throttle_count++;
+        return true;
+    }
+    // Table full — reuse the oldest slot.
+    int oldest = 0;
+    for (int i = 1; i < lora_throttle_count; i++) {
+        if ((int32_t)(lora_throttle[i].lastLogMs - lora_throttle[oldest].lastLogMs) < 0)
+            oldest = i;
+    }
+    lora_throttle[oldest].nodeId = nodeId;
+    lora_throttle[oldest].lastLogMs = now;
+    return true;
+}
+
+// Lazy radio bring-up. Returns true if the SX1262 is alive and armed
+// for receive. Idempotent: subsequent calls after a successful init
+// are no-ops. A single failed attempt is remembered so we don't pound
+// the bus retrying every loop pass; if init fails (most common cause:
+// no LoRa module is wired on this particular T-Deck) the wardrive task
+// continues without LoRa and the CSV simply contains no LORA rows.
+static bool wdLoraInit() {
+    if (lora_ready) return true;
+    if (lora_init_tried) return false;
+    lora_init_tried = true;
+
+#ifdef DEVICE_CARDPUTER_ADV
+    lora_module = new Module(PM_LORA_CS, PM_LORA_IRQ, PM_LORA_RST, PM_LORA_BUSY,
+                             cardputerSdSPI, lora_spi_settings);
+#else
+    lora_module = new Module(PM_LORA_CS, PM_LORA_IRQ, PM_LORA_RST, PM_LORA_BUSY,
+                             SPI, lora_spi_settings);
+#endif
+    lora_radio = new SX1262(lora_module);
+
+    if (!spi_mutex || xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        Serial.println("[WARDRIVE/LORA] Radio init: SPI mutex timeout");
+        delete lora_radio;  lora_radio  = nullptr;
+        delete lora_module; lora_module = nullptr;
+        return false;
+    }
+    int st = lora_radio->begin(WARDRIVE_LORA_FREQ_MHZ, WARDRIVE_LORA_BW_KHZ,
+                               WARDRIVE_LORA_SF, WARDRIVE_LORA_CR,
+                               WARDRIVE_LORA_SYNC, WARDRIVE_LORA_TX_UNUSED,
+                               WARDRIVE_LORA_PREAMBLE);
+    if (st != RADIOLIB_ERR_NONE) {
+        xSemaphoreGiveRecursive(spi_mutex);
+        Serial.printf("[WARDRIVE/LORA] Radio init failed: %d (no LoRa hardware?)\n", st);
+        delete lora_radio;  lora_radio  = nullptr;
+        delete lora_module; lora_module = nullptr;
+        return false;
+    }
+    lora_radio->setDio2AsRfSwitch(true);
+    lora_radio->setCurrentLimit(140.0f);
+    lora_radio->setRxBoostedGainMode(true);
+    lora_radio->setPacketReceivedAction(wdLoraRxISR);
+    lora_rx_flag = false;
+    int rxs = lora_radio->startReceive();
+    xSemaphoreGiveRecursive(spi_mutex);
+    if (rxs != RADIOLIB_ERR_NONE) {
+        Serial.printf("[WARDRIVE/LORA] startReceive failed: %d\n", rxs);
+        return false;
+    }
+    lora_my_node_id = wdLoraSelfNodeId();
+    lora_ready = true;
+    Serial.printf("[WARDRIVE/LORA] Radio ready. %.3f MHz SF%d BW%.0fk — self !%08x\n",
+                  WARDRIVE_LORA_FREQ_MHZ, WARDRIVE_LORA_SF,
+                  WARDRIVE_LORA_BW_KHZ, (unsigned)lora_my_node_id);
+    return true;
+}
+
+static void wdLoraDeinit() {
+    if (lora_radio) {
+        lora_radio->clearPacketReceivedAction();
+        lora_rx_flag = false;
+        if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            lora_radio->standby();
+            xSemaphoreGiveRecursive(spi_mutex);
+        }
+        delete lora_radio; lora_radio = nullptr;
+    }
+    if (lora_module) { delete lora_module; lora_module = nullptr; }
+    lora_ready = false;
+    lora_init_tried = false;
+    lora_throttle_count = 0;
+    lora_pkt_total = 0;
+}
+
+// Drain whatever the SX1262 has buffered. Bounded by RFS_DRAIN_PER_FRAME
+// to keep one busy mesh from monopolizing the loop. Each accepted packet
+// becomes a wardrive_log_observation() call (which itself is gated on
+// GPS fix, SD readiness, and the per-node throttle).
+static void wdLoraDrain() {
+    if (!lora_ready || !lora_radio) return;
+#ifdef DEVICE_NO_PSRAM
+    const int max_per_call = 4;
+#else
+    const int max_per_call = 10;
+#endif
+    for (int pass = 0; pass < max_per_call; pass++) {
+        if (!lora_rx_flag) break;
+        lora_rx_flag = false;
+
+        if (!spi_mutex || xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+            lora_rx_flag = true;     // bus busy — try again next loop
+            break;
+        }
+        uint8_t buf[256];
+        size_t rxLen = lora_radio->getPacketLength();
+        size_t readLen = (rxLen > 0) ? min(rxLen, sizeof(buf)) : sizeof(buf);
+        int st = lora_radio->readData(buf, readLen);
+        int   rssi = 0;
+        float snr  = 0.0f;
+        if (st == RADIOLIB_ERR_NONE || st == RADIOLIB_ERR_CRC_MISMATCH) {
+            rssi = (int)lora_radio->getRSSI();
+            snr  = lora_radio->getSNR();
+        }
+        lora_radio->startReceive();   // re-arm immediately
+        xSemaphoreGiveRecursive(spi_mutex);
+
+        if (st != RADIOLIB_ERR_NONE || rxLen <= sizeof(WdMeshHeader) || rxLen > sizeof(buf))
+            continue;
+
+        const WdMeshHeader* hdr = (const WdMeshHeader*)buf;
+        uint32_t from = hdr->from;
+        if (from == 0 || from == lora_my_node_id) continue;   // skip self / null
+
+        lora_pkt_total++;
+
+        if (!wdLoraShouldLog(from)) continue;
+
+        int hopLimit = hdr->flags & 0x07;
+        int hopStart = (hdr->flags >> 5) & 0x07;
+        int hops = hopStart - hopLimit; if (hops < 0) hops = 0;
+        bool direct = (hops == 0);
+
+        // Format for wardrive CSV:
+        //   MAC   = 00:00:aa:bb:cc:dd  (origin NodeID padded to 6 octets)
+        //   SSID  = !aabbccdd          (or "[RELAY] !aabbccdd" when hops>0)
+        //   Auth  = LORA
+        //   Chan  = Meshtastic channel hash
+        //   Type  = LORA
+        char mac[18];
+        snprintf(mac, sizeof(mac), "00:00:%02x:%02x:%02x:%02x",
+                 (unsigned)((from >> 24) & 0xFF), (unsigned)((from >> 16) & 0xFF),
+                 (unsigned)((from >>  8) & 0xFF), (unsigned)( from        & 0xFF));
+        char ssid[24];
+        if (direct) snprintf(ssid, sizeof(ssid), "!%08x",          (unsigned)from);
+        else        snprintf(ssid, sizeof(ssid), "[RELAY] !%08x",  (unsigned)from);
+
+        wardrive_log_observation(mac, ssid, "LORA", (int)hdr->channel, rssi, "LORA");
+        (void)snr;     // SNR is not part of the WiGLE schema; reserved for future
+    }
+}
+#endif  // SX1262 LoRa devices only
+
 void wardrive_task(void *pvParameters) {
 #ifdef DEVICE_TDECK_PLUS
     // T-Deck: GPIO 10 = BOARD_POWERON, drives the screen and PMU rail.
@@ -901,6 +1199,15 @@ void wardrive_task(void *pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(100));
 #endif
 
+    // LoRa receiver — lazy init alongside the WiFi+BLE radios. On a
+    // device with no SX1262 wired (some T-Deck Plus variants) this
+    // call returns false and the wardrive task continues WiFi+BLE
+    // only. Done OUTSIDE the WiFi/BLE coex path because LoRa is its
+    // own radio and doesn't share a bus contention story with them.
+#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_TLORAPAGER) || defined(DEVICE_CARDPUTER_ADV)
+    wdLoraInit();
+#endif
+
     for (;;) {
         // ── Teardown check ───────────────────────────────────────
         // wardrive_teardown() (called from wifi_mode.cpp when switching
@@ -917,6 +1224,11 @@ void wardrive_task(void *pvParameters) {
                 wdScan->stop();
                 wdScan->setAdvertisedDeviceCallbacks(nullptr, false);
             }
+#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_TLORAPAGER) || defined(DEVICE_CARDPUTER_ADV)
+            // Take LoRa down before WiFi/BLE teardown so its SPI ISR
+            // cannot fire during the rest of the shutdown.
+            wdLoraDeinit();
+#endif
             // Full NimBLE shutdown — frees host task + ~48KB
             if (nimbleInit) {
                 NimBLEDevice::deinit(true);
@@ -950,6 +1262,14 @@ void wardrive_task(void *pvParameters) {
         }
 
         while (SerialGPS.available() > 0) gps.encode(SerialGPS.read());
+
+#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_TLORAPAGER) || defined(DEVICE_CARDPUTER_ADV)
+        // Drain LoRa RX every loop pass. Non-blocking, bounded, and
+        // independent of the WiFi/BLE toggle below — LoRa is its own
+        // radio. Writes go through wardrive_log_observation() so they
+        // land in the same /wardrive_NNNN.csv as WiFi/BLE rows.
+        wdLoraDrain();
+#endif
 
         // GPS auto-baud
         if (millis() - last_baud_switch > 5000) {

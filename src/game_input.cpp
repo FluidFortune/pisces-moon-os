@@ -12,6 +12,9 @@
 #ifdef DEVICE_MAXINE
 #include "maxine_dpad.h"
 #endif
+#ifdef DEVICE_C5
+#include "c5_dpad.h"
+#endif
 
 static bool keyIs(char key, char lower) {
     return key == lower || key == (char)(lower - 'a' + 'A');
@@ -34,7 +37,14 @@ bool pm_is_nes_quit_key(char key) {
 PMNesInput pm_read_nes_input(bool includeTrackball) {
     PMNesInput input = {};
 
-#if !defined(DEVICE_MAXINE)
+#if !defined(DEVICE_MAXINE) && !defined(DEVICE_C5)
+    // T-Deck Plus / T-LoRa Pager / Cardputer / C28P input path — reads
+    // the physical keyboard, trackball, and BLE gamepad. Maxine and C5
+    // are pure-touch kiosks (no keyboard/trackball/gamepad hardware on
+    // either, and the C5's src_filter intentionally excludes
+    // keyboard.cpp / trackball.cpp / gamepad.cpp), so the whole block
+    // is gated out for them. The dpad poll calls below are the only
+    // input source on those boards.
     input.key = get_keypress();
 
     // ────────────────────────────────────────────────────────
@@ -109,7 +119,7 @@ PMNesInput pm_read_nes_input(bool includeTrackball) {
         input.down  = input.down  || (input.trackball.y == 1);
         input.a     = input.a     || input.trackball.clicked;
     }
-#endif // !DEVICE_MAXINE
+#endif // !DEVICE_MAXINE && !DEVICE_C5
 
 #ifdef DEVICE_C28P
     // C28P: OR in virtual D-pad touch state. The dpad layer writes
@@ -121,6 +131,12 @@ PMNesInput pm_read_nes_input(bool includeTrackball) {
 #ifdef DEVICE_MAXINE
     // Maxine: same virtual D-pad model as the C28P, scaled to 480x800.
     maxine_dpad_poll(&input);
+#endif
+#ifdef DEVICE_C5
+    // C5: same layout as the C28P (240×320 portrait, 200/120 split),
+    // single-touch only (XPT2046 resistive). poll() OR-s touch state
+    // into the input fields and redraws any buttons whose state changed.
+    c5_dpad_poll(&input);
 #endif
 
     return input;

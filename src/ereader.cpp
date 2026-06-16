@@ -74,6 +74,10 @@ extern bool c28p_touch_read(int16_t* x, int16_t* y);
 #ifdef DEVICE_MAXINE
 extern bool maxine_touch_read(int16_t* x, int16_t* y);
 #endif
+#ifdef DEVICE_C5
+// XPT2046 resistive touch on shared SPI; driver lives in c5_boot.cpp.
+extern bool c5_touch_read(int16_t* x, int16_t* y);
+#endif
 
 #ifdef DEVICE_TLORAPAGER
 extern PMDispTLoRaPager *gfx;
@@ -106,9 +110,12 @@ static constexpr int LINE_SPACING  = 1;
 static constexpr bool HAS_KEYBOARD = true;
 static constexpr bool HAS_TOUCH    = false;
 
-#elif defined(DEVICE_C28P)
-// C28P: 240x320 portrait, touch-only. Full-screen reader.
-// Bottom strip is a 3-button touch row.
+#elif defined(DEVICE_C28P) || defined(DEVICE_C5)
+// C28P and NM-CYD-C5: both 240x320 portrait, touch-only. Identical
+// reader layout — full-screen with a 3-button touch row across the
+// bottom. Touch IC differs (FT6336G capacitive on C28P, XPT2046
+// resistive on C5) but that's hidden behind the device-specific
+// *_touch_read() externs above.
 static constexpr int SCREEN_W      = 240;
 static constexpr int SCREEN_H      = 320;
 static constexpr int TEXT_SZ       = 1;
@@ -375,7 +382,7 @@ static void picker_draw_header() {
     gfx->setCursor(MARGIN_X, (HEADER_H - 8) / 2);
     gfx->print("E-READER");
     const char* hint =
-#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE) || defined(DEVICE_C5)
         "TAP TOP TO EXIT";
 #else
         "Q EXIT";
@@ -464,7 +471,7 @@ static void picker_draw_list() {
     char footer[64];
     snprintf(footer, sizeof(footer),
              "%d/%d  %s", picker_cursor + 1, book_count,
-#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE) || defined(DEVICE_C5)
              "TAP A BOOK TO READ"
 #elif defined(DEVICE_TLORAPAGER)
              "UP/DN: SELECT  ENTER: OPEN"
@@ -494,6 +501,11 @@ static int picker_run() {
                 while (maxine_touch_read(&tx, &ty)) { delay(10); yield(); }
                 return -1;
             }
+#elif defined(DEVICE_C5)
+            if (c5_touch_read(&tx, &ty)) {
+                while (c5_touch_read(&tx, &ty)) { delay(10); yield(); }
+                return -1;
+            }
 #else
             if (get_touch(&tx, &ty)) {
                 while (get_touch(&tx, &ty)) delay(10);
@@ -513,7 +525,7 @@ static int picker_run() {
         char k = get_keypress();
         TrackballState tb;
         tb.x = 0; tb.y = 0; tb.clicked = false;
-#if !defined(DEVICE_C28P) && !defined(DEVICE_MAXINE)
+#if !defined(DEVICE_C28P) && !defined(DEVICE_MAXINE) && !defined(DEVICE_C5)
         tb = update_trackball();
 #endif
 
@@ -536,6 +548,8 @@ static int picker_run() {
         touched = c28p_touch_read(&tx, &ty);
 #elif defined(DEVICE_MAXINE)
         touched = maxine_touch_read(&tx, &ty);
+#elif defined(DEVICE_C5)
+        touched = c5_touch_read(&tx, &ty);
 #elif !defined(DEVICE_TLORAPAGER) && !defined(DEVICE_CARDPUTER_ADV)
         touched = get_touch(&tx, &ty);
 #endif
@@ -545,6 +559,8 @@ static int picker_run() {
                 while (c28p_touch_read(&tx, &ty)) { delay(10); yield(); }
 #elif defined(DEVICE_MAXINE)
                 while (maxine_touch_read(&tx, &ty)) { delay(10); yield(); }
+#elif defined(DEVICE_C5)
+                while (c5_touch_read(&tx, &ty)) { delay(10); yield(); }
 #else
                 while (get_touch(&tx, &ty)) delay(10);
 #endif
@@ -559,6 +575,8 @@ static int picker_run() {
                     while (c28p_touch_read(&tx, &ty)) { delay(10); yield(); }
 #elif defined(DEVICE_MAXINE)
                     while (maxine_touch_read(&tx, &ty)) { delay(10); yield(); }
+#elif defined(DEVICE_C5)
+                    while (c5_touch_read(&tx, &ty)) { delay(10); yield(); }
 #else
                     while (get_touch(&tx, &ty)) delay(10);
 #endif
@@ -601,7 +619,7 @@ static void reader_draw_footer(uint32_t current, uint32_t total) {
     gfx->fillRect(0, fy, SCREEN_W, FOOTER_H, C_DARK);
     gfx->drawFastHLine(0, fy, SCREEN_W, C_GREEN);
 
-#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE) || defined(DEVICE_C5)
     int seg_w = SCREEN_W / 3;
     gfx->drawFastVLine(seg_w,     fy, FOOTER_H, 0x4208);
     gfx->drawFastVLine(seg_w * 2, fy, FOOTER_H, 0x4208);
@@ -717,7 +735,7 @@ static void reader_run(const char* book_path) {
             }
         }
 
-#if !defined(DEVICE_C28P) && !defined(DEVICE_MAXINE) && !defined(DEVICE_TLORAPAGER) && !defined(DEVICE_CARDPUTER_ADV)
+#if !defined(DEVICE_C28P) && !defined(DEVICE_MAXINE) && !defined(DEVICE_TLORAPAGER) && !defined(DEVICE_CARDPUTER_ADV) && !defined(DEVICE_C5)
         // T-Deck Plus: trackball as a secondary nav source.
         TrackballState tb = update_trackball();
         if (tb.x == 1)  want_next = true;
@@ -732,6 +750,8 @@ static void reader_run(const char* book_path) {
             touched = c28p_touch_read(&tx, &ty);
 #elif defined(DEVICE_MAXINE)
             touched = maxine_touch_read(&tx, &ty);
+#elif defined(DEVICE_C5)
+            touched = c5_touch_read(&tx, &ty);
 #else
             touched = get_touch(&tx, &ty);
 #endif
@@ -745,6 +765,8 @@ static void reader_run(const char* book_path) {
                 while (c28p_touch_read(&rx, &ry)) { delay(10); yield(); }
 #elif defined(DEVICE_MAXINE)
                 while (maxine_touch_read(&rx, &ry)) { delay(10); yield(); }
+#elif defined(DEVICE_C5)
+                while (c5_touch_read(&rx, &ry)) { delay(10); yield(); }
 #else
                 while (get_touch(&rx, &ry)) delay(10);
 #endif

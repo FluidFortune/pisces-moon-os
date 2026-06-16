@@ -75,6 +75,28 @@ void wardrive_ble_resume();
 // Session log filename
 const char* wardrive_get_log_filename();
 
+// Append one GPS-tagged observation to the active wardrive session CSV
+// (/wardrive_NNNN.csv), in the standard WiGLE-style row format, so non
+// WiFi/BLE sources land in the SAME session file and flow through the same
+// tooling (The Clinician, wardrive_inspect, the bridge). Used by the RF
+// Sniffer to record LoRa/Meshtastic node sightings as Type="LORA" rows.
+//
+// Creates/rotates the session file lazily if it does not exist yet. The
+// timestamp, latitude, longitude, and altitude are filled from the live
+// GPS to match the WiFi/BLE writers, so this returns false (logs nothing)
+// when there is no current GPS fix — wardrive rows are always GPS-tagged —
+// or when SD is busy / not ready.
+//
+//   mac      identity string, e.g. "00:00:aa:bb:cc:dd"
+//   ssid     human label, e.g. "!aabbccdd" or "[RELAY] !aabbccdd"
+//   authMode auth/category tag, e.g. "LORA"
+//   channel  integer channel field (Meshtastic channel hash for LoRa)
+//   rssi     received signal strength in dBm
+//   type     Type column tag, e.g. "LORA"
+bool wardrive_log_observation(const char* mac, const char* ssid,
+                              const char* authMode, int channel,
+                              int rssi, const char* type);
+
 // ─── v1.1 — Bridge streaming ───────────────────────────────────────
 extern volatile bool wardrive_bridge_streaming;
 extern volatile bool wardrive_raw_log;  // When true: emit wifi_seen for EVERY observation

@@ -135,6 +135,7 @@ struct Barrel {
     BarrelState state;
     int   girder;          // girder being rolled, -1 if falling
     bool  active;
+    bool  scored;          // true once Jumpman has been credited for a jump-over
     // At a ladder TOP, update_barrel rolls an RNG check to decide
     // continue-rolling vs drop-down-ladder (see DROP_CHANCE in .cpp).
 };
@@ -145,8 +146,19 @@ struct Fireball {
     int   girder, ladder;
     bool  active;
     bool  climbing;
+    float anim_timer;      // flicker animation
     // update_fireball biases velocity toward Jumpman's x/y, constrained
     // to girders + ladders — simple tracking, not full pathfinding.
+};
+
+// ── Hammer pickups ──
+// Two static pickups per level. Jumpman walking over one enters
+// JM_HAMMERING for HAMMER_DURATION seconds: invincible to barrels/
+// fireballs (smashes them on contact, +300/+500 points), CANNOT
+// jump or climb. Pickups regenerate on each new level.
+struct Hammer {
+    float x, y;            // pickup AABB top-left (pixels, projected)
+    bool  active;          // false once picked up
 };
 
 // ─────────────────────────────────────────────
@@ -161,9 +173,14 @@ struct GameState {
     Jumpman  player;
     Barrel   barrels[MAX_BARRELS];
     Fireball fireballs[MAX_FIREBALLS];
+    Hammer   hammers[2];
     float barrel_spawn_timer;
-    float bonus;               // countdown timer / bonus points
+    float fireball_spawn_timer;
+    float bonus;               // countdown timer / bonus points (5000 → 0 over the level)
     float death_timer;         // >0 while player is in JM_DYING (death anim)
+    float dk_anim_timer;       // DK arm-raise animation after each barrel throw
+    float level_clear_timer;   // >0 while showing the level-clear flourish
+    bool  level_clearing;      // true between Pauline touch and next level reset
     bool  quit;
 };
 

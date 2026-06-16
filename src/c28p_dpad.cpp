@@ -9,7 +9,7 @@
 //  Renders a NES-style controller layout in the bottom 120px of
 //  the C28P's 240x320 portrait screen. The render is two-pass:
 //    1. Initial draw: chrome (dividing line, D-pad arrows in idle
-//       state, A/B buttons in idle state).
+//       state, A/B buttons in idle state, song-cycle SELECT).
 //    2. Per-frame updates: only buttons that changed state are
 //       redrawn, to keep the audio + game loop responsive.
 //
@@ -20,6 +20,15 @@
 //  Mario (jump while running) and Galaga (fire while moving). The
 //  single-touch c28p_touch_read() is still used by menu screens
 //  where only one press matters at a time.
+//
+//  The smoothing layer below masks the FT6336G's brief slot
+//  dropouts (~7-16 ms) during touch-list reshuffles. Without it,
+//  Mario's jump-while-running corrupts because the direction
+//  finger appears released for one frame on the exact tap of A,
+//  and Mario's jump samples vx = 0 → straight-up jump in the
+//  wrong direction. With it, every button latches across the
+//  reshuffle and releases together within ~40 ms once every
+//  finger genuinely lifts.
 // ─────────────────────────────────────────────
 
 #ifdef DEVICE_C28P
@@ -35,6 +44,9 @@ extern Arduino_GFX *gfx;
 //  Touch driver — declared in c28p_boot.cpp.
 //  c28p_touch_read():       single point (menus).
 //  c28p_touch_read_multi(): up to two points (gameplay D-pad).
+//                           Filters FT6336G Lift-Up event slots
+//                           at the read layer so this file never
+//                           sees stale post-release coordinates.
 // ─────────────────────────────────────────────
 extern bool c28p_touch_read(int16_t* x, int16_t* y);
 extern int  c28p_touch_read_multi(int16_t* xs, int16_t* ys);
@@ -83,7 +95,10 @@ static ButtonRect rect_select = { 116, 248, 26, 34 };
 #define DPAD_LABEL          0xC618    // light gray text
 
 // ─────────────────────────────────────────────
-//  Pressed-state tracking — drives selective redraw.
+//  Pressed-state tracking — drives selective redraw. These compare
+//  against the smoothed output state, NOT the raw touch reading,
+//  so the visual matches what's being sent to the game (including
+//  the brief latch hold during dropouts).
 // ─────────────────────────────────────────────
 static bool was_up = false, was_down = false, was_left = false, was_right = false;
 static bool was_a  = false, was_b    = false, was_select = false;
@@ -209,6 +224,64 @@ bool c28p_dpad_touched() {
 
 // ─────────────────────────────────────────────
 //  Poll — populate PMNesInput from touch state.
+//
+//  TWO-FINGER MULTI-TOUCH. The FT6336G reports up to two
+//  simultaneous touches, c28p_touch_read_multi() returns both points
+//  (with stale Lift-Up slots filtered out at the driver layer), and
+//  this loop hit-tests each one independently. Holding LEFT with one
+//  finger while tapping A with another registers as both
+//  input.left = true AND input.a = true in the same frame — required
+//  for Mario (jump while running) and Galaga (fire while moving).
+//
+//  DIRECTIONS use quadrant-from-center mapping over the d-pad's
+//  bounding box rather than per-arrow rectangle hit-testing. Quadrant
+//  mapping covers the whole d-pad continuously and naturally produces
+//  diagonals when the touch is angular. The dom/2 threshold means an
+//  axis only engages once its component is ≥ 50% of the dominant
+//  axis — a near-cardinal touch is purely one direction, only a
+//  clearly-angular (45° ± ~18°) touch engages both. Stricter than
+//  dom/3 which engaged diagonals at ~71° and caused Mario to pick up
+//  phantom up/down on a slight wrist angle.
+//
+//  ACTION BUTTONS (A, B, SELECT) stay strict-rectangle hit-tests.
+//  Their hit areas are physically separated and there's no value in
+//  fuzzy-matching them.
+//
+//  SMOOTHING LAYER masks transient slot dropouts. The FT6336G drops
+//  slots for ~7-16 ms during touch-list reshuffles (new finger lands,
+//  one lifts, slots reorder). Without smoothing the jump-while-
+//  running sequence breaks two ways:
+//
+//    1. Direction-finger slot drops on the exact frame A is tapped.
+//       Mario reads input.left=false on the jump frame, sets vx=0,
+//       jumps straight up.
+//    2. A-finger slot drops while still held, registering as release.
+//       Next frame it reappears, registering as a fresh press — Mario
+//       sees "release then re-press" and triggers a second jump,
+//       often in a different direction since the direction finger
+//       may have moved by then.
+//
+//  Strategy:
+//    DIRECTION is a UNIT (one of 4 cardinals or 4 diagonals). A finger
+//    sliding from LEFT to RIGHT must not have LEFT still latched once
+//    it reaches RIGHT — opposite directions can never simultaneously
+//    be true. So direction is stored as a single bitmask that REPLACES
+//    on every direction-active frame.
+//
+//    A / B / SELECT are independent buttons. Each has its own grace
+//    timestamp; releasing one doesn't drag the others with it.
+//
+//    Grace window depends on whether any finger is still on screen:
+//      120 ms while touching — long enough to cover reshuffle gaps
+//       40 ms after all fingers lift — short enough that the next
+//                                       fresh tap arrives clean
+//
+//  Combined effect: directions and buttons hold through transient
+//  reshuffles, all release together within ~40 ms once every finger
+//  genuinely lifts, and a sliding direction touch updates the latch
+//  atomically so opposite directions never both assert. Mario's jump-
+//  while-running reads the correct direction even when A's tap lands
+//  on a reshuffle frame.
 // ─────────────────────────────────────────────
 bool c28p_dpad_poll(PMNesInput* input) {
     if (!rendered_once) c28p_dpad_render();
@@ -221,46 +294,126 @@ bool c28p_dpad_poll(PMNesInput* input) {
     bool now_a     = false, now_b     = false;
     bool now_select = false;
 
-    // Hit-test EVERY active touch point and OR the results. This is
-    // what lets a direction press and an A/B press register in the
-    // same frame (two fingers) — the fix for Mario jump-while-running
-    // and Galaga fire-while-moving. Touches in the game viewport
-    // (above the control strip) are ignored by the D-pad.
+    // D-pad bounding box and center — derived from the four arrow rects
+    // so any future layout tweak flows through without re-deriving here.
+    const int dpad_x_min = rect_left.x;
+    const int dpad_x_max = rect_right.x + rect_right.w;
+    const int dpad_y_min = rect_up.y;
+    const int dpad_y_max = rect_down.y + rect_down.h;
+    const int dpad_cx    = (dpad_x_min + dpad_x_max) / 2;
+    const int dpad_cy    = (dpad_y_min + dpad_y_max) / 2;
+
     for (int i = 0; i < n; i++) {
         int16_t tx = txs[i], ty = tys[i];
         if (ty < C28P_DPAD_AREA_Y) continue;
-        if (in_rect(tx, ty, rect_up))     now_up     = true;
-        if (in_rect(tx, ty, rect_down))   now_down   = true;
-        if (in_rect(tx, ty, rect_left))   now_left   = true;
-        if (in_rect(tx, ty, rect_right))  now_right  = true;
+
+        // Action buttons — strict rectangle hit-test, distinct regions.
         if (in_rect(tx, ty, rect_a))      now_a      = true;
         if (in_rect(tx, ty, rect_b))      now_b      = true;
         if (in_rect(tx, ty, rect_select)) now_select = true;
+
+        // D-pad: quadrant-from-center mapping with dom/2 diagonal gate.
+        // ~6px center deadzone prevents dead-center jitter from picking
+        // a random direction.
+        if (tx >= dpad_x_min && tx < dpad_x_max &&
+            ty >= dpad_y_min && ty < dpad_y_max) {
+            int dx  = tx - dpad_cx;
+            int dy  = ty - dpad_cy;
+            int adx = (dx < 0) ? -dx : dx;
+            int ady = (dy < 0) ? -dy : dy;
+            int dom = (adx > ady) ? adx : ady;
+            if (dom > 6) {
+                int threshold = dom / 2;
+                if (adx >= threshold) {
+                    if (dx < 0) now_left  = true;
+                    else        now_right = true;
+                }
+                if (ady >= threshold) {
+                    if (dy < 0) now_up    = true;
+                    else        now_down  = true;
+                }
+            }
+        }
     }
 
-    // OR the touch state into the input. This lets callers
-    // combine D-pad with other sources (e.g. a future Bluetooth
-    // gamepad attached to C28P over BLE).
-    input->up    = input->up    || now_up;
-    input->down  = input->down  || now_down;
-    input->left  = input->left  || now_left;
-    input->right = input->right || now_right;
-    input->a     = input->a     || now_a;
-    input->b     = input->b     || now_b;
+    // ── Smoothing layer ─────────────────────────────────────
+    // Static state survives across calls; static-local lifetime
+    // guarantees it persists for the life of the launcher loop.
+    // Resetting timestamps to zero on grace-expiry keeps the next
+    // gesture clean.
+    static uint32_t dir_last_ms    = 0;
+    static uint8_t  dir_last_mask  = 0;
+    static uint32_t a_last_ms      = 0;
+    static uint32_t b_last_ms      = 0;
+    static uint32_t select_last_ms = 0;
+
+    constexpr uint32_t LATCH_MS         = 120;   // grace while touching
+    constexpr uint32_t RELEASE_GRACE_MS = 40;    // grace after release
+
+    const uint32_t now_ms    = millis();
+    const bool     any_touch = (n > 0);
+    const uint32_t grace     = any_touch ? LATCH_MS : RELEASE_GRACE_MS;
+
+    // Direction — unit latch. Bitmask atomically replaces on every
+    // direction-active frame so a sliding touch transitioning between
+    // arrows never holds both opposites simultaneously.
+    const bool any_dir_now = now_up || now_down || now_left || now_right;
+    if (any_dir_now) {
+        dir_last_mask = (now_up    ? 0x01 : 0)
+                      | (now_down  ? 0x02 : 0)
+                      | (now_left  ? 0x04 : 0)
+                      | (now_right ? 0x08 : 0);
+        dir_last_ms = now_ms;
+    } else if (dir_last_mask != 0 && (now_ms - dir_last_ms) < grace) {
+        now_up    = (dir_last_mask & 0x01) != 0;
+        now_down  = (dir_last_mask & 0x02) != 0;
+        now_left  = (dir_last_mask & 0x04) != 0;
+        now_right = (dir_last_mask & 0x08) != 0;
+    } else {
+        dir_last_mask = 0;
+    }
+
+    // Action buttons — independent latches. Each has its own grace
+    // timestamp so releasing A doesn't drag B or SELECT with it.
+    auto smooth = [&](bool& flag, uint32_t& last_ms) {
+        if (flag) {
+            last_ms = now_ms;
+        } else if (last_ms != 0 && (now_ms - last_ms) < grace) {
+            flag = true;          // reassert latched state
+        } else {
+            last_ms = 0;          // grace expired — clear
+        }
+    };
+    smooth(now_a,      a_last_ms);
+    smooth(now_b,      b_last_ms);
+    smooth(now_select, select_last_ms);
+
+    // OR the touch state into the input. This lets callers combine
+    // the virtual D-pad with other sources (a future BLE gamepad on
+    // C28P).
+    input->up     = input->up     || now_up;
+    input->down   = input->down   || now_down;
+    input->left   = input->left   || now_left;
+    input->right  = input->right  || now_right;
+    input->a      = input->a      || now_a;
+    input->b      = input->b      || now_b;
     input->select = input->select || now_select;
 
-    // Selective redraw — only buttons whose state changed.
-    if (now_up    != was_up)    draw_dpad_button(rect_up,    now_up,    draw_arrow_up);
-    if (now_down  != was_down)  draw_dpad_button(rect_down,  now_down,  draw_arrow_down);
-    if (now_left  != was_left)  draw_dpad_button(rect_left,  now_left,  draw_arrow_left);
-    if (now_right != was_right) draw_dpad_button(rect_right, now_right, draw_arrow_right);
-    if (now_a     != was_a)     draw_action_button(rect_a,   "A", now_a, BTN_A_IDLE);
-    if (now_b     != was_b)     draw_action_button(rect_b,   "B", now_b, BTN_B_IDLE);
+    // Selective redraw — only buttons whose smoothed state changed.
+    // Drawing off the smoothed (not raw) state means the visual
+    // matches what's being sent to the game, including brief latch
+    // holds during dropouts.
+    if (now_up     != was_up)     draw_dpad_button(rect_up,    now_up,    draw_arrow_up);
+    if (now_down   != was_down)   draw_dpad_button(rect_down,  now_down,  draw_arrow_down);
+    if (now_left   != was_left)   draw_dpad_button(rect_left,  now_left,  draw_arrow_left);
+    if (now_right  != was_right)  draw_dpad_button(rect_right, now_right, draw_arrow_right);
+    if (now_a      != was_a)      draw_action_button(rect_a,   "A", now_a, BTN_A_IDLE);
+    if (now_b      != was_b)      draw_action_button(rect_b,   "B", now_b, BTN_B_IDLE);
     if (now_select != was_select) draw_select_button(rect_select, now_select);
 
-    was_up    = now_up;    was_down  = now_down;
-    was_left  = now_left;  was_right = now_right;
-    was_a     = now_a;     was_b     = now_b;
+    was_up     = now_up;     was_down  = now_down;
+    was_left   = now_left;   was_right = now_right;
+    was_a      = now_a;      was_b     = now_b;
     was_select = now_select;
 
     return now_up || now_down || now_left || now_right || now_a || now_b || now_select;

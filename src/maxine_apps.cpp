@@ -46,6 +46,7 @@
 
 extern Arduino_GFX *gfx;
 extern bool maxine_touch_read(int16_t* x, int16_t* y);
+extern void kiosk_run_wifi_setup();  // src/kiosk_wifi_setup.cpp — 2× scaled on Maxine
 
 // Forward decls from c28p_anomaly.cpp (now compiled for Maxine too)
 extern void c28p_anomaly_init();
@@ -233,19 +234,22 @@ static void wifi_draw_main() {
     app_chrome("WIFI", 0x07FF);
     wifi_draw_status_panel();
 
-    // Three big buttons
+    // Four big buttons (CONNECT / MANUAL / PORTAL / FORGET), 60 tall
+    // with 10px gaps so they fit comfortably between status panel and
+    // BACK affordance.
     struct { const char* label; uint16_t color; int y; } btn[] = {
         { "CONNECT",     0x07E0, 200 },
-        { "OPEN PORTAL", 0xFC00, 300 },
-        { "FORGET",      0xF800, 400 },
+        { "MANUAL",      0x07FF, 270 },
+        { "OPEN PORTAL", 0xFC00, 340 },
+        { "FORGET",      0xF800, 410 },
     };
-    for (int i = 0; i < 3; i++) {
-        gfx->fillRect(40, btn[i].y, MAX_W - 80, 72, 0x18C3);
-        gfx->drawRect(40, btn[i].y, MAX_W - 80, 72, btn[i].color);
+    for (int i = 0; i < 4; i++) {
+        gfx->fillRect(40, btn[i].y, MAX_W - 80, 60, 0x18C3);
+        gfx->drawRect(40, btn[i].y, MAX_W - 80, 60, btn[i].color);
         gfx->setTextSize(3);
         gfx->setTextColor(btn[i].color);
         int tw = (int)strlen(btn[i].label) * 18;
-        gfx->setCursor((MAX_W - tw) / 2, btn[i].y + (72 - 24) / 2);
+        gfx->setCursor((MAX_W - tw) / 2, btn[i].y + (60 - 24) / 2);
         gfx->print(btn[i].label);
     }
 
@@ -307,13 +311,13 @@ void maxine_run_wifi_setup() {
         bool touched = maxine_touch_read(&tx, &ty);
 
         if (touched && !was_touched) {
-            // CONNECT  y=200..272
-            if (ty >= 200 && ty < 272) pressed = 0;
-            // PORTAL   y=300..372
-            else if (ty >= 300 && ty < 372) pressed = 1;
-            // FORGET   y=400..472
-            else if (ty >= 400 && ty < 472) pressed = 2;
-            else if (hit_back(tx, ty)) pressed = -1;
+            // CONNECT (y=200..260) / MANUAL (y=270..330) /
+            // PORTAL  (y=340..400) / FORGET (y=410..470)
+            if      (ty >= 200 && ty < 260) pressed = 0;
+            else if (ty >= 270 && ty < 330) pressed = 3;   // MANUAL
+            else if (ty >= 340 && ty < 400) pressed = 1;   // PORTAL
+            else if (ty >= 410 && ty < 470) pressed = 2;   // FORGET
+            else if (hit_back(tx, ty))      pressed = -1;
         } else if (!touched && was_touched) {
             if (pressed == -1) return;
             else if (pressed == 0) {
@@ -322,8 +326,12 @@ void maxine_run_wifi_setup() {
                 if (WiFi.status() == WL_CONNECTED) {
                     wifi_show_message("Connected!", WiFi.SSID().c_str(), 0x07E0, 1800);
                 } else {
-                    wifi_show_message("Failed", "Try PORTAL for new credentials", 0xF800, 2000);
+                    wifi_show_message("Failed", "Try MANUAL or PORTAL", 0xF800, 2000);
                 }
+                wifi_draw_main();
+            } else if (pressed == 3) {
+                // MANUAL — kiosk_wifi_setup with 2× scaled keyboard
+                kiosk_run_wifi_setup();
                 wifi_draw_main();
             } else if (pressed == 1) {
                 wifi_portal_screen();

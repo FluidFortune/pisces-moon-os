@@ -68,6 +68,9 @@ extern bool wardrive_active;
 // visible API to be reachable from this launcher.
 extern void run_wifi_connect();
 extern void run_gps();
+extern void run_map();
+extern void run_flight_tracker();
+extern void run_mesh_map();
 extern void run_mesh_messenger();
 extern void run_voice_terminal();
 extern void run_lora_voice();
@@ -184,6 +187,8 @@ static const CpAppEntry APPS[] = {
     // ─── COMMS ──────────────────────────────
     {"WIFI JOIN",  "W", 0, run_wifi_connect},
     {"GPS",        "*", 0, run_gps},
+    {"MAP",        "=", 0, run_map},
+    {"FLIGHTS",    "^", 0, run_flight_tracker},
     {"MESH",       "m", 0, run_mesh_messenger},
     {"VOICE",      "V", 0, run_voice_terminal},
     {"LORA PTT",   "P", 0, run_lora_voice},
@@ -198,6 +203,7 @@ static const CpAppEntry APPS[] = {
     {"GATT XPLR",  "g", 1, run_ble_gatt_explorer},
     {"WPA HS",     "h", 1, run_wpa_handshake},
     {"RF SPECTRM", "^", 1, run_rf_spectrum},
+    {"MESH MAP",   "=", 1, run_mesh_map},
     {"PROBE INTL", "?", 1, run_probe_intel},
     {"PKT ANLYS",  "%", 1, run_offline_pkt_analysis},
     {"BLE DUCKY",  "D", 1, run_ble_ducky},

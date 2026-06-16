@@ -15,6 +15,9 @@
 #ifdef DEVICE_C28P
 #include "c28p_dpad.h"
 #endif
+#ifdef DEVICE_C5
+#include "c5_dpad.h"
+#endif
 
 #ifdef DEVICE_TLORAPAGER
 extern PMDispTLoRaPager *gfx;
@@ -32,9 +35,11 @@ static constexpr int VIEW_W = 320;
 static constexpr int VIEW_H = 222;
 static constexpr int HORIZON = 76;
 static constexpr int CAR_Y = 178;
-#elif defined(DEVICE_C28P)
+#elif defined(DEVICE_C28P) || defined(DEVICE_C5)
 // C28P 240x320 portrait, touch-only. The game renders in the top 200px
 // (C28P_GAME_VIEW_H); the bottom 120px holds the virtual D-pad chrome.
+// C5 is identical — same panel, same touch-only kiosk shape, same
+// virtual dpad layout from c5_dpad.cpp.
 // The road uses the full 240px width (wider than Tetris's narrow board).
 // HORIZON/CAR_Y are scaled to the 200px-tall viewport, with the road
 // kept clear of the bottom edge so it never paints into the D-pad zone.
@@ -97,7 +102,7 @@ static int vx() {
 }
 
 static int vy() {
-#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_C28P) || defined(DEVICE_C5) || defined(DEVICE_MAXINE)
     // Top-anchor the viewport on touch kiosks: bottom rows belong to the
     // virtual D-pad chrome and must not be painted by the game.
     return 0;
@@ -370,6 +375,10 @@ void run_pole_position() {
     // pm_read_nes_input() handles press/release feedback from here on.
     c28p_dpad_render();
 #endif
+#ifdef DEVICE_C5
+    // C5 mirrors C28P's chrome layout (same panel, same dpad shape).
+    c5_dpad_render();
+#endif
 #ifdef DEVICE_MAXINE
     // Same idea, different chrome: maxine_dpad_render draws into the
     // bottom strip (y >= 520) which the game's viewport never touches.
@@ -442,7 +451,7 @@ void run_pole_position() {
             for (int i = 0; i < NUM_RIVALS; i++) drawRival(rivals[i]);
             drawPlayerCar();
             drawHud();
-#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_MAXINE) || defined(DEVICE_C28P)
+#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_MAXINE) || defined(DEVICE_C28P) || defined(DEVICE_C5)
             // Cardputer ST7789, Maxine RGB panel, and C28P ILI9341V all
             // suffer at a 60fps target with this slice-based renderer.
             //

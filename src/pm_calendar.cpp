@@ -33,7 +33,7 @@
 //    "today" cell.
 // ─────────────────────────────────────────────
 
-#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE) || defined(DEVICE_C5)
 
 #include <Arduino.h>
 #include <Arduino_GFX_Library.h>
@@ -44,9 +44,14 @@
 
 extern Arduino_GFX *gfx;
 
+#if defined(DEVICE_C28P) || defined(DEVICE_C5)
 #ifdef DEVICE_C28P
 extern bool c28p_touch_read(int16_t* x, int16_t* y);
 static inline bool _cal_touch(int16_t* x, int16_t* y) { return c28p_touch_read(x, y); }
+#else  // DEVICE_C5
+extern bool c5_touch_read(int16_t* x, int16_t* y);
+static inline bool _cal_touch(int16_t* x, int16_t* y) { return c5_touch_read(x, y); }
+#endif
 static const int CAL_W           = 240;
 static const int CAL_H           = 320;
 static const int CAL_EXIT_H      = 14;
@@ -641,4 +646,4 @@ void pm_run_calendar() {
     }
 }
 
-#endif  // DEVICE_C28P || DEVICE_MAXINE
+#endif  // DEVICE_C28P || DEVICE_MAXINE || DEVICE_C5

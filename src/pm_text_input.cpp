@@ -39,7 +39,7 @@
 //  Cancel:  tap the top EXIT bar.
 // ─────────────────────────────────────────────
 
-#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE) || defined(DEVICE_C5)
 
 #include <Arduino.h>
 #include <Arduino_GFX_Library.h>
@@ -48,9 +48,17 @@
 
 extern Arduino_GFX *gfx;
 
+#if defined(DEVICE_C28P) || defined(DEVICE_C5)
 #ifdef DEVICE_C28P
 extern bool c28p_touch_read(int16_t* x, int16_t* y);
 static inline bool _ti_touch(int16_t* x, int16_t* y) { return c28p_touch_read(x, y); }
+#else  // DEVICE_C5
+// C5 shares C28P's 240×320 portrait geometry; only the touch read
+// function differs (XPT2046 resistive via SPI vs FT6336G capacitive
+// via I2C). Constants below are reused as-is.
+extern bool c5_touch_read(int16_t* x, int16_t* y);
+static inline bool _ti_touch(int16_t* x, int16_t* y) { return c5_touch_read(x, y); }
+#endif
 static const int TI_W           = 240;
 static const int TI_H           = 320;
 static const int TI_EXIT_H      = 14;
@@ -522,4 +530,4 @@ bool pm_text_input(const char* label, char* out, size_t outlen, const char* init
     }
 }
 
-#endif  // DEVICE_C28P || DEVICE_MAXINE
+#endif  // DEVICE_C28P || DEVICE_MAXINE || DEVICE_C5

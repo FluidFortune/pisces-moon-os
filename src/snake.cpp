@@ -13,6 +13,7 @@
  *   T-LoRa Pager  480x222  8px cells   40x24 grid (320x240 centered)
  *   Cardputer ADV 240x135  5px cells   48x22 grid
  *   C28P          240x320  8px cells   30x23 grid (top 200px, dpad below)
+ *   C5            240x320  8px cells   30x23 grid (top 200px, dpad below)
  *   Maxine        480x800  16px cells  30x32 grid (top 520px, dpad below)
  *
  * Input mapping (universal — pm_read_nes_input handles the mapping):
@@ -34,6 +35,9 @@
 #include "SdFat.h"
 #ifdef DEVICE_C28P
 #include "c28p_dpad.h"
+#endif
+#ifdef DEVICE_C5
+#include "c5_dpad.h"
 #endif
 #ifdef DEVICE_MAXINE
 #include "maxine_dpad.h"
@@ -62,7 +66,10 @@ extern SdFat sd;
   #define OVER_Y      30
   #define OVER_W      180
   #define OVER_H      75
-#elif defined(DEVICE_C28P)
+#elif defined(DEVICE_C28P) || defined(DEVICE_C5)
+  // C28P + C5 share the same 240x320 portrait panel and the same
+  // 240x200 game viewport above the virtual dpad strip. Geometry is
+  // identical; only the touch driver underneath differs.
   #define GRID_X      0
   #define GRID_Y      16
   #define GRID_W      240
@@ -151,7 +158,7 @@ static int view_x() {
 }
 
 static int view_y() {
-#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_C28P) || defined(DEVICE_C5) || defined(DEVICE_MAXINE)
     return 0;   // top-anchored (dpad owns the bottom strip)
 #else
     int h = gfx->height();
@@ -190,8 +197,10 @@ static inline void draw_cell(int col, int row, uint16_t color) {
 }
 
 static void draw_header(int score, int hi) {
-#ifdef DEVICE_C28P
-    // Score line painted into the right side of the C28P exit bar.
+#if defined(DEVICE_C28P) || defined(DEVICE_C5)
+    // Score line painted into the right side of the exit bar.
+    // Same layout on C28P + C5 since both have the same 240x14
+    // header strip above the game viewport.
     gfx->fillRect(80, 0, 240 - 80, 14, 0x0000);
     gfx->setTextSize(1);
     gfx->setTextColor(C_GREEN);
@@ -395,7 +404,7 @@ static OverAction show_game_over(int score, int hi, bool new_hi) {
     const char *p = "R=RETRY  Q=QUIT";
     gfx->setCursor(ox + (OVER_W - (int)strlen(p) * 6) / 2, oy + 58);
     gfx->print(p);
-#elif defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#elif defined(DEVICE_C28P) || defined(DEVICE_C5) || defined(DEVICE_MAXINE)
     int title_x = ox + (OVER_W - 108) / 2;
     int line_y  = oy + (OVER_H >= 120 ? 40 : 30);
     gfx->setTextSize(2);
@@ -459,7 +468,7 @@ static OverAction show_game_over(int score, int hi, bool new_hi) {
 
     while (true) {
         PMNesInput input = pm_read_nes_input(true);
-#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_C28P) || defined(DEVICE_C5) || defined(DEVICE_MAXINE)
         if (input.a)               return OVER_RETRY;
         if (input.b || input.quit) return OVER_EXIT;
 #else
@@ -477,11 +486,14 @@ static OverAction show_game_over(int score, int hi, bool new_hi) {
 //  MAIN ENTRY POINT
 // ─────────────────────────────────────────────
 void run_snake() {
-#if !defined(DEVICE_CARDPUTER_ADV) && !defined(DEVICE_C28P) && !defined(DEVICE_MAXINE)
+#if !defined(DEVICE_CARDPUTER_ADV) && !defined(DEVICE_C28P) && !defined(DEVICE_C5) && !defined(DEVICE_MAXINE)
     init_trackball();
 #endif
 #ifdef DEVICE_C28P
     c28p_dpad_render();
+#endif
+#ifdef DEVICE_C5
+    c5_dpad_render();
 #endif
 #ifdef DEVICE_MAXINE
     maxine_dpad_render();
@@ -495,7 +507,9 @@ void run_snake() {
     while (true) {
         init_snake(g);
 
-#if defined(DEVICE_C28P)
+#if defined(DEVICE_C28P) || defined(DEVICE_C5)
+        // C28P + C5: clear only the game viewport (top 200px). The
+        // dpad chrome below must persist across game-over and retry.
         gfx->fillRect(0, 0, 240, 200, BG_COLOR);
 #elif defined(DEVICE_MAXINE)
         // Maxine: clear only the game viewport. The dpad chrome below

@@ -20,6 +20,7 @@ void show_splash_screen();
 
 // App Suite — COMMS
 void run_wifi_connect();
+void run_wifi_share_qr();    // QR-code WiFi bridge (T-Deck Plus, T-LoRa Pager, Cardputer ADV)
 void run_gps();
 
 // App Suite — TOOLS
@@ -169,5 +170,24 @@ void run_bridge();
 // Connect any ESP32 running Pisces Moon to piscesdemo.fluidfortune.com
 // Chrome/Edge only (Web Serial API). Launch from SYSTEM menu.
 void run_bridge();
+
+// ============================================================
+//  MAP ENGINE FAMILY — v1.4 "moving map"
+// ============================================================
+
+// MAP — offline moving map + GPS breadcrumb. Raster basemap from
+// /maps/<set>/<z>/<x>/<y>.png on SD (graticule fallback w/o SD).
+// Renders per-device via pm_map_engine (runtime-sized from gfx).
+void run_map();
+
+// FLIGHT TRACKER — live aircraft on the moving map via OpenSky API
+// (WiFi). Heading arrows + callsign + altitude. Any WiFi device.
+void run_flight_tracker();
+
+// MESH MAP — live Meshtastic/LoRa node positions on the moving map.
+// Passive SX1262 RX; nodes plotted where heard, RSSI-colored, with
+// range rings. The in-field spatial view of WarDrive's LoRa data.
+// SX1262 LoRa devices only.
+void run_mesh_map();
 
 #endif // APPS_H

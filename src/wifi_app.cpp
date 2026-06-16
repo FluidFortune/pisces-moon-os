@@ -14,7 +14,7 @@
 #include "keyboard.h"
 #include "pm_input.h"
 #include "theme.h"
-#include "apps.h"
+#include "apps.h"   // for run_wifi_share_qr()
 
 #ifdef DEVICE_TLORAPAGER
 extern PMDispTLoRaPager *gfx;
@@ -52,7 +52,7 @@ void run_wifi_app() {
         gfx->fillScreen(C_BLACK);
         gfx->fillRect(0, 0, DISP_W, 24, C_DARK);
         gfx->setCursor(10, 7); gfx->setTextColor(C_GREEN);
-        gfx->print("WIFI SCANNER | R: RESCAN | " PM_EXIT_SHORT_COPY);
+        gfx->print("WIFI SCANNER | R:RESCAN S:QR | " PM_EXIT_SHORT_COPY);
 
         gfx->setCursor(10, 50); gfx->setTextColor(C_WHITE);
         gfx->print("Initializing Radio & Scanning...");
@@ -109,6 +109,13 @@ void run_wifi_app() {
             char c = get_keypress();
             if (c == 'r' || c == 'R') {
                 waiting = false;
+            }
+            if (c == 's' || c == 'S') {
+                // SHARE QR — phone-bridge for captive-portal networks.
+                // Renders the currently-connected (or last-saved) WiFi
+                // creds as a standard WIFI:S:...;T:...;P:...;; QR code.
+                run_wifi_share_qr();
+                waiting = false;   // force a re-render on return
             }
             if (pm_is_exit_key(c)) {
                 running = false;

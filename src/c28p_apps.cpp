@@ -30,6 +30,7 @@
 
 extern Arduino_GFX *gfx;
 extern bool c28p_touch_read(int16_t* x, int16_t* y);
+extern void kiosk_run_wifi_setup();  // src/kiosk_wifi_setup.cpp
 
 // ─────────────────────────────────────────────
 //  ABOUT
@@ -158,25 +159,32 @@ static void wifi_draw_main() {
     wifi_draw_status_banner();
 
     // CONNECT button
-    gfx->fillRect(16, 116, 208, 40, 0x18C3);
-    gfx->drawRect(16, 116, 208, 40, 0x07E0);
+    gfx->fillRect(16, 116, 208, 32, 0x18C3);
+    gfx->drawRect(16, 116, 208, 32, 0x07E0);
     gfx->setTextSize(2);
     gfx->setTextColor(0x07E0);
-    gfx->setCursor(58, 128);
+    gfx->setCursor(58, 124);
     gfx->print("CONNECT");
 
+    // MANUAL button (v1.2.1 — on-screen keyboard for new networks)
+    gfx->fillRect(16, 154, 208, 32, 0x18C3);
+    gfx->drawRect(16, 154, 208, 32, 0x07FF);
+    gfx->setTextColor(0x07FF);
+    gfx->setCursor(64, 162);
+    gfx->print("MANUAL");
+
     // PORTAL button
-    gfx->fillRect(16, 166, 208, 40, 0x18C3);
-    gfx->drawRect(16, 166, 208, 40, 0xFC00);
+    gfx->fillRect(16, 192, 208, 32, 0x18C3);
+    gfx->drawRect(16, 192, 208, 32, 0xFC00);
     gfx->setTextColor(0xFC00);
-    gfx->setCursor(46, 178);
+    gfx->setCursor(46, 200);
     gfx->print("OPEN PORTAL");
 
     // FORGET button (clear saved credentials)
-    gfx->fillRect(16, 216, 208, 40, 0x18C3);
-    gfx->drawRect(16, 216, 208, 40, 0xF800);
+    gfx->fillRect(16, 230, 208, 32, 0x18C3);
+    gfx->drawRect(16, 230, 208, 32, 0xF800);
     gfx->setTextColor(0xF800);
-    gfx->setCursor(64, 228);
+    gfx->setCursor(64, 238);
     gfx->print("FORGET");
 
     // BACK button
@@ -259,35 +267,42 @@ void c28p_run_wifi_setup() {
                 while (c28p_touch_read(&tx, &ty)) { delay(20); yield(); }
                 return;
             }
-            // CONNECT button
-            if (ty >= 116 && ty < 156) {
+            // CONNECT button (y=116..148)
+            if (ty >= 116 && ty < 148) {
                 wifi_show_message("Scanning...", "Trying known networks", nullptr, 0xFFE0, 0);
                 auto_connect_wifi();
                 if (WiFi.status() == WL_CONNECTED) {
                     wifi_show_message("Connected!", WiFi.SSID().c_str(), nullptr, 0x07E0, 1500);
                 } else {
                     wifi_show_message("Failed", "No known networks worked.",
-                                      "Try PORTAL for new credentials.", 0xF800, 2000);
+                                      "Try MANUAL or PORTAL.", 0xF800, 2000);
                 }
                 wifi_draw_main();
                 while (c28p_touch_read(&tx, &ty)) { delay(20); yield(); }
                 wifi_was_touched = false;
                 continue;
             }
-            // PORTAL button
-            if (ty >= 166 && ty < 206) {
+            // MANUAL button (y=154..186) — kiosk on-screen keyboard
+            if (ty >= 154 && ty < 186) {
+                while (c28p_touch_read(&tx, &ty)) { delay(20); yield(); }
+                kiosk_run_wifi_setup();
+                wifi_draw_main();
+                wifi_was_touched = false;
+                continue;
+            }
+            // PORTAL button (y=192..224)
+            if (ty >= 192 && ty < 224) {
                 wifi_portal_screen();
                 WiFiManager wm;
                 wm.setConfigPortalTimeout(180);
-                // Blocking call — returns when user finishes or timeout
                 wm.autoConnect("PiscesMoon-Setup");
                 wifi_draw_main();
                 while (c28p_touch_read(&tx, &ty)) { delay(20); yield(); }
                 wifi_was_touched = false;
                 continue;
             }
-            // FORGET button
-            if (ty >= 216 && ty < 256) {
+            // FORGET button (y=230..262)
+            if (ty >= 230 && ty < 262) {
                 WiFi.disconnect(true, true);   // clear creds
                 wifi_show_message("Forgotten", "Stored credentials cleared",
                                   nullptr, 0xFC00, 1500);

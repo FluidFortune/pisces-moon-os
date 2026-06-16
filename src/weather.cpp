@@ -12,7 +12,7 @@
 //  is identical on all devices. The render + input loop is per-device
 //  because screen geometry and input modalities differ.
 //
-//  PORTRAIT DEVICES (C28P, Heltec V4):
+//  PORTRAIT DEVICES (C28P, Heltec V4, C5):
 //    240×320, touch-only. Top exit bar at y<14. Card layout vertical.
 //
 //  T-DECK PLUS:
@@ -47,6 +47,9 @@ extern Arduino_GFX *gfx;
 
 #if defined(DEVICE_C28P) || defined(DEVICE_HELTEC_V4)
 extern bool c28p_touch_read(int16_t *x, int16_t *y);
+#endif
+#if defined(DEVICE_C5)
+extern bool c5_touch_read(int16_t *x, int16_t *y);
 #endif
 
 // T-LoRa Pager has no touch hardware — NES buttons (dpad + A/B) only.
@@ -211,8 +214,12 @@ static void load_location() {
 //  PER-DEVICE RENDER + LOOP
 // ─────────────────────────────────────────────
 
-#if defined(DEVICE_C28P) || defined(DEVICE_HELTEC_V4)
-// ─── Portrait 240×320 (C28P, Heltec V4) ───
+#if defined(DEVICE_C28P) || defined(DEVICE_HELTEC_V4) || defined(DEVICE_C5)
+// ─── Portrait 240×320 (C28P, Heltec V4, C5) ───
+// All three boards share the same 240×320 portrait geometry and the
+// same touch-only input model. Only the touch driver differs:
+// C28P/Heltec use the FT6336G capacitive controller (c28p_touch_read),
+// the C5 uses the XPT2046 resistive controller (c5_touch_read).
 
 static void wx_p_chrome() {
     gfx->fillRect(0, 14, 240, 320 - 14, 0x0000);
@@ -317,7 +324,11 @@ static void wx_portrait_loop() {
     int pressed = -2;
     while (true) {
         int16_t tx, ty;
+#if defined(DEVICE_C5)
+        bool touched = c5_touch_read(&tx, &ty);
+#else
         bool touched = c28p_touch_read(&tx, &ty);
+#endif
 
         if (touched && !was_touched) {
             if (ty < 14) pressed = 1;
@@ -651,7 +662,7 @@ static void wx_tlp_loop() {
 void run_weather() {
     load_location();
 
-#if defined(DEVICE_C28P) || defined(DEVICE_HELTEC_V4)
+#if defined(DEVICE_C28P) || defined(DEVICE_HELTEC_V4) || defined(DEVICE_C5)
     wx_portrait_loop();
 #elif defined(DEVICE_TDECK_PLUS)
     wx_tdeck_loop();

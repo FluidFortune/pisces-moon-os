@@ -37,7 +37,7 @@
 #include "theme.h"
 #include "gamepad.h"
 #include "chess.h"
-#if defined(DEVICE_MAXINE) || defined(DEVICE_C28P)
+#if defined(DEVICE_MAXINE) || defined(DEVICE_C28P) || defined(DEVICE_C5)
 // ──────────────────────────────────────────────────────────────
 //  Touch-only kiosk stubs for symbols chess.cpp calls directly
 //  but which aren't linked into the Maxine / C28P builds.
@@ -88,6 +88,29 @@ bool gamepad_poll() { return false; }
 extern bool c28p_touch_read(int16_t* x, int16_t* y);
 #endif
 
+#ifdef DEVICE_C5
+// C5 single-touch driver (XPT2046 resistive), defined non-static in
+// c5_boot.cpp. Same shape as c28p_touch_read — the kiosk_touch()
+// helper below dispatches to whichever the build target provides.
+extern bool c5_touch_read(int16_t* x, int16_t* y);
+#endif
+
+#if defined(DEVICE_C28P) || defined(DEVICE_C5)
+// Single entry point for touch on both portrait kiosk targets. The
+// touch-handling blocks below are written against this name and the
+// preprocessor picks the right physical driver per build. Avoids
+// duplicating ~120 lines of board-tap / button-tap logic between
+// C28P and C5 branches when the only difference is which extern
+// gets called.
+static inline bool kiosk_touch(int16_t* x, int16_t* y) {
+#ifdef DEVICE_C28P
+    return c28p_touch_read(x, y);
+#else
+    return c5_touch_read(x, y);
+#endif
+}
+#endif
+
 extern Arduino_GFX *gfx;
 
 // ─────────────────────────────────────────────
@@ -116,19 +139,15 @@ extern Arduino_GFX *gfx;
 #define PANEL_H     (800 - PANEL_Y)
 #define SCREEN_W_C  480
 #define SCREEN_H_C  800
-#elif defined(DEVICE_C28P)
-// C28P 240x320 portrait, touch-only. Chess takes over the entire
-// screen (no virtual dpad: every input is a tap, not a d-pad press).
-// Layout:
+#elif defined(DEVICE_C28P) || defined(DEVICE_C5)
+// C28P + C5 share the same 240x320 portrait panel + touch-only
+// kiosk shape, so they share the same chess board geometry.
+// Layout (both):
 //    y=0..13     14-px header strip (tap-to-quit hot zone)
 //    y=14..237   224-px board (8 * SQ=28), x=14..238 centered
 //    y=238..247  10-px gap holds the a..h file labels (size-1)
 //    y=248..319  72-px panel: turn indicator, AI cycle button,
 //                check status, control hints
-// SQ=28 was picked over 26 (T-Deck) to use the extra width C28P
-// has: the board fills the screen edge-to-edge with a 1px margin
-// outside the rank labels, giving comfortable tap targets for an
-// adult fingertip on a 2.8" display.
 #define SQ          28
 #define BOARD_X     14
 #define BOARD_Y     14
@@ -974,8 +993,8 @@ static void drawPanel() {
     return;
 #endif
 
-#ifdef DEVICE_C28P
-    // C28P: 240x72 panel below the board. Horizontal layout, four
+#if defined(DEVICE_C28P) || defined(DEVICE_C5)
+    // C28P + C5: 240x72 panel below the board.
     // zones top-to-bottom:
     //    row 1 (y+4) : "WHITE TURN" / "BLACK TURN" (size-2 left)
     //                  + check badge (size-2 right, red, if any)
@@ -1252,13 +1271,13 @@ void run_chess() {
                     // gap, or the panel — taps there mean something
                     // else (board = move, panel = AI cycle, etc).
                     int16_t tx, ty;
-#if defined(DEVICE_C28P)
-                    // C28P: top 14px strip is the quit hot zone.
+#if defined(DEVICE_C28P) || defined(DEVICE_C5)
+                    // C28P + C5: top 14px strip is the quit hot zone.
                     // Anything below is either the board or the panel.
-                    if (c28p_touch_read(&tx, &ty) && ty < 14) {
+                    if (kiosk_touch(&tx, &ty) && ty < 14) {
                         // Debounce: wait for release before quitting.
                         int16_t rx, ry;
-                        while (c28p_touch_read(&rx, &ry)) { delay(10); yield(); }
+                        while (kiosk_touch(&rx, &ry)) { delay(10); yield(); }
                         quit = true; break;
                     }
 #elif defined(DEVICE_MAXINE)
@@ -1318,18 +1337,18 @@ void run_chess() {
                         cursorRow = (mty - BOARD_Y) / SQ;
                         touchConfirm = true;
                     }
-#elif defined(DEVICE_C28P)
-                    // C28P: tap inside the board area moves cursor and confirms.
+#elif defined(DEVICE_C28P) || defined(DEVICE_C5)
+                    // C28P + C5: tap inside the board area moves cursor and confirms.
                     // Tap on the AI button row (PANEL_Y+24..PANEL_Y+45) cycles
                     // the AI personality — since there's no 'A' key on this
                     // device, the button is the only way to change difficulty.
                     int16_t ctx, cty;
-                    if (c28p_touch_read(&ctx, &cty)) {
+                    if (kiosk_touch(&ctx, &cty)) {
                         // Board tap
                         if (ctx >= BOARD_X && cty >= BOARD_Y &&
                             ctx < BOARD_X + SQ*8 && cty < BOARD_Y + SQ*8) {
                             int16_t rx, ry;
-                            while (c28p_touch_read(&rx, &ry)) { delay(5); yield(); }
+                            while (kiosk_touch(&rx, &ry)) { delay(5); yield(); }
                             cursorCol = (ctx - BOARD_X) / SQ;
                             cursorRow = (cty - BOARD_Y) / SQ;
                             touchConfirm = true;
@@ -1337,7 +1356,7 @@ void run_chess() {
                         // AI cycle button tap
                         else if (cty >= PANEL_Y + 24 && cty < PANEL_Y + 46) {
                             int16_t rx, ry;
-                            while (c28p_touch_read(&rx, &ry)) { delay(5); yield(); }
+                            while (kiosk_touch(&rx, &ry)) { delay(5); yield(); }
                             aiPersonality = (aiPersonality + 1) % 6;
                             drawPanel();
                             continue;
@@ -1495,12 +1514,12 @@ void run_chess() {
             if (k || tb.clicked || maxine_touch_read(&tx, &ty)) {
                 newGame = true; break;
             }
-#elif defined(DEVICE_C28P)
-            // C28P: any tap restarts the game (matching T-Deck's
+#elif defined(DEVICE_C28P) || defined(DEVICE_C5)
+            // C28P + C5: any tap restarts the game (matching T-Deck's
             // behavior). The 10-second timeout is the only way out
             // — if the player wants to leave chess after game-over,
             // they just don't tap.
-            if (k || tb.clicked || c28p_touch_read(&tx, &ty)) {
+            if (k || tb.clicked || kiosk_touch(&tx, &ty)) {
                 newGame = true; break;
             }
 #else

@@ -208,16 +208,35 @@ int c28p_touch_read_multi(int16_t* xs, int16_t* ys) {
 
     // Touch 1 → b[1..4] (regs 0x03-0x06)
     // Touch 2 → b[7..10] (regs 0x09-0x0C)
+    //
+    // Each touch slot's XH byte (b[base]) encodes the event type in
+    // its top two bits (7-6):
+    //   00 = Press Down
+    //   01 = Lift Up
+    //   10 = Contact (held)
+    //   11 = reserved
+    // A "Lift Up" slot still carries the last coordinates of the finger
+    // that just released. The FT6336G reports it for one frame past the
+    // actual release as part of its event protocol. Treating that as an
+    // active touch means the game sees a phantom press for one frame
+    // every time a finger lifts — which during Mario's jump-while-running
+    // looks like a stray direction nudge at the exact wrong moment.
+    // Filter those slots out so only Press Down + Contact (currently in
+    // contact with the panel) get reported back.
+    int out = 0;
     for (int p = 0; p < num; p++) {
         int base = (p == 0) ? 1 : 7;
+        uint8_t event = (b[base] >> 6) & 0x03;
+        if (event == 1) continue;   // Lift Up — slot is stale, skip
         uint16_t rx = ((uint16_t)(b[base]     & 0x0F) << 8) | b[base + 1];
         uint16_t ry = ((uint16_t)(b[base + 2] & 0x0F) << 8) | b[base + 3];
         if (rx >= SCREEN_W) rx = SCREEN_W - 1;
         if (ry >= SCREEN_H) ry = SCREEN_H - 1;
-        xs[p] = (int16_t)rx;
-        ys[p] = (int16_t)ry;
+        xs[out] = (int16_t)rx;
+        ys[out] = (int16_t)ry;
+        out++;
     }
-    return num;
+    return out;
 }
 
 // ─────────────────────────────────────────────

@@ -44,6 +44,7 @@
 #include "galaga.h"
 #include "pole_position.h"
 #include "mario_bros.h"
+#include "donkey_kong.h"
 #include "breakout.h"
 #include "game_2048.h"
 #include "minesweeper.h"
@@ -488,6 +489,7 @@ static void maxine_open_games() {
         { "GALAGA",     run_galaga },
         { "POLE POS",   run_pole_position },
         { "MARIO BROS", run_mario_bros },
+        { "DONKEY KONG",run_donkey_kong },
         { "BREAKOUT",   run_breakout },
         { "2048",       run_2048 },
         { "MINESWEEPER",run_minesweeper },

@@ -33,6 +33,9 @@
 #ifdef DEVICE_C28P
 #include "c28p_dpad.h"
 #endif
+#ifdef DEVICE_C5
+#include "c5_dpad.h"
+#endif
 #ifdef DEVICE_MAXINE
 #include "maxine_dpad.h"
 #endif
@@ -60,8 +63,10 @@ extern SemaphoreHandle_t spi_mutex;
 #define TS          6
 #define HUD_H       12
 #define MAZE_TOP    20
-#elif defined(DEVICE_C28P)
+#elif defined(DEVICE_C28P) || defined(DEVICE_C5)
 // C28P 240×320 portrait, top 200px game area, bottom 120px D-pad.
+// C5 is identical — same panel, same touch-only kiosk shape, same
+// virtual dpad layout from c5_dpad.cpp.
 // TS=6 → maze is 168 wide × 186 tall, plus HUD=10 and MAZE_TOP=4
 // totals 200px in the vertical, exactly filling the game viewport.
 #define SCREEN_W    240
@@ -221,7 +226,7 @@ static int viewX() {
 }
 
 static int viewY() {
-#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_C28P) || defined(DEVICE_C5) || defined(DEVICE_MAXINE)
     // Top-anchor on touch kiosks so the bottom rows stay reserved for
     // the virtual D-pad chrome.
     return 0;
@@ -479,10 +484,11 @@ static void saveHS(int hs) {
 static void drawHUD() {
     int vx = viewX();
     int vy = viewY();
-#ifdef DEVICE_C28P
-    // C28P: top 14px is dpad's exit bar. Don't paint a separate HUD;
-    // instead write score/level/lives compactly into the right side
-    // of the exit bar.
+#if defined(DEVICE_C28P) || defined(DEVICE_C5)
+    // C28P + C5: top 14px is dpad's exit bar. Don't paint a separate
+    // HUD; instead write score/level/lives compactly into the right
+    // side of the exit bar. Both boards share the 240x14 strip layout
+    // since they share the same dpad chrome rendering.
     gfx->fillRect(80, 0, 240 - 80, 14, COL_BLACK);
     gfx->setTextSize(1);
     gfx->setTextColor(COL_SCORE);
@@ -981,6 +987,10 @@ void run_pacman() {
 #ifdef DEVICE_C28P
     // Paint D-pad chrome below the game viewport
     c28p_dpad_render();
+#endif
+#ifdef DEVICE_C5
+    // C5 mirrors C28P's chrome layout (same panel, same dpad shape).
+    c5_dpad_render();
 #endif
 #ifdef DEVICE_MAXINE
     // Paint Maxine's virtual D-pad below the game viewport (y >= 520).

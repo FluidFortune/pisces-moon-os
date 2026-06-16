@@ -69,7 +69,7 @@
 #else
 #include <Arduino_GFX_Library.h>
 #endif
-#if !defined(DEVICE_C28P) && !defined(DEVICE_MAXINE)
+#if !defined(DEVICE_C28P) && !defined(DEVICE_MAXINE) && !defined(DEVICE_C5)
 #include "keyboard.h"
 #include "touch.h"
 #endif
@@ -89,6 +89,13 @@ static constexpr int DISP_W = 480;
 #elif defined(DEVICE_C28P)
 extern Arduino_GFX *gfx;
 extern bool c28p_touch_read(int16_t* x, int16_t* y);
+static constexpr int DISP_W = 240;
+#elif defined(DEVICE_C5)
+// C5 uses XPT2046 resistive touch via the inline driver in c5_boot.cpp.
+// Same signature as the C28P's capacitive read — returns (x, y) in
+// 240×320 portrait space, true when a stable touch is detected.
+extern Arduino_GFX *gfx;
+extern bool c5_touch_read(int16_t* x, int16_t* y);
 static constexpr int DISP_W = 240;
 #elif defined(DEVICE_CARDPUTER_ADV)
 extern Arduino_GFX *gfx;
@@ -926,6 +933,12 @@ static bool _filemgr_should_stop() {
 #elif defined(DEVICE_MAXINE)
     if (maxine_touch_read(&tx, &ty) && ty < 56) {
         while (maxine_touch_read(&tx, &ty)) { delay(10); yield(); }
+        return true;
+    }
+#elif defined(DEVICE_C5)
+    // C5 mirrors the C28P kiosk model — tap the top header band to exit.
+    if (c5_touch_read(&tx, &ty) && ty < 40) {
+        while (c5_touch_read(&tx, &ty)) { delay(10); yield(); }
         return true;
     }
 #else

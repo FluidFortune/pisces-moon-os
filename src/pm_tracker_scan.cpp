@@ -61,7 +61,7 @@
 //  is the actionable signal for a stalking scenario.
 // ─────────────────────────────────────────────
 
-#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE) || defined(DEVICE_C5)
 
 #include <Arduino.h>
 #include <Arduino_GFX_Library.h>
@@ -72,9 +72,14 @@
 
 extern Arduino_GFX *gfx;
 
+#if defined(DEVICE_C28P) || defined(DEVICE_C5)
 #ifdef DEVICE_C28P
 extern bool c28p_touch_read(int16_t* x, int16_t* y);
 static inline bool _ts_touch(int16_t* x, int16_t* y) { return c28p_touch_read(x, y); }
+#else  // DEVICE_C5
+extern bool c5_touch_read(int16_t* x, int16_t* y);
+static inline bool _ts_touch(int16_t* x, int16_t* y) { return c5_touch_read(x, y); }
+#endif
 static const int TS_W            = 240;
 static const int TS_H            = 320;
 static const int TS_EXIT_H       = 14;
@@ -210,10 +215,25 @@ static void scan_window_and_collect() {
     ensure_ble();
     if (!g_scanner) return;
 
-    NimBLEScanResults results = g_scanner->start(1, false);
+    // NimBLE 1.x (C28P/MAXINE on 1.4.1) vs 2.x (C5 on ^2.1.0) differ
+    // in the scan-start API and how getDevice() returns a result. The
+    // rest of the loop body uses `dev.` uniformly so the divergence is
+    // confined to these two ifdef blocks.
+#if defined(DEVICE_C5)
+    NimBLEScanResults results = g_scanner->getResults(1000, false);  // ms
+#else
+    NimBLEScanResults results = g_scanner->start(1, false);          // s
+#endif
     int count = results.getCount();
     for (int i = 0; i < count; i++) {
+#if defined(DEVICE_C5)
+        // NimBLE 2.x: getDevice returns a const pointer, not a value.
+        const NimBLEAdvertisedDevice* devp = results.getDevice(i);
+        if (!devp) continue;
+        const NimBLEAdvertisedDevice& dev = *devp;
+#else
         NimBLEAdvertisedDevice dev = results.getDevice(i);
+#endif
         if (!dev.haveManufacturerData()) continue;
 
         std::string mfg = dev.getManufacturerData();
@@ -224,9 +244,23 @@ static void scan_window_and_collect() {
         // little-endian on this version; reverse to MSB-first for
         // human-readable display.
         NimBLEAddress nbaddr = dev.getAddress();
-        const uint8_t* raw = nbaddr.getNative();
         uint8_t addr_be[6];
+#if defined(DEVICE_C5)
+        // NimBLE 2.x removed/renamed getNative(); use toString() and
+        // parse — the colon-separated MSB-first form is stable across
+        // NimBLE versions. Result: 6-byte big-endian address.
+        std::string s = nbaddr.toString();
+        unsigned ba[6];
+        if (sscanf(s.c_str(), "%x:%x:%x:%x:%x:%x",
+                   &ba[0], &ba[1], &ba[2], &ba[3], &ba[4], &ba[5]) != 6) {
+            continue;
+        }
+        for (int j = 0; j < 6; j++) addr_be[j] = (uint8_t)ba[j];
+#else
+        // NimBLE 1.x: getNative() returns LE bytes; reverse for BE.
+        const uint8_t* raw = nbaddr.getNative();
         for (int j = 0; j < 6; j++) addr_be[j] = raw[5 - j];
+#endif
 
         int idx = find_or_add(addr_be, type);
         if (idx < 0) continue;
@@ -488,4 +522,4 @@ void pm_run_tracker_scan() {
     }
 }
 
-#endif // DEVICE_C28P || DEVICE_MAXINE
+#endif // DEVICE_C28P || DEVICE_MAXINE || DEVICE_C5

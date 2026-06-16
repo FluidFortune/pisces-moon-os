@@ -11,7 +11,7 @@
 //  Shared: feed list (NoSQL "rss_feeds"), default-seed, fetch+parse.
 //  Per-device: layout + input handling.
 //
-//  PORTRAIT (C28P, Heltec V4 — 240×320):  list scrolls vertically
+//  PORTRAIT (C28P, Heltec V4, C5 — 240×320):  list scrolls vertically
 //  T-DECK PLUS (320×240 landscape):       2-column list, keyboard nav
 //  CARDPUTER ADV (240×135 landscape):     compact list, keyboard scroll
 //  T-LORA PAGER (480×222 landscape):      wide 2-column, NES+touch
@@ -33,6 +33,12 @@ extern Arduino_GFX *gfx;
 
 #if defined(DEVICE_C28P) || defined(DEVICE_HELTEC_V4)
 extern bool c28p_touch_read(int16_t *x, int16_t *y);
+#endif
+#if defined(DEVICE_C5)
+// XPT2046 resistive touch on shared SPI; driver lives in c5_boot.cpp.
+// Same (int16_t*,int16_t*)→bool signature as c28p_touch_read, so the
+// portrait section below dispatches per-device through p_touch().
+extern bool c5_touch_read(int16_t *x, int16_t *y);
 #endif
 
 // T-LoRa Pager has no touch hardware — NES buttons (dpad + A/B) only.
@@ -204,8 +210,19 @@ static int draw_wrapped(const String& s, int x0, int y0,
 //  PER-DEVICE IMPLEMENTATIONS
 // ─────────────────────────────────────────────
 
-#if defined(DEVICE_C28P) || defined(DEVICE_HELTEC_V4)
-// ─── Portrait 240×320 ───
+#if defined(DEVICE_C28P) || defined(DEVICE_HELTEC_V4) || defined(DEVICE_C5)
+// ─── Portrait 240×320 (C28P, Heltec V4, C5) ───
+// Identical layout on all three; only the touch driver differs
+// (FT6336G capacitive vs XPT2046 resistive). Same pattern as
+// weather.cpp's portrait branch.
+
+static inline bool p_touch(int16_t *x, int16_t *y) {
+#if defined(DEVICE_C5)
+    return c5_touch_read(x, y);
+#else
+    return c28p_touch_read(x, y);
+#endif
+}
 
 static constexpr int P_PER_PAGE = 5;
 static constexpr int P_ROW_H = 52;
@@ -254,7 +271,7 @@ static bool p_pick_feed(String& feed_url, String& feed_name) {
     int pressed = -2;
     while (true) {
         int16_t tx, ty;
-        bool touched = c28p_touch_read(&tx, &ty);
+        bool touched = p_touch(&tx, &ty);
         if (touched && !was_touched) {
             if (ty < 14) pressed = -1;
             else {
@@ -292,9 +309,9 @@ static void p_show_article(int idx) {
     bool was_touched = false;
     while (true) {
         int16_t tx, ty;
-        bool touched = c28p_touch_read(&tx, &ty);
+        bool touched = p_touch(&tx, &ty);
         if (touched && !was_touched) {
-            while (c28p_touch_read(&tx, &ty)) { delay(20); yield(); }
+            while (p_touch(&tx, &ty)) { delay(20); yield(); }
             return;
         }
         was_touched = touched;
@@ -340,7 +357,7 @@ static void p_show_headlines(const String& feed_name) {
     int pressed = -2;
     while (true) {
         int16_t tx, ty;
-        bool touched = c28p_touch_read(&tx, &ty);
+        bool touched = p_touch(&tx, &ty);
         if (touched && !was_touched) {
             if (ty < 14) pressed = -1;
             else if (ty >= 304 && pages > 1) {
@@ -929,7 +946,7 @@ static void tlp_pick_feed_and_run() {
 void run_rss() {
     seed_defaults_if_empty();
 
-#if defined(DEVICE_C28P) || defined(DEVICE_HELTEC_V4)
+#if defined(DEVICE_C28P) || defined(DEVICE_HELTEC_V4) || defined(DEVICE_C5)
     portrait_loop();
 #elif defined(DEVICE_TDECK_PLUS)
     td_pick_feed_and_run();

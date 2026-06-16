@@ -49,6 +49,9 @@ extern SdFat sd;
 #ifdef DEVICE_C28P
 #include "c28p_dpad.h"
 #endif
+#ifdef DEVICE_C5
+#include "c5_dpad.h"
+#endif
 #ifdef DEVICE_MAXINE
 #include "maxine_dpad.h"
 #endif
@@ -59,7 +62,7 @@ extern SdFat sd;
 #elif defined(DEVICE_CARDPUTER_ADV)
 #define SCREEN_W        240
 #define SCREEN_H        135
-#elif defined(DEVICE_C28P)
+#elif defined(DEVICE_C28P) || defined(DEVICE_C5)
 #define SCREEN_W        240
 #define SCREEN_H        200
 #elif defined(DEVICE_MAXINE)
@@ -73,7 +76,7 @@ extern SdFat sd;
 #endif
 #ifdef DEVICE_CARDPUTER_ADV
 #define PLAY_W          220
-#elif defined(DEVICE_C28P)
+#elif defined(DEVICE_C28P) || defined(DEVICE_C5)
 #define PLAY_W          220
 #elif defined(DEVICE_MAXINE)
 #define PLAY_W          440   // 20px margin each side on a 480-wide panel
@@ -119,7 +122,9 @@ extern SdFat sd;
 // (C28P: y>=200, Maxine: y>=520) holds the virtual D-pad chrome
 // and must not be wiped — restrict the clear to the game viewport.
 static inline void clearGameArea() {
-#ifdef DEVICE_C28P
+#if defined(DEVICE_C28P) || defined(DEVICE_C5)
+    // C28P + C5 share the same 240x200 game viewport above the dpad
+    // chrome at y>=200.
     gfx->fillRect(0, 0, 240, 200, COL_BG);
 #elif defined(DEVICE_MAXINE)
     gfx->fillRect(0, 0, 480, 520, COL_BG);
@@ -1106,6 +1111,10 @@ void run_galaga() {
 #ifdef DEVICE_C28P
     // Paint the virtual D-pad chrome below the game viewport
     c28p_dpad_render();
+#endif
+#ifdef DEVICE_C5
+    // C5 uses the same 240x200 viewport + dpad chrome as C28P.
+    c5_dpad_render();
 #endif
 #ifdef DEVICE_MAXINE
     // Paint Maxine's virtual D-pad below the game viewport (y >= 520).

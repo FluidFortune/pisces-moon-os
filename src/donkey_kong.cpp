@@ -7,27 +7,36 @@
 // ─────────────────────────────────────────────
 //  donkey_kong.cpp — original arcade-style climbing game
 //
-//  CHUNK 1 — THE PROVING SKELETON.
+//  Complete implementation. The 1981-spirit single-screen climbing
+//  game: Jumpman starts bottom-right and must reach Pauline at the
+//  top while dodging barrels thrown by Donkey Kong, fireballs from
+//  the oil drum, and the gaps in broken ladders. Hammers along the
+//  way give him a brief window of smash-everything offense.
 //
-//  This is the first of four build chunks (see donkey_kong.h). It
-//  exists to prove three risky things on real hardware BEFORE any
-//  barrels/fireballs are added:
-//    1. The pmp::FixedTimestep accumulator runs the sim at a steady
-//       60 Hz without stutter on the ESP32-S3.
-//    2. Sloped-girder collision (height-function y=f(x)) feels right
-//       underfoot — Jumpman rises/falls with the incline as he walks.
-//    3. The fall-damage rule is tuned so a one-level drop is safe and
-//       a two-level drop is fatal.
-//
-//  What's HERE: the canonical 25m board (girders + full/broken
-//  ladders) in board-units, per-device projection, Jumpman walking
-//  sloped girders, climbing FULL ladders, falling, fall damage, and
-//  rendering. DK + Pauline are drawn as static decoration so the
-//  board reads correctly.
-//
-//  What's NOT here yet: barrels (chunk 2), fireballs/hammers/scoring/
-//  level-clear (chunk 3), five-device tuning + audio polish (chunk 4).
-//  Launcher entry is C28P-only for now.
+//  WHAT'S HERE (everything):
+//    • Sloped-girder collision (height-function y=f(x)) with the
+//      arcade-feel zigzag layout.
+//    • Jumpman FSM: idle / run / jump (RIGID, no air control) /
+//      climb / hammering / fall / dying.
+//    • Fall damage tuned to the 32-BU girder gap so one-level drops
+//      are safe, two-level drops are fatal.
+//    • Barrels: DK throws them on a level-scaled cadence; they roll
+//      with the girder slope (zigzag down the stack), RNG-drop down
+//      ladders, and either kill Jumpman, are smashed by his hammer
+//      (+300), or are jumped over for points (+100, one credit per
+//      barrel).
+//    • Fireballs from the oil drum patrol girders, occasionally
+//      climb ladders, and weakly track Jumpman's x. Hammer-smashable
+//      for +500.
+//    • Two hammer pickups per level. While hammering, Jumpman is
+//      invincible but cannot jump or climb (HAMMER_DURATION = 5s).
+//    • Bonus counter (5000 → 0 at 100/s) added to score on level
+//      clear. Reaching Pauline ends the level and escalates the
+//      next: faster barrel cadence, more fireballs.
+//    • DK arm-raise animation each time he throws.
+//    • Per-device geometry projection (uniform-scale letterbox) so
+//      the feel is identical on every screen and the slope angles
+//      stay correct.
 //
 //  ARCHITECTURE (per pm_platformer.h): strict SIM / DRAW split. The
 //  SIM section never calls gfx->. The DRAW section (render + its
@@ -62,6 +71,9 @@
 #include <FS.h>
 #include <SD_MMC.h>
 #else
+#ifdef DEVICE_C5
+#include "c5_dpad.h"
+#endif
 #include <SdFat.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -94,7 +106,7 @@ static constexpr int FRAME_DELAY_MS = 33;
 #elif defined(DEVICE_TLORAPAGER)
 static constexpr int VIEW_W = 320, VIEW_H = 222, HUD_H = 12;
 static constexpr int FRAME_DELAY_MS = 16;
-#elif defined(DEVICE_C28P)
+#elif defined(DEVICE_C28P) || defined(DEVICE_C5)
 static constexpr int VIEW_W = 240, VIEW_H = 200, HUD_H = 14;  // top 200px; dpad below
 static constexpr int FRAME_DELAY_MS = 16;
 #elif defined(DEVICE_MAXINE)
@@ -129,6 +141,47 @@ static constexpr float PLAYER_W_BU = 11.0f;
 static constexpr float PLAYER_H_BU = 16.0f;
 static constexpr float GIRDER_T_BU = 5.0f;
 
+// ── Barrels (board-units)
+static constexpr float BARREL_W_BU      = 9.0f;
+static constexpr float BARREL_H_BU      = 9.0f;
+static constexpr float BARREL_ROLL_BU   = 50.0f;
+static constexpr float BARREL_TERM_BU   = 220.0f;
+static constexpr float BARREL_DROP_BASE = 0.22f;   // prob/frame at ladder TOP, base
+// DK throws on a cadence that tightens as the level climbs. We keep an
+// inviolable floor (BARREL_SPAWN_MIN) so even at high levels the screen
+// never floods past what MAX_BARRELS can hold.
+static constexpr float BARREL_SPAWN_BASE = 3.5f;
+static constexpr float BARREL_SPAWN_MIN  = 1.6f;
+static constexpr float BARREL_SPAWN_DECAY = 0.30f;  // s/level
+
+// ── Fireballs (board-units)
+static constexpr float FIREBALL_W_BU         = 10.0f;
+static constexpr float FIREBALL_H_BU         = 11.0f;
+static constexpr float FIREBALL_WALK_BU      = 22.0f;
+static constexpr float FIREBALL_CLIMB_BU     = 18.0f;
+static constexpr float FIREBALL_LADDER_RATE  = 0.6f;   // prob/sec at a ladder bottom
+static constexpr float FIREBALL_SPAWN_BASE   = 14.0f;
+static constexpr float FIREBALL_SPAWN_MIN    = 7.0f;
+
+// ── Hammer (board-units)
+static constexpr float HAMMER_W_BU    = 9.0f;
+static constexpr float HAMMER_H_BU    = 11.0f;
+static constexpr float HAMMER_DURATION = 5.0f;
+
+// ── DK / Pauline animation
+static constexpr float DK_THROW_ANIM    = 0.45f;
+static constexpr float PAULINE_W_BU     = 8.0f;
+static constexpr float PAULINE_H_BU     = 14.0f;
+static constexpr float LEVEL_CLEAR_HOLD = 2.4f;     // freeze + flourish duration
+
+// ── Bonus / scoring
+static constexpr float BONUS_START = 5000.0f;
+static constexpr float BONUS_RATE  = 100.0f;        // points/sec drain
+static constexpr int   SCORE_BARREL_JUMP    = 100;
+static constexpr int   SCORE_BARREL_SMASH   = 300;
+static constexpr int   SCORE_FIREBALL_SMASH = 500;
+static constexpr int   SCORE_PAULINE_KISS   = 100;  // flat bonus on top of remaining bonus
+
 // ─────────────────────────────────────────────
 //  COLORS (RGB565)
 // ─────────────────────────────────────────────
@@ -145,25 +198,38 @@ static constexpr uint16_t COL_JM_DYING   = 0xFFE0;  // yellow flash on death
 static constexpr uint16_t COL_DK_BODY    = 0x8B40;  // brown
 static constexpr uint16_t COL_DK_FACE    = 0xFCC0;  // muzzle
 static constexpr uint16_t COL_PAULINE    = 0xF81F;  // pink dress
+static constexpr uint16_t COL_PAULINE_HAIR = 0xFFE0;
+static constexpr uint16_t COL_BARREL     = 0xFCA0;  // amber
+static constexpr uint16_t COL_BARREL_BAND = 0x6A40;
+static constexpr uint16_t COL_FIRE_HOT   = 0xFFE0;  // yellow core
+static constexpr uint16_t COL_FIRE_MID   = 0xFD20;  // orange
+static constexpr uint16_t COL_FIRE_RIM   = 0xF800;  // red
+static constexpr uint16_t COL_HAMMER     = 0xFFE0;  // bright yellow head
+static constexpr uint16_t COL_HAMMER_GRIP = 0x9320;
+static constexpr uint16_t COL_OIL_DRUM   = 0x8B40;
 static constexpr uint16_t COL_TITLE      = 0xFFE0;
 
 // ─────────────────────────────────────────────
 //  THE 25m BOARD (board-units; one source of truth)
 //
-//  Six girders bottom→top, 32-BU spacing, gentle ±6 BU alternating
-//  slope (zig-zag). G5 is the flat top platform DK stands on. Ladder
-//  endpoints (yt/yb) are pre-computed to sit on the girder surfaces
-//  at their x. A full-ladder climb path exists: L0→L1→L2→L3→L4.
+//  Six girders bottom→top, 32-BU spacing, gentle alternating slope
+//  (zig-zag). G0–G4 span the FULL board width (0→224) wall-to-wall,
+//  so there are no side gutters and the screen edges act as solid
+//  walls (clamp_to_board) — Jumpman can't stroll off an end into open
+//  air. G5 is the short flat top platform DK stands on. Ladder
+//  endpoints (yt/yb) sit on the girder surfaces at their x; the
+//  slope LINES are unchanged by the wall-to-wall extension, so every
+//  ladder still meets its girder exactly. Full climb path: L0→L4.
 //  Broken ladders (for chunk-2 barrels) can't be climbed.
 // ─────────────────────────────────────────────
 static const GirderDef BOARD_GIRDERS[N_GIRDERS] = {
     //  xl   yl    xr   yr
-    {   0, 244,  224, 244 },   // G0 bottom — FLAT, full width (safe floor, no walk-off)
-    {  16, 202,  208, 214 },   // G1        — down-right
-    {  16, 182,  208, 170 },   // G2        — down-left
-    {  16, 138,  208, 150 },   // G3        — down-right
-    {  16, 118,  208, 106 },   // G4        — down-left
-    {  60,  80,  164,  80 },   // G5 top    — flat (DK platform)
+    {   0, 244,  224, 244 },   // G0 bottom — FLAT, full width
+    {   0, 201,  224, 215 },   // G1        — down-right, wall-to-wall
+    {   0, 183,  224, 169 },   // G2        — down-left,  wall-to-wall
+    {   0, 137,  224, 151 },   // G3        — down-right, wall-to-wall
+    {   0, 119,  224, 105 },   // G4        — down-left,  wall-to-wall
+    {  60,  80,  164,  80 },   // G5 top    — flat (DK platform, short by design)
 };
 
 static const LadderDef BOARD_LADDERS[N_LADDERS] = {
@@ -187,6 +253,28 @@ static Ladder g_ladders[N_LADDERS];
 static float  g_scale = 1.0f, g_off_x = 0.0f, g_off_y = 0.0f;
 static float  g_gravity, g_jump_vel, g_walk, g_climb, g_max_fall, g_fall_dmg;
 static float  g_pw, g_ph, g_girder_t;
+static float  g_barrel_w, g_barrel_h, g_barrel_roll, g_barrel_term;
+static float  g_fireball_w, g_fireball_h, g_fireball_walk, g_fireball_climb;
+static float  g_hammer_w, g_hammer_h;
+static float  g_pauline_w, g_pauline_h;
+
+// Static-per-level data computed at projection time and after every
+// level reset. Sprite rects for DK / Pauline / oil drum live here so
+// render() can stay branch-free and the Pauline-collision test reads
+// them as a plain AABB.
+struct SpriteRect { float x, y, w, h; };
+static SpriteRect g_dk_rect;
+static SpriteRect g_pauline_rect;
+static SpriteRect g_oil_rect;
+
+// Hammer pickup positions — picked to sit on the climb path:
+//   spot 0: mid of G3 (above the bottom-half barrel storm)
+//   spot 1: right side of G1 (rewards taking the long way around)
+struct HammerSpotDef { int girder; float frac; };
+static const HammerSpotDef HAMMER_SPOTS[2] = {
+    { 3, 0.50f },
+    { 1, 0.78f },
+};
 
 // ─────────────────────────────────────────────
 //  VIEWPORT HELPERS (centre VIEW within a larger physical screen,
@@ -245,6 +333,50 @@ void project_board(int view_w, int view_h, int hud_h) {
     g_ph       = PLAYER_H_BU * g_scale;
     g_girder_t = GIRDER_T_BU * g_scale;
     if (g_girder_t < 3.0f) g_girder_t = 3.0f;
+
+    g_barrel_w       = BARREL_W_BU       * g_scale;
+    g_barrel_h       = BARREL_H_BU       * g_scale;
+    g_barrel_roll    = BARREL_ROLL_BU    * g_scale;
+    g_barrel_term    = BARREL_TERM_BU    * g_scale;
+    g_fireball_w     = FIREBALL_W_BU     * g_scale;
+    g_fireball_h     = FIREBALL_H_BU     * g_scale;
+    g_fireball_walk  = FIREBALL_WALK_BU  * g_scale;
+    g_fireball_climb = FIREBALL_CLIMB_BU * g_scale;
+    g_hammer_w       = HAMMER_W_BU       * g_scale;
+    g_hammer_h       = HAMMER_H_BU       * g_scale;
+    g_pauline_w      = PAULINE_W_BU      * g_scale;
+    g_pauline_h      = PAULINE_H_BU      * g_scale;
+    if (g_barrel_w < 4.0f) g_barrel_w = 4.0f;
+    if (g_barrel_h < 4.0f) g_barrel_h = 4.0f;
+    if (g_fireball_w < 5.0f) g_fireball_w = 5.0f;
+    if (g_fireball_h < 5.0f) g_fireball_h = 5.0f;
+    if (g_hammer_w < 4.0f) g_hammer_w = 4.0f;
+    if (g_hammer_h < 5.0f) g_hammer_h = 5.0f;
+    if (g_pauline_w < 4.0f) g_pauline_w = 4.0f;
+    if (g_pauline_h < 7.0f) g_pauline_h = 7.0f;
+
+    // Sprite rects for DK, Pauline, oil drum (pixel space).
+    {
+        const Girder& g5 = g_girders[5];
+        float dk_w = 20.0f * g_scale; if (dk_w < 12.0f) dk_w = 12.0f;
+        float dk_h = 20.0f * g_scale; if (dk_h < 12.0f) dk_h = 12.0f;
+        float dk_x = g5.x_left + 2.0f * g_scale;
+        float dk_surf = girder_y_at(g5, dk_x + dk_w * 0.5f);
+        g_dk_rect = { dk_x, dk_surf - dk_h, dk_w, dk_h };
+
+        // Pauline stands above & to the right of DK.
+        float pl_x = dk_x + dk_w + 6.0f * g_scale;
+        g_pauline_rect = { pl_x, dk_surf - dk_h - g_pauline_h - 2.0f,
+                           g_pauline_w + 2.0f, g_pauline_h };
+
+        // Oil drum at G0 left side — fireball spawn point.
+        const Girder& g0 = g_girders[0];
+        float od_w = 14.0f * g_scale; if (od_w < 10.0f) od_w = 10.0f;
+        float od_h = 16.0f * g_scale; if (od_h < 12.0f) od_h = 12.0f;
+        float od_x = g0.x_left + 4.0f * g_scale;
+        float od_surf = girder_y_at(g0, od_x + od_w * 0.5f);
+        g_oil_rect = { od_x, od_surf - od_h, od_w, od_h };
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -277,10 +409,11 @@ static bool in_girder_span(int i, float cx) {
 }
 
 // Keep Jumpman within the board's horizontal bounds — he can't walk or
-// drift off the left/right screen edges (DK has no horizontal wrap).
-// This does NOT prevent falling off the interior ENDS of the upper
-// girders (those ends sit inside the board), so the drop-to-the-level-
-// below mechanic still works; it only stops him leaving the world.
+// drift off the left/right screen edges. With G0–G4 spanning the full
+// board width, these bounds coincide with the girder ends, so the
+// edges are solid walls: walking into one stops him dead instead of
+// dropping him into a gutter. Only G5 (the short top platform) has
+// interior ends; stepping off those is a safe one-level drop onto G4.
 static inline void clamp_to_board(Jumpman& p) {
     float lo = g_off_x;
     float hi = g_off_x + BOARD_W * g_scale - g_pw;
@@ -494,19 +627,26 @@ void update_jumpman(GameState& gs, const PMNesInput& in, float dt) {
         return;   // still climbing
     }
 
-    // ── GROUNDED (IDLE / RUNNING) ──
+    // ── GROUNDED (IDLE / RUNNING / HAMMERING) ──
     if (!airborne(p)) {
-        // Climb intent takes priority over walking.
-        if (in.up   && try_start_climb(gs, true,  false)) return;
-        if (in.down && try_start_climb(gs, false, true )) return;
+        bool hammering = (p.state == JM_HAMMERING);
 
-        // Horizontal walk (full ground control).
-        if (in.left)       { p.vx = -g_walk; p.facing = -1; p.state = JM_RUNNING; }
-        else if (in.right) { p.vx =  g_walk; p.facing = +1; p.state = JM_RUNNING; }
-        else               { p.vx = 0;       p.state = JM_IDLE; }
+        // Climb intent takes priority over walking — but not while
+        // hammering. (DK arcade: hammer can't climb.)
+        if (!hammering) {
+            if (in.up   && try_start_climb(gs, true,  false)) return;
+            if (in.down && try_start_climb(gs, false, true )) return;
+        }
 
-        // Jump (rigid). HAMMERING (chunk 3) will disable this.
-        if (in.a) { to_jumping(p); pm_game_audio_fx_jump(); }
+        // Horizontal walk (full ground control). While hammering we
+        // still move but keep the JM_HAMMERING state so the draw layer
+        // shows the hammer overhead and collisions resolve as smash.
+        if (in.left)       { p.vx = -g_walk; p.facing = -1; if (!hammering) p.state = JM_RUNNING; }
+        else if (in.right) { p.vx =  g_walk; p.facing = +1; if (!hammering) p.state = JM_RUNNING; }
+        else               { p.vx = 0;       if (!hammering) p.state = JM_IDLE; }
+
+        // Jump (rigid). Disabled while hammering — the arcade rule.
+        if (!hammering && in.a) { to_jumping(p); pm_game_audio_fx_jump(); }
 
         // Move horizontally, then resolve against the girder.
         if (!airborne(p)) {
@@ -552,15 +692,489 @@ void update_jumpman(GameState& gs, const PMNesInput& in, float dt) {
     }
 }
 
-// Barrels / fireballs arrive in chunks 2 and 3 — no-ops for now so the
-// header contract is satisfied and step_world can call them uniformly.
-void update_barrel(GameState& gs, int slot, float dt)   { (void)gs; (void)slot; (void)dt; }
-void update_fireball(GameState& gs, int slot, float dt) { (void)gs; (void)slot; (void)dt; }
+// ──────────────────────────────────────────
+//  SPAWN HELPERS
+// ──────────────────────────────────────────
+static int find_free_barrel(GameState& gs) {
+    for (int i = 0; i < MAX_BARRELS; i++) if (!gs.barrels[i].active) return i;
+    return -1;
+}
+static int find_free_fireball(GameState& gs) {
+    for (int i = 0; i < MAX_FIREBALLS; i++) if (!gs.fireballs[i].active) return i;
+    return -1;
+}
+
+static void spawn_barrel(GameState& gs) {
+    int slot = find_free_barrel(gs);
+    if (slot < 0) return;
+    Barrel& b = gs.barrels[slot];
+    const Girder& g5 = g_girders[5];
+    // Spawn at DK's right side, on the G5 surface.
+    float spawn_x = g_dk_rect.x + g_dk_rect.w + 2.0f;
+    if (spawn_x + g_barrel_w > g5.x_right) spawn_x = g5.x_right - g_barrel_w - 1.0f;
+    if (spawn_x < g5.x_left) spawn_x = g5.x_left + 1.0f;
+    float surf = girder_y_at(g5, spawn_x + g_barrel_w * 0.5f);
+    b.x = spawn_x;
+    b.y = surf - g_barrel_h;
+    b.vx = g_barrel_roll;          // rolls rightward off G5 onto G4
+    b.vy = 0.0f;
+    b.state = BAR_ROLLING;
+    b.girder = 5;
+    b.active = true;
+    b.scored = false;
+    gs.dk_anim_timer = DK_THROW_ANIM;
+    pm_game_audio_fx_kick();
+}
+
+static void spawn_fireball(GameState& gs) {
+    int slot = find_free_fireball(gs);
+    if (slot < 0) return;
+    Fireball& f = gs.fireballs[slot];
+    const Girder& g0 = g_girders[0];
+    // Emerge from the oil drum; place sprite just to the right of it.
+    float spawn_x = g_oil_rect.x + g_oil_rect.w + 2.0f;
+    if (spawn_x + g_fireball_w > g0.x_right) spawn_x = g0.x_left + 18.0f * g_scale;
+    float surf = girder_y_at(g0, spawn_x + g_fireball_w * 0.5f);
+    f.x = spawn_x;
+    f.y = surf - g_fireball_h;
+    f.vx = g_fireball_walk;        // wander rightward initially
+    f.vy = 0.0f;
+    f.girder = 0;
+    f.ladder = -1;
+    f.active = true;
+    f.climbing = false;
+    f.anim_timer = 0.0f;
+}
+
+// Generic swept landing test parameterised by entity height. Mirror of
+// landing_girder() above but for any entity (barrels are taller than
+// they are wide; fireballs use this on the rare descent path).
+static int landing_girder_h(float prev_y, float curr_y, float cx, float h) {
+    float prev_feet = prev_y + h;
+    float curr_feet = curr_y + h;
+    if (curr_feet < prev_feet) return -1;
+    int best = -1;
+    float best_surf = 1e9f;
+    for (int i = 0; i < N_GIRDERS; i++) {
+        if (!in_girder_span(i, cx)) continue;
+        float surf = girder_y_at(g_girders[i], cx);
+        if (prev_feet <= surf && curr_feet >= surf) {
+            if (surf < best_surf) { best_surf = surf; best = i; }
+        }
+    }
+    return best;
+}
+
+// ──────────────────────────────────────────
+//  BARRELS
+//
+//  A barrel on a girder follows the slope: vx_sign tracks the
+//  downhill direction, so the zigzag-stacked layout drives the
+//  classic DK barrel cascade automatically. At a ladder TOP that
+//  matches the current girder's surface, an RNG check (decay
+//  steeper at higher levels) drops the barrel down the ladder. Off
+//  the end of a girder, the barrel enters BAR_FALLING and resumes
+//  normal projectile motion until the swept landing test catches
+//  it on the next girder — same algorithm Jumpman uses, just
+//  parameterised by g_barrel_h.
+// ──────────────────────────────────────────
+void update_barrel(GameState& gs, int slot, float dt) {
+    Barrel& b = gs.barrels[slot];
+    if (!b.active) return;
+
+    if (b.state == BAR_ROLLING) {
+        if (b.girder < 0 || b.girder >= N_GIRDERS) { b.active = false; return; }
+        const Girder& g = g_girders[b.girder];
+
+        // Roll direction is the girder's downhill (slope sign). On flat
+        // girders we preserve whatever vx came in — G0 (bottom) and G5
+        // (DK platform) both feed barrels off their right edges.
+        float dx_span = g.x_right - g.x_left;
+        float slope = (fabsf(dx_span) > 0.01f)
+                      ? (g.y_right - g.y_left) / dx_span
+                      : 0.0f;
+        if (fabsf(slope) > 0.03f) {
+            b.vx = (slope > 0 ? +1.0f : -1.0f) * g_barrel_roll;
+        }
+        b.x += b.vx * dt;
+        float cx = b.x + g_barrel_w * 0.5f;
+
+        // Off the girder edge → fall.
+        float lo = (g.x_left < g.x_right) ? g.x_left : g.x_right;
+        float hi = (g.x_left < g.x_right) ? g.x_right : g.x_left;
+        if (cx < lo || cx > hi) {
+            b.state  = BAR_FALLING;
+            b.girder = -1;
+            b.vy = 8.0f * g_scale;   // small nudge so gravity wins immediately
+            return;
+        }
+
+        // Snap to surface so the roll tracks the slope.
+        float surf = girder_y_at(g, cx);
+        b.y = surf - g_barrel_h;
+
+        // RNG drop check at any ladder TOP whose head sits on THIS girder.
+        // Skip the broken ladders for variety — barrels usually drop only
+        // through intact ladders. (Broken ladders still slow the player
+        // because he can't climb them; barrels swerving past them stays
+        // honest to the arcade.)
+        for (int i = 0; i < N_LADDERS; i++) {
+            const Ladder& L = g_ladders[i];
+            if (L.type != LADDER_FULL) continue;
+            if (fabsf(cx - L.x) > g_barrel_w * 0.6f) continue;
+            if (fabsf(L.y_top - surf) > g_girder_t + 2.0f) continue;
+            float p = BARREL_DROP_BASE + 0.04f * (float)(gs.level - 1);
+            if (p > 0.55f) p = 0.55f;
+            float r = (float)(esp_random() & 0xFFFF) / 65535.0f;
+            if (r < p * dt * 6.0f) {
+                b.x = L.x - g_barrel_w * 0.5f;
+                b.state  = BAR_FALLING;
+                b.girder = -1;
+                b.vx = 0.0f;
+                b.vy = g_barrel_roll * 0.6f;
+                return;
+            }
+        }
+        return;
+    }
+
+    if (b.state == BAR_FALLING) {
+        b.vy += g_gravity * dt;
+        if (b.vy > g_barrel_term) b.vy = g_barrel_term;
+        float prev_y = b.y;
+        b.x += b.vx * dt;
+        b.y += b.vy * dt;
+
+        float cx = b.x + g_barrel_w * 0.5f;
+        if (b.vy > 0) {
+            int gi = landing_girder_h(prev_y, b.y, cx, g_barrel_h);
+            if (gi >= 0) {
+                float surf = girder_y_at(g_girders[gi], cx);
+                b.y = surf - g_barrel_h;
+                b.vy = 0;
+                b.state  = BAR_ROLLING;
+                b.girder = gi;
+                // Inherit the new girder's slope direction. Flat girders
+                // (G0/G5) keep whatever sign vx had on takeoff so the
+                // barrel walks off the next edge.
+                float dxs = g_girders[gi].x_right - g_girders[gi].x_left;
+                float sl  = (fabsf(dxs) > 0.01f)
+                            ? (g_girders[gi].y_right - g_girders[gi].y_left) / dxs
+                            : 0.0f;
+                if (fabsf(sl) > 0.03f) b.vx = (sl > 0 ? +1.0f : -1.0f) * g_barrel_roll;
+                else if (fabsf(b.vx) < 1.0f) b.vx = g_barrel_roll;
+            }
+        }
+
+        // Off the bottom of the play area — retire the barrel.
+        if (b.y > g_off_y + BOARD_H * g_scale + g_barrel_h) {
+            b.active = false;
+        }
+        return;
+    }
+
+    // BAR_SPAWNED currently unused as a separate transition state —
+    // spawn_barrel() places the barrel directly into BAR_ROLLING. The
+    // enum slot is kept for future tuning (e.g., DK animation gate)
+    // without breaking the header contract.
+    (void)dt;
+}
+
+// ──────────────────────────────────────────
+//  FIREBALLS
+//
+//  Fireballs walk a girder back and forth, bouncing off the ends.
+//  Cheap tracking: if Jumpman is on the same (vertical) band, the
+//  fireball aligns its vx toward him. At a ladder bottom with
+//  Jumpman above, a per-second probability gate decides whether to
+//  climb. While climbing, the fireball stays snapped to the rail
+//  until it reaches the upper girder.
+// ──────────────────────────────────────────
+void update_fireball(GameState& gs, int slot, float dt) {
+    Fireball& f = gs.fireballs[slot];
+    if (!f.active) return;
+    f.anim_timer += dt;
+
+    if (f.climbing) {
+        if (f.ladder < 0 || f.ladder >= N_LADDERS) {
+            f.climbing = false; return;
+        }
+        const Ladder& L = g_ladders[f.ladder];
+        f.y += f.vy * dt;
+        f.x  = L.x - g_fireball_w * 0.5f;
+        float feet = f.y + g_fireball_h;
+        // Top arrival
+        if (f.vy < 0 && feet <= L.y_top) {
+            int gi = girder_under(L.x, L.y_top, fmaxf(4.0f, g_fireball_h * 0.6f));
+            if (gi >= 0) {
+                f.y = girder_y_at(g_girders[gi], L.x) - g_fireball_h;
+                f.girder = gi;
+                f.ladder = -1;
+                f.climbing = false;
+                // Aim toward Jumpman's x.
+                float pcx = gs.player.x + g_pw * 0.5f;
+                f.vx = (pcx > f.x + g_fireball_w * 0.5f ? +1 : -1) * g_fireball_walk;
+                f.vy = 0;
+            }
+            return;
+        }
+        // Bottom arrival (shouldn't usually happen — they climb up —
+        // but is safe to handle).
+        if (f.vy > 0 && feet >= L.y_bottom) {
+            int gi = girder_under(L.x, L.y_bottom, fmaxf(4.0f, g_fireball_h * 0.6f));
+            if (gi >= 0) {
+                f.y = girder_y_at(g_girders[gi], L.x) - g_fireball_h;
+                f.girder = gi;
+                f.ladder = -1;
+                f.climbing = false;
+                f.vx = g_fireball_walk;
+                f.vy = 0;
+            }
+            return;
+        }
+        return;
+    }
+
+    if (f.girder < 0 || f.girder >= N_GIRDERS) { f.active = false; return; }
+    const Girder& g = g_girders[f.girder];
+
+    f.x += f.vx * dt;
+    float cx = f.x + g_fireball_w * 0.5f;
+    float lo = (g.x_left < g.x_right) ? g.x_left : g.x_right;
+    float hi = (g.x_left < g.x_right) ? g.x_right : g.x_left;
+    // Bounce off the girder ends.
+    if (cx < lo + g_fireball_w * 0.5f) {
+        f.vx = +g_fireball_walk;
+        cx = lo + g_fireball_w * 0.5f;
+        f.x = cx - g_fireball_w * 0.5f;
+    } else if (cx > hi - g_fireball_w * 0.5f) {
+        f.vx = -g_fireball_walk;
+        cx = hi - g_fireball_w * 0.5f;
+        f.x = cx - g_fireball_w * 0.5f;
+    }
+
+    // Snap to girder surface.
+    f.y = girder_y_at(g, cx) - g_fireball_h;
+
+    // Cheap tracking: if Jumpman is roughly on the same level, align
+    // our walk direction toward him. Doesn't override a fresh bounce.
+    const Jumpman& p = gs.player;
+    float p_cx = p.x + g_pw * 0.5f;
+    if (fabsf((p.y + g_ph) - (f.y + g_fireball_h)) < g_ph * 1.5f) {
+        if (p_cx > f.x + g_fireball_w && f.vx < 0) f.vx = +g_fireball_walk;
+        else if (p_cx + g_pw < f.x && f.vx > 0) f.vx = -g_fireball_walk;
+    }
+
+    // Ladder-climb decision: only when Jumpman is above (so the
+    // fireball doesn't pointlessly climb away from him).
+    if (p.y + g_ph < f.y - 4.0f) {
+        for (int i = 0; i < N_LADDERS; i++) {
+            const Ladder& L = g_ladders[i];
+            if (L.type != LADDER_FULL) continue;
+            if (fabsf(cx - L.x) > g_fireball_w * 0.6f) continue;
+            if (fabsf(L.y_bottom - (f.y + g_fireball_h)) > g_fireball_h * 0.5f) continue;
+            float r = (float)(esp_random() & 0xFFFF) / 65535.0f;
+            if (r < FIREBALL_LADDER_RATE * dt) {
+                f.climbing = true;
+                f.ladder = i;
+                f.girder = -1;
+                f.vy = -g_fireball_climb;
+                f.x  = L.x - g_fireball_w * 0.5f;
+                return;
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────
+//  COLLISIONS, PICKUPS, LEVEL CLEAR
+//
+//  After all entities have updated, we resolve interactions in one
+//  pass: jump-over scoring (one credit per barrel), hammer pickup,
+//  hammer smash, lethal contact, and Pauline touch.
+// ──────────────────────────────────────────
+static pmp::AABB jumpman_aabb(const Jumpman& p) {
+    return { p.x + 1.0f, p.y + 1.0f, g_pw - 2.0f, g_ph - 2.0f };
+}
+
+static void try_pickup_hammer(GameState& gs) {
+    Jumpman& p = gs.player;
+    // Pickup is grounded-only: a mid-jump grab would transition straight
+    // into JM_HAMMERING while still airborne, which to_hammering()
+    // wasn't designed for. Walking over a hammer is the only legal way
+    // to acquire one (matches arcade behaviour).
+    if (p.state != JM_IDLE && p.state != JM_RUNNING) return;
+    pmp::AABB ja = jumpman_aabb(p);
+    for (int i = 0; i < 2; i++) {
+        Hammer& h = gs.hammers[i];
+        if (!h.active) continue;
+        pmp::AABB ha = { h.x, h.y, g_hammer_w, g_hammer_h };
+        if (pmp::aabb_overlap(ja, ha)) {
+            h.active = false;
+            to_hammering(p);
+            p.hammer_timer = HAMMER_DURATION;
+            pm_game_audio_fx_pow();
+            return;
+        }
+    }
+}
+
+static void check_collisions(GameState& gs) {
+    Jumpman& p = gs.player;
+    if (p.state == JM_DYING || gs.level_clearing) return;
+
+    pmp::AABB ja = jumpman_aabb(p);
+
+    // Pauline kiss — level clear.
+    pmp::AABB pa = { g_pauline_rect.x, g_pauline_rect.y,
+                     g_pauline_rect.w, g_pauline_rect.h };
+    if (pmp::aabb_overlap(ja, pa)) {
+        gs.level_clearing    = true;
+        gs.level_clear_timer = LEVEL_CLEAR_HOLD;
+        gs.score += (long)gs.bonus + SCORE_PAULINE_KISS;
+        gs.bonus = 0;
+        p.vx = 0;
+        p.vy = 0;
+        p.state = JM_IDLE;
+        pm_game_audio_fx_pow();
+        return;
+    }
+
+    // Barrels.
+    for (int i = 0; i < MAX_BARRELS; i++) {
+        Barrel& b = gs.barrels[i];
+        if (!b.active) continue;
+        pmp::AABB ba = { b.x, b.y, g_barrel_w, g_barrel_h };
+
+        // Jump-over: when airborne with the barrel passing under us,
+        // credit one (and only one) point award per barrel.
+        if (!b.scored && (p.state == JM_JUMPING || p.state == JM_FALLING)) {
+            float bcx = b.x + g_barrel_w * 0.5f;
+            float pcx = p.x + g_pw * 0.5f;
+            if (fabsf(bcx - pcx) < g_pw * 0.85f &&
+                b.y > p.y + g_ph * 0.55f) {
+                b.scored = true;
+                gs.score += SCORE_BARREL_JUMP;
+                pm_game_audio_fx_flip();
+            }
+        }
+
+        if (pmp::aabb_overlap(ja, ba)) {
+            if (p.state == JM_HAMMERING) {
+                b.active = false;
+                gs.score += SCORE_BARREL_SMASH;
+                pm_game_audio_fx_explode();
+            } else {
+                to_dying(gs);
+                return;
+            }
+        }
+    }
+
+    // Fireballs.
+    for (int i = 0; i < MAX_FIREBALLS; i++) {
+        Fireball& f = gs.fireballs[i];
+        if (!f.active) continue;
+        pmp::AABB fa = { f.x, f.y, g_fireball_w, g_fireball_h };
+        if (pmp::aabb_overlap(ja, fa)) {
+            if (p.state == JM_HAMMERING) {
+                f.active = false;
+                gs.score += SCORE_FIREBALL_SMASH;
+                pm_game_audio_fx_explode();
+            } else {
+                to_dying(gs);
+                return;
+            }
+        }
+    }
+}
+
+// Per-level fireball cap escalates with progress (1→3 over 3 levels).
+static int fireball_cap_for_level(int level) {
+    int cap = level;
+    if (cap < 1) cap = 1;
+    if (cap > MAX_FIREBALLS) cap = MAX_FIREBALLS;
+    return cap;
+}
+
+static int active_fireball_count(const GameState& gs) {
+    int n = 0;
+    for (int i = 0; i < MAX_FIREBALLS; i++) if (gs.fireballs[i].active) n++;
+    return n;
+}
+
+// Place the two hammer pickups on their canonical board spots, on the
+// girder surface. Called by reset_game at level start.
+static void place_hammers(GameState& gs) {
+    for (int i = 0; i < 2; i++) {
+        const HammerSpotDef& s = HAMMER_SPOTS[i];
+        const Girder& g = g_girders[s.girder];
+        float x_mid = pmp::lerpf(g.x_left, g.x_right, s.frac);
+        float surf  = girder_y_at(g, x_mid);
+        gs.hammers[i].x = x_mid - g_hammer_w * 0.5f;
+        gs.hammers[i].y = surf - g_hammer_h;
+        gs.hammers[i].active = true;
+    }
+}
 
 void step_world(GameState& gs, const PMNesInput& in, float dt) {
+    // Level-clear flourish: hold the screen for a beat before resetting
+    // the board for the next level.
+    if (gs.level_clearing) {
+        gs.level_clear_timer -= dt;
+        if (gs.dk_anim_timer > 0) gs.dk_anim_timer -= dt;
+        return;
+    }
+
     update_jumpman(gs, in, dt);
-    // (chunk 2) for each active barrel: update_barrel(gs, i, dt);
-    // (chunk 3) for each active fireball: update_fireball(gs, i, dt);
+    if (gs.player.state == JM_DYING) {
+        // Pause the rest of the world during the death animation. Barrels
+        // and fireballs already on screen freeze — standard arcade feel.
+        if (gs.dk_anim_timer > 0) gs.dk_anim_timer -= dt;
+        return;
+    }
+
+    try_pickup_hammer(gs);
+
+    // Hammer auto-expires.
+    if (gs.player.state == JM_HAMMERING && gs.player.hammer_timer <= 0.0f) {
+        gs.player.state = JM_IDLE;
+        gs.player.vx = 0;
+    }
+
+    for (int i = 0; i < MAX_BARRELS;   i++) update_barrel  (gs, i, dt);
+    for (int i = 0; i < MAX_FIREBALLS; i++) update_fireball(gs, i, dt);
+
+    check_collisions(gs);
+
+    // Bonus drain (visible counter; awarded to score on Pauline touch).
+    if (gs.bonus > 0) {
+        gs.bonus -= BONUS_RATE * dt;
+        if (gs.bonus < 0) gs.bonus = 0;
+    }
+
+    // Barrel spawn cadence. Faster every level, capped at BARREL_SPAWN_MIN.
+    gs.barrel_spawn_timer -= dt;
+    if (gs.barrel_spawn_timer <= 0.0f) {
+        spawn_barrel(gs);
+        float interval = BARREL_SPAWN_BASE - BARREL_SPAWN_DECAY * (gs.level - 1);
+        if (interval < BARREL_SPAWN_MIN) interval = BARREL_SPAWN_MIN;
+        gs.barrel_spawn_timer = interval;
+    }
+
+    // Fireball spawn cadence — only while under the per-level cap.
+    gs.fireball_spawn_timer -= dt;
+    if (gs.fireball_spawn_timer <= 0.0f) {
+        if (active_fireball_count(gs) < fireball_cap_for_level(gs.level)) {
+            spawn_fireball(gs);
+        }
+        float interval = FIREBALL_SPAWN_BASE - 1.5f * (gs.level - 1);
+        if (interval < FIREBALL_SPAWN_MIN) interval = FIREBALL_SPAWN_MIN;
+        gs.fireball_spawn_timer = interval;
+    }
+
+    // DK animation timer.
+    if (gs.dk_anim_timer > 0) gs.dk_anim_timer -= dt;
 }
 
 // ═════════════════════════════════════════════
@@ -632,35 +1246,161 @@ static void draw_jumpman(const Jumpman& p) {
         gfx->drawFastVLine(x, y, head_h, COL_JM_CAP);
         gfx->drawFastVLine(x + w - 1, y, head_h, COL_JM_CAP);
     }
+    // Hammer overhead during JM_HAMMERING. Two-frame swing animation
+    // (overhead ↔ down-and-to-the-facing-side) so it reads as actively
+    // smashing rather than a held trophy.
+    if (p.state == JM_HAMMERING) {
+        int hw = (int)g_hammer_w; if (hw < 4) hw = 4;
+        int hh = (int)(g_hammer_h * 0.6f); if (hh < 4) hh = 4;
+        bool swing_down = ((millis() / 200) & 1);
+        int hx, hy;
+        if (swing_down) {
+            hx = (p.facing > 0) ? x + w : x - hw;
+            hy = y + head_h;
+        } else {
+            hx = x + w / 2 - hw / 2;
+            hy = y - hh - 1;
+        }
+        gfx->fillRect(hx, hy, hw, hh, COL_HAMMER);
+        gfx->drawRect(hx, hy, hw, hh, COL_HAMMER_GRIP);
+    }
 }
 
-// Static decoration so the board reads as DK (animated in chunk 3).
-static void draw_dk_and_pauline() {
-    // DK on the top-left of the upper platform (G5).
-    const Girder& g5 = g_girders[5];
-    int gx = (int)g5.x_left + 2;
-    int gy = (int)girder_y_at(g5, g5.x_left + 2);
-    int s  = (int)(20 * g_scale); if (s < 12) s = 12;
-    gfx->fillRect(scr_x((float)gx), scr_y((float)(gy - s)), s, s, COL_DK_BODY);
-    gfx->fillRect(scr_x((float)(gx + 3)), scr_y((float)(gy - s + 4)), s - 6, s / 3, COL_DK_FACE);
-    // Pauline above DK.
-    int px = gx + s + 4;
-    int ph = (int)(14 * g_scale); if (ph < 9) ph = 9;
-    gfx->fillRect(scr_x((float)px), scr_y((float)(gy - s - ph)), ph / 2 + 3, ph, COL_PAULINE);
-    gfx->fillRect(scr_x((float)px), scr_y((float)(gy - s - ph)), ph / 2 + 3, 3, COL_JM_FACE);
+// ──────────────────────────────────────────
+//  Barrels, fireballs, hammers, oil drum — the arcade props that
+//  separate "Phase 1 skeleton" from "actual Donkey Kong."
+// ──────────────────────────────────────────
+static void draw_barrel(const Barrel& b) {
+    int x = scr_x(b.x), y = scr_y(b.y);
+    int w = (int)g_barrel_w, h = (int)g_barrel_h;
+    if (w < 4) w = 4; if (h < 4) h = 4;
+    int cx = x + w / 2, cy = y + h / 2;
+    int r  = (w < h ? w : h) / 2;
+    gfx->fillCircle(cx, cy, r, COL_BARREL);
+    // Single horizontal stripe — reads as a barrel band, also rotates
+    // visually as the barrel rolls (no real rotation, but the band
+    // breaks up the silhouette).
+    int band_y = cy + ((millis() / 100) & 1 ? -1 : 0);
+    gfx->drawFastHLine(x, band_y, w, COL_BARREL_BAND);
+}
+
+static void draw_fireball(const Fireball& f) {
+    int x = scr_x(f.x), y = scr_y(f.y);
+    int w = (int)g_fireball_w, h = (int)g_fireball_h;
+    if (w < 5) w = 5; if (h < 5) h = 5;
+    int cx = x + w / 2, cy = y + h / 2;
+    int r  = (w < h ? w : h) / 2;
+    bool flick = ((millis() / 90) & 1);
+    int  r_rim = flick ? r : r - 1; if (r_rim < 2) r_rim = 2;
+    gfx->fillCircle(cx, cy,     r_rim,     COL_FIRE_RIM);
+    gfx->fillCircle(cx, cy,     r_rim - 1, COL_FIRE_MID);
+    gfx->fillCircle(cx, cy - 1, r_rim / 2, COL_FIRE_HOT);
+}
+
+static void draw_hammer(const Hammer& h) {
+    if (!h.active) return;
+    int x = scr_x(h.x), y = scr_y(h.y);
+    int w = (int)g_hammer_w, hh = (int)g_hammer_h;
+    if (w < 4) w = 4; if (hh < 5) hh = 5;
+    int head_h = hh / 2;
+    // Head
+    gfx->fillRect(x, y, w, head_h, COL_HAMMER);
+    gfx->drawRect(x, y, w, head_h, COL_HAMMER_GRIP);
+    // Grip (centered shaft down to the girder surface)
+    int gx = x + w / 2 - 1;
+    gfx->fillRect(gx, y + head_h, 2, hh - head_h, COL_HAMMER_GRIP);
+}
+
+static void draw_oil_drum() {
+    int x = scr_x(g_oil_rect.x), y = scr_y(g_oil_rect.y);
+    int w = (int)g_oil_rect.w, h = (int)g_oil_rect.h;
+    gfx->fillRect(x, y, w, h, COL_OIL_DRUM);
+    gfx->drawFastHLine(x, y + h / 3,     w, COL_GIRDER_RIV);
+    gfx->drawFastHLine(x, y + 2 * h / 3, w, COL_GIRDER_RIV);
+    gfx->drawRect(x, y, w, h, COL_GIRDER_RIV);
+    // Flame on top
+    int fcx = x + w / 2;
+    int fcy = y - 3;
+    bool flick = ((millis() / 160) & 1);
+    int fr = flick ? 4 : 3;
+    if (fr > w / 2) fr = w / 2;
+    if (fr < 2) fr = 2;
+    gfx->fillCircle(fcx, fcy,     fr,     COL_FIRE_RIM);
+    gfx->fillCircle(fcx, fcy,     fr - 1, COL_FIRE_MID);
+    gfx->fillCircle(fcx, fcy - 1, fr / 2, COL_FIRE_HOT);
+}
+
+static void draw_dk_animated(const GameState& gs) {
+    int x = scr_x(g_dk_rect.x), y = scr_y(g_dk_rect.y);
+    int w = (int)g_dk_rect.w, h = (int)g_dk_rect.h;
+    // Body
+    gfx->fillRect(x, y, w, h, COL_DK_BODY);
+    // Muzzle/face block
+    gfx->fillRect(x + 3, y + 4, w - 6, h / 3, COL_DK_FACE);
+    // Eyes
+    gfx->fillRect(x + 4,     y + 6, 2, 2, 0x0000);
+    gfx->fillRect(x + w - 6, y + 6, 2, 2, 0x0000);
+    // Arms — raised during the throw window, resting otherwise.
+    bool throwing = (gs.dk_anim_timer > 0);
+    int arm_w = (w >= 16) ? 3 : 2;
+    int arm_h = h / 3;
+    int arm_y = throwing ? y - arm_h / 2 : y + h / 3;
+    gfx->fillRect(x - arm_w, arm_y, arm_w, arm_h, COL_DK_BODY);
+    gfx->fillRect(x + w,     arm_y, arm_w, arm_h, COL_DK_BODY);
+    // Tiny barrel-in-hand cue while throwing.
+    if (throwing) {
+        int bx = x + w + arm_w;
+        int by = arm_y - 2;
+        int bs = arm_w + 2;
+        gfx->fillRect(bx, by, bs, bs, COL_BARREL);
+        gfx->drawFastHLine(bx, by + bs / 2, bs, COL_BARREL_BAND);
+    }
+}
+
+static void draw_pauline_animated() {
+    int x = scr_x(g_pauline_rect.x), y = scr_y(g_pauline_rect.y);
+    int w = (int)g_pauline_rect.w, h = (int)g_pauline_rect.h;
+    // Hair (top quarter)
+    int hair_h = h / 4;
+    gfx->fillRect(x, y, w, hair_h, COL_PAULINE_HAIR);
+    // Face
+    gfx->fillRect(x, y + hair_h, w, h / 6, COL_JM_FACE);
+    // Dress
+    gfx->fillRect(x, y + hair_h + h / 6, w, h - hair_h - h / 6, COL_PAULINE);
+    // Optional "!" cue — a single yellow dot above her head, blinking.
+    if (((millis() / 600) & 1)) {
+        gfx->fillRect(x + w / 2 - 1, y - 4, 2, 3, COL_TITLE);
+    }
 }
 
 static void draw_hud(const GameState& gs) {
     int hy = vy();
     gfx->fillRect(vx(), hy, VIEW_W, HUD_H, COL_BG);
     gfx->setTextSize(1);
+
+    // Left: score
     gfx->setTextColor(COL_HUD);
     gfx->setCursor(vx() + 4, hy + 2);
-    gfx->printf("SC %ld", gs.score);
-    gfx->setCursor(vx() + VIEW_W / 2 - 24, hy + 2);
-    gfx->printf("HI %ld", gs.high_score);
-    gfx->setCursor(vx() + VIEW_W - 64, hy + 2);
-    gfx->printf("L%d", gs.lives);
+    gfx->printf("SC%ld", gs.score);
+
+    // Center-left: level + bonus
+    gfx->setTextColor(COL_FIRE_HOT);
+    int cx = vx() + VIEW_W / 2 - 36;
+    gfx->setCursor(cx, hy + 2);
+    gfx->printf("L%d", gs.level);
+    gfx->setTextColor(COL_HUD);
+    gfx->setCursor(cx + 18, hy + 2);
+    gfx->printf("B%d", (int)gs.bonus);
+
+    // Center-right: high score
+    gfx->setTextColor(COL_TITLE);
+    gfx->setCursor(vx() + VIEW_W - 76, hy + 2);
+    gfx->printf("HI%ld", gs.high_score);
+
+    // Right: lives count
+    gfx->setTextColor(COL_JM_CAP);
+    gfx->setCursor(vx() + VIEW_W - 22, hy + 2);
+    gfx->printf("x%d", gs.lives);
 }
 
 void render(const GameState& gs) {
@@ -668,9 +1408,30 @@ void render(const GameState& gs) {
     gfx->fillRect(vx(), vy() + HUD_H, VIEW_W, VIEW_H - HUD_H, COL_BG);
     for (int i = 0; i < N_LADDERS; i++) draw_ladder(g_ladders[i]);   // behind girders
     for (int i = 0; i < N_GIRDERS; i++) draw_girder(g_girders[i]);
-    draw_dk_and_pauline();
+    draw_oil_drum();
+    draw_dk_animated(gs);
+    draw_pauline_animated();
+    // Pickups behind dynamic entities so a barrel passing over a hammer
+    // is still readable.
+    for (int i = 0; i < 2; i++) draw_hammer(gs.hammers[i]);
+    for (int i = 0; i < MAX_BARRELS; i++) if (gs.barrels[i].active)   draw_barrel(gs.barrels[i]);
+    for (int i = 0; i < MAX_FIREBALLS; i++) if (gs.fireballs[i].active) draw_fireball(gs.fireballs[i]);
     draw_jumpman(gs.player);
     draw_hud(gs);
+
+    // Level-clear flourish overlays on top of the static board.
+    if (gs.level_clearing) {
+        gfx->setTextSize(2);
+        gfx->setTextColor(COL_TITLE);
+        char buf[24];
+        snprintf(buf, sizeof(buf), "LEVEL %d CLEAR!", gs.level);
+        int tw = (int)strlen(buf) * 12;
+        int ox = vx() + (VIEW_W - tw) / 2;
+        int oy = vy() + VIEW_H / 2 - 8;
+        // Drop-shadow for legibility against the busy board.
+        gfx->setTextColor(0x0000); gfx->setCursor(ox + 1, oy + 1); gfx->print(buf);
+        gfx->setTextColor(COL_TITLE); gfx->setCursor(ox, oy);     gfx->print(buf);
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -680,7 +1441,13 @@ static bool wait_for_start() {
     gfx->fillRect(vx(), vy(), VIEW_W, VIEW_H, COL_BG);
     for (int i = 0; i < N_LADDERS; i++) draw_ladder(g_ladders[i]);
     for (int i = 0; i < N_GIRDERS; i++) draw_girder(g_girders[i]);
-    draw_dk_and_pauline();
+    draw_oil_drum();
+    // Build a one-off zeroed gs purely so the title screen can use
+    // draw_dk_animated() in its "resting" pose without exposing the
+    // internal helpers to anything outside this TU.
+    GameState title_gs{};
+    draw_dk_animated(title_gs);
+    draw_pauline_animated();
 
     gfx->setTextSize(2);
     gfx->setTextColor(COL_TITLE);
@@ -690,7 +1457,7 @@ static bool wait_for_start() {
     gfx->print(title);
     gfx->setTextSize(1);
     gfx->setTextColor(0xFFFF);
-#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_C28P) || defined(DEVICE_C5) || defined(DEVICE_MAXINE)
     const char* sub = "TAP A TO START";
 #else
     const char* sub = "PRESS A / SPACE TO START";
@@ -733,17 +1500,28 @@ static void show_game_over(GameState& gs) {
     delay(2800);
 }
 
+// Reset state for the NEXT level. Preserves score, lives, high score;
+// regenerates barrels/fireballs/hammers; freshens the bonus timer.
+static void next_level_reset(GameState& gs) {
+    gs.bonus               = BONUS_START;
+    gs.barrel_spawn_timer  = 1.4f;   // grace period before the first throw
+    gs.fireball_spawn_timer = 5.0f;
+    gs.death_timer         = 0;
+    gs.dk_anim_timer       = 0;
+    gs.level_clear_timer   = 0;
+    gs.level_clearing      = false;
+    for (int i = 0; i < MAX_BARRELS; i++)   gs.barrels[i].active = false;
+    for (int i = 0; i < MAX_FIREBALLS; i++) gs.fireballs[i].active = false;
+    place_jumpman_start(gs);
+    place_hammers(gs);
+}
+
 static void reset_game(GameState& gs) {
     gs.level = 1;
     gs.lives = 3;
     gs.score = 0;
-    gs.bonus = 5000;
-    gs.barrel_spawn_timer = 0;
-    gs.death_timer = 0;
-    gs.quit = false;
-    for (int i = 0; i < MAX_BARRELS; i++)   gs.barrels[i].active = false;
-    for (int i = 0; i < MAX_FIREBALLS; i++) gs.fireballs[i].active = false;
-    place_jumpman_start(gs);
+    gs.quit  = false;
+    next_level_reset(gs);
 }
 
 }  // namespace dk
@@ -754,6 +1532,9 @@ static void reset_game(GameState& gs) {
 void run_donkey_kong() {
 #ifdef DEVICE_C28P
     c28p_dpad_render();
+#endif
+#ifdef DEVICE_C5
+    c5_dpad_render();
 #endif
 #ifdef DEVICE_MAXINE
     maxine_dpad_render();
@@ -767,7 +1548,7 @@ void run_donkey_kong() {
     gs.high_score = dk::load_high_score();
 
     if (!dk::wait_for_start()) {
-#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_C28P) || defined(DEVICE_C5) || defined(DEVICE_MAXINE)
         gfx->fillRect(0, 0, dk::VIEW_W, dk::VIEW_H, 0);
 #else
         gfx->fillScreen(0);
@@ -789,6 +1570,17 @@ void run_donkey_kong() {
         for (int i = 0; i < n; i++)
             dk::step_world(gs, in, pmp::FixedTimestep::FIXED_DT);
 
+        // Level advance: once the level-clear flourish has finished
+        // playing, escalate to the next level while preserving score,
+        // lives, and high score. The fixed-timestep accumulator is
+        // realigned so the dt = sim-time invariant holds across the
+        // visible board reset.
+        if (gs.level_clearing && gs.level_clear_timer <= 0.0f) {
+            gs.level++;
+            dk::next_level_reset(gs);
+            ts.reset(millis());
+        }
+
         dk::render(gs);
 
         delay(dk::FRAME_DELAY_MS);
@@ -798,7 +1590,7 @@ void run_donkey_kong() {
     pm_game_audio_stop();
     dk::show_game_over(gs);
 
-#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
+#if defined(DEVICE_C28P) || defined(DEVICE_C5) || defined(DEVICE_MAXINE)
     gfx->fillRect(0, 0, dk::VIEW_W, dk::VIEW_H, 0);
 #else
     gfx->fillScreen(0);

@@ -248,8 +248,43 @@ static const PMDeviceCapabilities pm_device_caps = {
     .ghost_partition_default = false,  // Desk fixtures don't fit the GP threat model
 };
 
+#elif defined(DEVICE_C5)
+
+static const PMDeviceCapabilities pm_device_caps = {
+    .device_id              = "c5",
+    .device_label           = "NM-CYD-C5",
+    .device_short           = "C5",
+    .form_factor            = PM_FORM_DESK_KIOSK,
+    .battery_powered        = false,   // USB-powered RockBase board
+    .display_w              = 240,
+    .display_h              = 320,     // portrait via software rotation
+    .display_touch          = true,    // XPT2046 resistive
+    .display_color          = true,
+    .input_keyboard         = false,
+    .input_trackball        = false,
+    .input_rotary           = false,
+    .input_dpad             = false,
+    .input_touch            = true,
+    .radio_wifi             = true,
+    .radio_ble              = true,
+    .radio_lora             = false,
+    .radio_nfc              = false,
+    .radio_ir               = false,
+    .io_microphone          = false,   // no audio hardware on this build
+    .io_speaker             = false,
+    .io_sd_spi              = true,    // shared SPI bus with LCD + touch
+    .io_sd_sdio             = false,
+    .io_gps                 = false,   // sourced over PMU1 from P4 peer
+    .io_imu                 = false,
+    .io_haptic              = false,
+    .psram_mb               = 8,
+    .sram_kb                = 320,
+    .flash_mb               = 16,
+    .ghost_partition_default = false,  // Desk fixture: same posture as C28P
+};
+
 #else
-#error "Pisces Moon: no DEVICE_* flag defined. Set one of DEVICE_TDECK_PLUS, DEVICE_TLORAPAGER, DEVICE_CARDPUTER_ADV, or DEVICE_C28P in platformio.ini."
+#error "Pisces Moon: no DEVICE_* flag defined. Set one of DEVICE_TDECK_PLUS, DEVICE_TLORAPAGER, DEVICE_CARDPUTER_ADV, DEVICE_C28P, DEVICE_MAXINE, or DEVICE_C5 in platformio.ini."
 #endif
 
 // ─────────────────────────────────────────────
@@ -318,7 +353,7 @@ static inline bool pm_caps_supports(const PMAppRequirements* req) {
     #define PM_HAS_KEYBOARD 1
 #endif
 
-#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_C28P)
+#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_C28P) || defined(DEVICE_C5)
     #define PM_HAS_TOUCH 1
 #endif
 
@@ -343,9 +378,12 @@ static inline bool pm_caps_supports(const PMAppRequirements* req) {
     #define PM_HAS_IR 1
 #endif
 
-#if defined(DEVICE_C28P)
+#if defined(DEVICE_C28P) || defined(DEVICE_C5)
     #define PM_FORM_KIOSK 1
     #define PM_NO_BATTERY 1
+#endif
+
+#if defined(DEVICE_C28P)
     #define PM_SD_SDIO 1
 #endif
 

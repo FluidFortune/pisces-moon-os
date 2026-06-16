@@ -94,6 +94,7 @@ extern bool wardrive_active;  // Ghost Engine state — Core 0
 #include "wifi_ducky.h"
 #include "bridge_app.h"
 #include "ereader.h"
+#include "pm_map_apps.h"
 #include "apps.h"
 
 extern Arduino_GFX *gfx;
@@ -119,17 +120,12 @@ extern XPowersAXP2101 PMU;
 #define C_CHAMFER    0x0600   // Chamfer line color (mid green)
 #define C_GLOW       0x0BE0   // Icon glow (bright-mid green)
 
-// Category accent colors — used for chamfer borders and trace details
-// Each folder has a distinct color that carries through to its app grid
-static const uint16_t CAT_ACCENT[] = {
-    0x03EF,  // COMMS  — teal
-    0xF400,  // CYBER  — red-orange
-    0xFD20,  // TOOLS  — amber
-    0x07E0,  // GAMES  — green
-    0x07FF,  // INTEL  — cyan
-    0xF81F,  // MEDIA  — magenta
-    0x8410,  // SYSTEM — silver
-};
+// Category accent colors live with each device's category-definition
+// block further down — the T-Deck Plus and C28P/Maxine layouts have
+// different cardinalities (7 vs 10) and different orderings, so the
+// CAT_ACCENT[] table is defined per-device. Leaving a single common
+// definition here would either collide with the per-device tables or
+// silently desynchronise from the active layout.
 
 
 // ─────────────────────────────────────────────
@@ -396,6 +392,9 @@ struct Category {
 #define APP_TRACKER_SCAN 67   // pm_run_tracker_scan() — AirTag/Tile detector
 #define APP_AI_TERMINAL  68   // AI chat terminal (API key TBD — stub)
 #define APP_RSS          69   // RSS feed reader
+#define APP_MAP          70   // Offline moving map + GPS breadcrumb
+#define APP_FLIGHTS      71   // Live flight tracker (OpenSky API)
+#define APP_MESH_MAP     72   // Live Meshtastic/LoRa node map (SX1262)
 
 // ─────────────────────────────────────────────
 //  CATEGORY DEFINITIONS
@@ -560,6 +559,13 @@ static const Category categories[] = {
 #define GRID_SLOTS     NUM_CATEGORIES
 #define SLOT_TETRIS    -2   // unused on T-Deck Plus
 
+// Identity slot→category mapping. The C28P/Maxine 12-tile grid has a
+// real permutation here plus SLOT_NONE/SLOT_TETRIS sentinels; T-Deck
+// Plus is a straight 7-tile grid so slot index IS the category index.
+// Keeping the table defined on every device lets the touch handler
+// stay branch-free.
+static const int SLOT_CAT[GRID_SLOTS] = { 0, 1, 2, 3, 4, 5, 6 };
+
 static const uint16_t CAT_ACCENT[] = {
     0x03EF,  // COMMS  — teal
     0xF400,  // CYBER  — red-orange
@@ -575,10 +581,12 @@ static const Category categories[] = {
     { "COMMS", "C", 0x03EF,
       {{"WIFI JOIN", APP_WIFI_JOIN},
        {"GPS",       APP_GPS},
+       {"MAP",       APP_MAP},
+       {"FLIGHTS",   APP_FLIGHTS},
        {"MESH",      APP_MESH},
        {"VOICE",     APP_VOICE_TERM},
        {"LORA PTT",  APP_LORA_VOICE}},
-      5 },
+      7 },
 
     { "CYBER", "!", 0xF200,
       {{"WARDRIVE",  APP_WARDRIVE},
@@ -590,12 +598,13 @@ static const Category categories[] = {
        {"GATT XPLR", APP_BLE_GATT},
        {"WPA HS",    APP_WPA_HS},
        {"RF SPECTRM",APP_RF_SPECTRUM},
+       {"MESH MAP",  APP_MESH_MAP},
        {"PROBE INTL",APP_PROBE_INTEL},
        {"PKT ANLYS", APP_PKT_ANALYSIS},
        {"BLE DUCKY", APP_BLE_DUCKY},
        {"USB DUCKY", APP_USB_DUCKY},
        {"WIFI DUCKY",APP_WIFI_DUCKY}},
-      14 },
+      15 },
 
     { "TOOLS", "T", 0x8C00,
       {{"JOURNAL",   APP_JOURNAL},
@@ -1042,6 +1051,15 @@ static void launchApp(int launchId) {
         case APP_WIFI_JOIN:    run_wifi_connect();                          break;
         case APP_GPS:          run_gps();                                    break;
         case APP_MESH:         run_mesh_messenger();                         break;
+        case APP_MAP:          run_map();                                    break;
+        case APP_FLIGHTS:      run_flight_tracker();                         break;
+#if defined(DEVICE_TDECK_PLUS)
+        // MESH MAP is a LoRa-radio app; run_mesh_map() is only defined on
+        // SX1262 devices. T-Deck Plus is the only LoRa device sharing this
+        // launcher branch (C28P/Maxine/C5 exclude pm_mesh_map.cpp), so the
+        // case is guarded to keep their link clean.
+        case APP_MESH_MAP:     run_mesh_map();                               break;
+#endif
         case APP_VOICE_TERM:   run_voice_terminal();                         break;
         case APP_LORA_VOICE:   run_lora_voice();                             break;
 
@@ -1120,13 +1138,22 @@ static void launchApp(int launchId) {
         case APP_USB_DUCKY:    run_usb_ducky();                             break;
         case APP_WIFI_DUCKY:   run_wifi_ducky();                            break;
 
-        // CYBER — v1.3.0 (was hidden, now surfaced)
+        // CYBER — v1.3.0 (was hidden, now surfaced). pm_run_tracker_scan
+        // is implemented in pm_tracker_scan.cpp under a touch-kiosk guard,
+        // so the symbol only exists on C28P/Maxine builds. The APP_ID is
+        // never reachable on T-Deck Plus (TRACKER isn't in its CYBER
+        // category), but the linker resolves every case body regardless.
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
         case APP_TRACKER_SCAN: pm_run_tracker_scan();                       break;
+#endif
 
         // SYSTEM — Bridge App
         case APP_BRIDGE:       run_bridge();                                break;
 
-        // UTILITIES — new (were hidden behind pm_clock.h)
+        // UTILITIES — new (were hidden behind pm_clock.h). C28P/Maxine
+        // only — see the pm_tracker_scan note above for the linker
+        // rationale; same situation applies to all five of these.
+#if defined(DEVICE_C28P) || defined(DEVICE_MAXINE)
         case APP_TIMER:        pm_run_timer();                              break;
         case APP_STOPWATCH:    pm_run_stopwatch();                          break;
         case APP_UNITS:        pm_run_units();                              break;
@@ -1134,6 +1161,7 @@ static void launchApp(int launchId) {
         // PERSONAL — new (were hidden)
         case APP_NOTES:        pm_run_notes();                              break;
         case APP_CONTACTS:     pm_run_contacts();                           break;
+#endif
 
         // AI TERMINAL — stub until API token configured
         case APP_AI_TERMINAL:
@@ -1426,6 +1454,8 @@ static void run_sleep();
 static const TloraAppEntry APPS_COMMS[] = {
     {"WIFI JOIN", run_wifi_connect},
     {"GPS",       run_gps},
+    {"MAP",       run_map},
+    {"FLIGHTS",   run_flight_tracker},
     {"MESH",      run_mesh_messenger},
     {"VOICE",     run_voice_terminal},
     {"LORA PTT",  run_lora_voice},
@@ -1440,6 +1470,7 @@ static const TloraAppEntry APPS_CYBER[] = {
     {"GATT XPLR",  run_ble_gatt_explorer},
     {"WPA HS",     run_wpa_handshake},
     {"RF SPECTRM", run_rf_spectrum},
+    {"MESH MAP",   run_mesh_map},
     {"PROBE INTL", run_probe_intel},
     {"PKT ANLYS",  run_offline_pkt_analysis},
     {"BLE DUCKY",  run_ble_ducky},

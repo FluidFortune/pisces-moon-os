@@ -425,6 +425,46 @@
 #endif // DEVICE_MAXINE
 
 
+// ── NM-CYD-C5 (ESP32-C5 RockBase "Colorful") ─────────────
+// Touch-only desk fixture, USB-powered. Same SOFTWARE class as the
+// C28P (touch-only, no keyboard, no radios beyond WiFi/BLE) but on
+// a single-core RISC-V chip with the fleet-unique dual-band Wi-Fi 6
+// capability (2.4 + 5 GHz). Pin defines come from platformio.ini
+// build_flags (PIN_LCD_*, PIN_TOUCH_*, PIN_SD_*, PIN_I2C_*) and from
+// include/hal_c5.h; this block is just the HAS_* capability summary
+// that hal_pins.h's pm_has_*() helpers depend on.
+#ifdef DEVICE_C5
+
+  // Screen geometry mirrors hal_c5.h (portrait via software rotation
+  // of the native 320×240 landscape ST7789 panel).
+  #ifndef SCREEN_W
+    #define SCREEN_W        240
+  #endif
+  #ifndef SCREEN_H
+    #define SCREEN_H        320
+  #endif
+  #define SCREEN_DRIVER     ST7789
+
+  // Capabilities — RockBase NM-CYD-C5
+  #define HAS_TRACKBALL     0
+  #define HAS_LORA          0
+  #define HAS_GPS           0             // GPS sourced over PMU1 from P4 peer
+  #define HAS_AUDIO         0             // no audio hardware on this build
+  #define HAS_AUDIO_IN      0             // no microphone
+  #define HAS_NFC           0
+  #define HAS_IMU           0
+  #define HAS_HAPTIC        0
+  #define HAS_ENCODER       0
+  #define HAS_RTC           0
+  #define HAS_NRF24         0
+  #define HAS_IOEXP         0
+  #define HAS_TOUCH         1             // XPT2046 resistive (still touch)
+  #define HAS_KEYBOARD      0
+  #define HAS_BATTERY       0             // USB-powered
+
+#endif // DEVICE_C5
+
+
 // Default HAS_AUDIO_IN for boards that predate the split (they all
 // have mics where they have audio). Maxine overrides to 0 above.
 #ifndef HAS_AUDIO_IN
