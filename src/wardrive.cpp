@@ -142,6 +142,7 @@
 #include <SPI.h>
 #include <RadioLib.h>
 #include "pm_lora_pins.h"
+#include "pm_lora_locator.h"
 #endif
 #ifdef DEVICE_CARDPUTER_ADV
 #include <esp_err.h>
@@ -167,6 +168,10 @@ extern SemaphoreHandle_t spi_mutex;
 
 int  networks_found  = 0;
 volatile int  bt_found        = 0;
+// Devices kept in the most recent COMPLETED BLE window. Written by the
+// scan task only after a window finishes, so the UI never reads the
+// mid-window reset of bt_found. A genuine 0 still shows as 0.
+static volatile int bt_last_window = 0;
 int  esp_found       = 0;
 int      networks_total = 0;
 int      ble_total = 0;
@@ -247,10 +252,23 @@ static bool isEspressifMAC(const char* mac) {
     return false;
 }
 
-#define BLE_QUEUE_SIZE 32
 #ifdef DEVICE_CARDPUTER_ADV
-static constexpr int BLE_FLUSH_MAX_ROWS = 8;
+// The ring buffer holds BLE_QUEUE_SIZE - 1 entries. 65 -> 64, matching
+// CP_BLE_WINDOW_EVENT_BUDGET, so one full BLE window always fits and
+// nothing is dropped for lack of queue space. (Was 32 -> 31 slots while
+// windows delivered up to 64 events and the flush drained only 8 rows
+// every 5 s, so the queue sat full and most BLE devices were discarded:
+// field log showed windows alternating kept=8 / kept=0 drops=40.)
+// Cost: ~3.6 KB internal RAM total, +1.8 KB vs before.
+#define BLE_QUEUE_SIZE 65
+// Rows written per SD open. The original TASK_WDT wedge came from one
+// open/close per BLE hit; the WiFi path already writes up to 24 rows
+// per open without trouble, so 32 per open keeps opens rare.
+static constexpr int BLE_FLUSH_MAX_ROWS = 32;
+// Max open/write/close batches per post-window drain (3 x 32 > 64).
+static constexpr int BLE_DRAIN_MAX_BATCHES = 3;
 #else
+#define BLE_QUEUE_SIZE 32
 static constexpr int BLE_FLUSH_MAX_ROWS = BLE_QUEUE_SIZE;
 #endif
 struct BLEResult { char mac[18]; char name[32]; int rssi; };
@@ -699,11 +717,13 @@ static bool ensure_session_file() {
     return ok;
 }
 
-static void flushBLEQueue(const char* log_file) {
+// Returns the number of rows written (0 if SD unavailable, no GPS,
+// mutex timeout, or queue empty).
+static int flushBLEQueue(const char* log_file) {
     // Skip SD writes while file manager has the card
-    if (sd_in_use) return;
+    if (sd_in_use) return 0;
     // Skip if no session file yet
-    if (!log_file || log_file[0] == '\0') return;
+    if (!log_file || log_file[0] == '\0') return 0;
 
     if (!gps.location.isValid()) {
         portENTER_CRITICAL(&bleMux);
@@ -712,21 +732,28 @@ static void flushBLEQueue(const char* log_file) {
 #ifdef DEVICE_CARDPUTER_ADV
         cp_sd_diag_throttled("ble_flush_no_gps");
 #endif
-        return;
+        return 0;
     }
+
+    // Nothing queued: skip the mutex + SD open entirely.
+    bool empty;
+    portENTER_CRITICAL(&bleMux);
+    empty = (bleTail == bleHead);
+    portEXIT_CRITICAL(&bleMux);
+    if (empty) return 0;
 
     if (!spi_mutex) {
 #ifdef DEVICE_CARDPUTER_ADV
         cp_sd_diag_throttled("ble_flush_no_mutex");
 #endif
-        return;
+        return 0;
     }
 
     if (xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
 #ifdef DEVICE_CARDPUTER_ADV
         cp_sd_diag_throttled("ble_flush_mutex_timeout");
 #endif
-        return;
+        return 0;
     }
 
     FsFile file = sd.open(log_file, O_WRITE | O_APPEND);
@@ -735,7 +762,7 @@ static void flushBLEQueue(const char* log_file) {
 #ifdef DEVICE_CARDPUTER_ADV
         cp_sd_diag_throttled("ble_flush_open_fail");
 #endif
-        return;
+        return 0;
     }
 
     int flushed = 0;
@@ -774,7 +801,23 @@ static void flushBLEQueue(const char* log_file) {
 #endif
 
     if (flushed > 0) vTaskDelay(pdMS_TO_TICKS(1));
+    return flushed;
 }
+
+#ifdef DEVICE_CARDPUTER_ADV
+// Drain the BLE queue right after a BLE window completes. Each batch
+// is its own mutex-take / open / write / close, and we yield between
+// batches so the Bus Treaty lets other SPI users (diag log, LoRa, file
+// manager) interleave. Bounded to BLE_DRAIN_MAX_BATCHES so a stuck
+// card can't hold the task here.
+static void cp_drain_ble_queue(const char* log_file) {
+    for (int b = 0; b < BLE_DRAIN_MAX_BATCHES; b++) {
+        int n = flushBLEQueue(log_file);
+        if (n < BLE_FLUSH_MAX_ROWS) break;   // empty, or SD unavailable
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+}
+#endif
 
 // ─────────────────────────────────────────────────────────────
 //  wardrive_log_observation() — public single-row append for
@@ -874,10 +917,10 @@ static SPISettings   lora_spi_settings(2000000, MSBFIRST, SPI_MODE0);
 static Module*       lora_module       = nullptr;
 static SX1262*       lora_radio        = nullptr;
 static volatile bool lora_rx_flag      = false;
-static bool          lora_ready        = false;
+static volatile bool lora_ready        = false;
 static bool          lora_init_tried   = false;
 static uint32_t      lora_my_node_id   = 0;
-static uint32_t      lora_pkt_total    = 0;
+static volatile uint32_t lora_pkt_total = 0;
 
 struct WdLoraThrottle {
     uint32_t nodeId;
@@ -975,6 +1018,7 @@ static bool wdLoraInit() {
         return false;
     }
     lora_my_node_id = wdLoraSelfNodeId();
+    pm_lora_locator_reset();
     lora_ready = true;
     Serial.printf("[WARDRIVE/LORA] Radio ready. %.3f MHz SF%d BW%.0fk — self !%08x\n",
                   WARDRIVE_LORA_FREQ_MHZ, WARDRIVE_LORA_SF,
@@ -1040,12 +1084,21 @@ static void wdLoraDrain() {
 
         lora_pkt_total++;
 
-        if (!wdLoraShouldLog(from)) continue;
-
         int hopLimit = hdr->flags & 0x07;
         int hopStart = (hdr->flags >> 5) & 0x07;
         int hops = hopStart - hopLimit; if (hops < 0) hops = 0;
         bool direct = (hops == 0);
+
+        // Feed every spatially useful packet to the streaming estimator
+        // before the CSV throttle. Relay packets update presence metadata
+        // but are excluded from the fit inside pm_lora_locator_observe().
+        if (gps.location.isValid() && gps.location.age() < 10000UL) {
+            pm_lora_locator_observe(from,
+                                    gps.location.lat(), gps.location.lng(),
+                                    rssi, snr, (uint8_t)hops, millis());
+        }
+
+        if (!wdLoraShouldLog(from)) continue;
 
         // Format for wardrive CSV:
         //   MAC   = 00:00:aa:bb:cc:dd  (origin NodeID padded to 6 octets)
@@ -1263,14 +1316,6 @@ void wardrive_task(void *pvParameters) {
 
         while (SerialGPS.available() > 0) gps.encode(SerialGPS.read());
 
-#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_TLORAPAGER) || defined(DEVICE_CARDPUTER_ADV)
-        // Drain LoRa RX every loop pass. Non-blocking, bounded, and
-        // independent of the WiFi/BLE toggle below — LoRa is its own
-        // radio. Writes go through wardrive_log_observation() so they
-        // land in the same /wardrive_NNNN.csv as WiFi/BLE rows.
-        wdLoraDrain();
-#endif
-
         // GPS auto-baud
         if (millis() - last_baud_switch > 5000) {
             uint32_t current_chars = gps.charsProcessed();
@@ -1300,6 +1345,13 @@ void wardrive_task(void *pvParameters) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
+
+#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_TLORAPAGER) || defined(DEVICE_CARDPUTER_ADV)
+        // Drain LoRa only while the Ghost Engine is active. This makes the
+        // Wardrive pause control apply to WiFi, BLE, and LoRa consistently.
+        // The drain remains independent of the WiFi/BLE time slice.
+        wdLoraDrain();
+#endif
 
         if (wardrive_mode == WARDRIVE_MODE_PROMISCUOUS) {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -1491,6 +1543,7 @@ void wardrive_task(void *pvParameters) {
                 //   arrive and crash on an exhausted heap.
                 static bool bleDisabledForSession = false;
                 if (bleDisabledForSession) {
+                    bt_last_window = 0;
                     scanningWiFi = true;
                     continue;
                 }
@@ -1593,6 +1646,15 @@ void wardrive_task(void *pvParameters) {
                 }
 #endif
                 ble_total += bt_found;
+                bt_last_window = bt_found;
+#ifdef DEVICE_CARDPUTER_ADV
+                // Drain now instead of waiting for the 5 s periodic
+                // flush, so the queue is empty before the next window.
+                if (have_session) {
+                    cp_drain_ble_queue(_current_log_file);
+                    last_ble_flush = millis();
+                }
+#endif
             }
         }
 
@@ -1683,6 +1745,22 @@ void wardrive_ble_resume() {
     if (wdScan && wdCallbacks)
         wdScan->setAdvertisedDeviceCallbacks(wdCallbacks, false);
     wardrive_active = true;
+}
+
+bool wardrive_lora_is_ready() {
+#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_TLORAPAGER) || defined(DEVICE_CARDPUTER_ADV)
+    return lora_ready;
+#else
+    return false;
+#endif
+}
+
+uint32_t wardrive_lora_packet_count() {
+#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_TLORAPAGER) || defined(DEVICE_CARDPUTER_ADV)
+    return lora_pkt_total;
+#else
+    return 0;
+#endif
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1782,15 +1860,10 @@ static void run_wardrive_cardputer() {
         // Column A values
         gfx->setTextColor(networks_found > 0 ? 0x07E0 : 0xFD20);
         gfx->setCursor(colAValueX, rowY[0]); gfx->print(networks_found);
-        // Show current BLE count. bt_found resets to 0 at the start
-        // of each BLE window and accumulates kept devices during the
-        // scan. We snapshot it into a UI-side cache so the brief
-        // reset window doesn't blink the display to 0 between cycles.
-        static int bt_display_cached = 0;
-        int bt_snapshot = bt_found;
-        if (bt_snapshot > 0) bt_display_cached = bt_snapshot;
-        gfx->setTextColor(bt_display_cached > 0 ? 0x07FF : 0xFD20);
-        gfx->setCursor(colAValueX, rowY[1]); gfx->print(bt_display_cached);
+        // Current BLE count: devices kept in the last completed window.
+        int bt_shown = bt_last_window;
+        gfx->setTextColor(bt_shown > 0 ? 0x07FF : 0xFD20);
+        gfx->setCursor(colAValueX, rowY[1]); gfx->print(bt_shown);
         gfx->setTextColor(0xFFFF);
         gfx->setCursor(colAValueX, rowY[2]);
         gfx->printf("%.4f", gps.location.isValid() ? gps.location.lat() : 0.0);
@@ -1917,13 +1990,10 @@ void run_wardrive() {
 
         gfx->setTextColor(networks_found > 0 ? 0x07E0 : 0xFD20);
         gfx->setCursor(dataX, 38);  gfx->println(networks_found);
-        // Current BLE count, cached to avoid blinking during the brief
-        // per-window reset (see comment in Cardputer block).
-        static int bt_display_cached = 0;
-        int bt_snapshot = bt_found;
-        if (bt_snapshot > 0) bt_display_cached = bt_snapshot;
-        gfx->setTextColor(bt_display_cached > 0 ? 0x07FF : 0xFD20);
-        gfx->setCursor(dataX, 63);  gfx->println(bt_display_cached);
+        // Current BLE count: devices kept in the last completed window.
+        int bt_shown = bt_last_window;
+        gfx->setTextColor(bt_shown > 0 ? 0x07FF : 0xFD20);
+        gfx->setCursor(dataX, 63);  gfx->println(bt_shown);
         gfx->setTextColor(0xFFFF);
         gfx->setCursor(dataX, 88);  gfx->println(gps.satellites.value());
         gfx->setTextColor(0xC618);

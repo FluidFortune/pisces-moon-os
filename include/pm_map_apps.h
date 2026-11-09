@@ -32,11 +32,11 @@ void run_map();
 // MHz ADS-B reception is the hardware-companion path, future.)
 void run_flight_tracker();
 
-// MESH MAP — live Meshtastic/LoRa node positions on the moving map.
-// Reuses the passive SX1262 RX path: every heard packet's origin is
-// placed at our GPS fix (where we heard it) as a node dot, with
-// RSSI-driven color and a range ring. The spatial, in-field view of
-// the same data WarDrive logs to CSV. SX1262 devices only.
+// MESH MAP — motion-assisted Meshtastic/LoRa location estimates.
+// Reuses Wardrive's passive SX1262 RX path (never opens a second radio).
+// Direct packets gathered while the receiver moves become an RSSI-weighted
+// center, uncertainty ring, and confidence rating. Relayed packets are shown
+// as heard but excluded from the fit. SX1262 devices only.
 void run_mesh_map();
 
 #endif // PM_MAP_APPS_H

@@ -40,11 +40,12 @@
 
 #if defined(DEVICE_TLORAPAGER)
 #include "pm_disp_tlorapager.h"
+extern PMDispTLoRaPager *gfx;
 #else
 #include <Arduino_GFX_Library.h>
+extern Arduino_GFX *gfx;
 #endif
 
-extern Arduino_GFX *gfx;
 extern TinyGPSPlus  gps;
 
 // Header band height; the map fills the rest.

@@ -38,12 +38,16 @@
 #include <Arduino.h>
 #include <math.h>
 #include <TinyGPSPlus.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "pm_storage.h"
 
 #if defined(DEVICE_TLORAPAGER)
 #include "pm_disp_tlorapager.h"
+extern PMDispTLoRaPager *gfx;
 #else
 #include <Arduino_GFX_Library.h>
+extern Arduino_GFX *gfx;
 #endif
 
 // PNGdec is a tiny, dependency-free PNG decoder already suited to MCUs.
@@ -56,8 +60,10 @@
   #define PM_MAP_HAVE_PNGDEC 0
 #endif
 
-extern Arduino_GFX *gfx;
 extern TinyGPSPlus  gps;
+#ifndef DEVICE_C28P
+extern SemaphoreHandle_t spi_mutex;
+#endif
 
 // ─────────────────────────────────────────────
 //  DEVICE-TUNED LIMITS
@@ -338,17 +344,52 @@ static int tilePngDraw(PNGDRAW *pDraw) {
 static bool drawTileFromSD(int z, int tx, int ty, int dx, int dy) {
     char path[80];
     snprintf(path, sizeof(path), "/maps/%s/%d/%d/%d.png", s_tileSet, z, tx, ty);
-    if (!pm_storage::exists(path)) return false;
 
+    // SdFat map tiles share SPI with the SX1262 on the mobile devices.
+    // Hold the Treaty only for the SD read, then release it before PNG
+    // decode/display drawing so LoRa is not blocked for a whole render.
+#ifndef DEVICE_C28P
+    if (!spi_mutex ||
+        xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return false;
+    }
+#endif
+
+    if (!pm_storage::exists(path)) {
+#ifndef DEVICE_C28P
+        xSemaphoreGiveRecursive(spi_mutex);
+#endif
+        return false;
+    }
     pm_storage::File f = pm_storage::open(path, pm_storage::Mode::Read);
-    if (!f) return false;
+    if (!f) {
+#ifndef DEVICE_C28P
+        xSemaphoreGiveRecursive(spi_mutex);
+#endif
+        return false;
+    }
     size_t sz = f.size();
-    if (sz == 0 || sz > 200000) { f.close(); return false; }  // sanity cap
+    if (sz == 0 || sz > 200000) {
+        f.close();
+#ifndef DEVICE_C28P
+        xSemaphoreGiveRecursive(spi_mutex);
+#endif
+        return false;
+    }
 
     uint8_t* buf = (uint8_t*)malloc(sz);
-    if (!buf) { f.close(); return false; }
+    if (!buf) {
+        f.close();
+#ifndef DEVICE_C28P
+        xSemaphoreGiveRecursive(spi_mutex);
+#endif
+        return false;
+    }
     size_t got = f.read(buf, sz);
     f.close();
+#ifndef DEVICE_C28P
+    xSemaphoreGiveRecursive(spi_mutex);
+#endif
     if (got != sz) { free(buf); return false; }
 
     int rc = s_png.openRAM(buf, sz, tilePngDraw);

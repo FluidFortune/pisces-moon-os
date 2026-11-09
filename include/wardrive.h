@@ -97,6 +97,12 @@ bool wardrive_log_observation(const char* mac, const char* ssid,
                               const char* authMode, int channel,
                               int rssi, const char* type);
 
+// Passive LoRa receiver health for apps that consume Wardrive's shared
+// SX1262 observation stream (notably Mesh Map). These are read-only and
+// do not claim the SPI bus.
+bool wardrive_lora_is_ready();
+uint32_t wardrive_lora_packet_count();
+
 // ─── v1.1 — Bridge streaming ───────────────────────────────────────
 extern volatile bool wardrive_bridge_streaming;
 extern volatile bool wardrive_raw_log;  // When true: emit wifi_seen for EVERY observation
