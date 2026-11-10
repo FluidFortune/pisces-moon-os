@@ -21,6 +21,7 @@
 
 #include "pm_input.h"
 #include "pm_lora_pins.h"
+#include "pm_lora_lease.h"
 #include "pi4ioe_cap.h"
 
 #ifndef PIN_P4_I2C_SDA
@@ -808,29 +809,41 @@ static bool lora_bridge_begin() {
 #if defined(PIN_LORA_CS) && defined(PIN_LORA_IRQ)
     if (s_lora_ready) return true;
     if (s_lora_init_attempted && s_lora_last_state != 0) return false;
+    // Radio lease: the bridge is the lowest-priority owner. If Wardrive or
+    // Mesh Messenger has the SX1262 (or wants it), leave it alone; the
+    // task loop asks again later. Not counted as an attempt.
+    if (!pm_lora_lease_request(PM_LORA_TETHER)) return false;
     s_lora_init_attempted = true;
 
-    pi4ioe_cap_init();
+    // RF switch enable on the Cap's I/O expander. main.cpp already did
+    // this at boot; once here is enough. Repeating it on every re-take
+    // would put I2C traffic on the keyboard's bus from this task.
+    static bool s_cap_rf_enabled = false;
+    if (!s_cap_rf_enabled) {
+        pi4ioe_cap_init();
+        s_cap_rf_enabled = true;
+    }
     if (!lora_bridge_prepare_shared_spi()) {
         s_lora_last_state = -1003;
+        pm_lora_lease_release(PM_LORA_TETHER);
         return false;
     }
 
     s_lora_module = new Module(PM_LORA_CS, PM_LORA_IRQ, PM_LORA_RST, PM_LORA_BUSY,
                                cardputerSdSPI, s_lora_spi_settings);
     s_lora_radio = new SX1262(s_lora_module);
-    if (!s_lora_module || !s_lora_radio) {
-        s_lora_last_state = -1000;
-        return false;
-    }
 
     if (!spi_mutex || xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
         Serial.println("[P4-BRIDGE] LoRa bridge init: SPI mutex timeout");
         s_lora_last_state = -1001;
+        delete s_lora_radio; s_lora_radio = nullptr;
+        delete s_lora_module; s_lora_module = nullptr;
+        pm_lora_lease_release(PM_LORA_TETHER);
         return false;
     }
 
-    int state = s_lora_radio->begin(906.875f, 250.0f, 11, 5, 0x2B, 22, 16);
+    int state = s_lora_radio->begin(906.875f, 250.0f, 11, 5, 0x2B, 22, 16,
+                                    PM_LORA_TCXO_V, PM_LORA_USE_LDO);
     if (state == RADIOLIB_ERR_NONE) {
         s_lora_radio->setDio2AsRfSwitch(true);
         s_lora_radio->setCurrentLimit(140.0f);
@@ -845,6 +858,7 @@ static bool lora_bridge_begin() {
         Serial.printf("[P4-BRIDGE] LoRa bridge init failed: %d\n", state);
         delete s_lora_radio; s_lora_radio = nullptr;
         delete s_lora_module; s_lora_module = nullptr;
+        pm_lora_lease_release(PM_LORA_TETHER);
         return false;
     }
 
@@ -855,6 +869,27 @@ static bool lora_bridge_begin() {
     s_lora_last_state = -1002;
     return false;
 #endif
+}
+
+// Give the SX1262 to a higher-priority owner (Wardrive, Mesh Messenger).
+// Runs in this task, so the driver is never deleted under a transfer.
+// The loop takes the radio back once the lease is free again.
+static void lora_bridge_end() {
+    if (s_lora_radio) {
+        s_lora_radio->clearPacketReceivedAction();
+        s_lora_rx_flag = false;
+        if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            s_lora_radio->standby();
+            xSemaphoreGiveRecursive(spi_mutex);
+        }
+        delete s_lora_radio; s_lora_radio = nullptr;
+    }
+    if (s_lora_module) { delete s_lora_module; s_lora_module = nullptr; }
+    s_lora_ready = false;
+    s_lora_init_attempted = false;   // not a hardware failure: retry later
+    s_lora_last_state = 0;
+    pm_lora_lease_release(PM_LORA_TETHER);
+    Serial.println("[P4-BRIDGE] LoRa released to a higher-priority app");
 }
 
 static void lora_bridge_poll_rx() {
@@ -900,7 +935,11 @@ static void lora_bridge_send_pending() {
     s_lora_tx_pending = false;
     portEXIT_CRITICAL(&s_mux);
     if (len == 0) return;
-    if (!lora_bridge_begin()) return;
+    if (!lora_bridge_begin()) {
+        Serial.printf("[P4-BRIDGE] LoRa TX dropped (%u bytes): radio held by %s\n",
+                      len, pm_lora_owner_name(pm_lora_lease_holder()));
+        return;
+    }
 
     if (!spi_mutex || xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
         Serial.println("[P4-BRIDGE] LoRa TX: SPI mutex timeout");
@@ -1151,6 +1190,8 @@ static void module_task(void*) {
     uint32_t current_baud = gps_bauds[gps_baud_idx];
     uint32_t last_baud_check = millis();
     uint32_t last_chars = 0;
+    bool gps_lock_reported = false;
+    bool gps_fix_reported = false;
     SerialGPS.setRxBufferSize(512);
     SerialGPS.begin(current_baud, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
     s_gps_started = true;
@@ -1188,8 +1229,17 @@ static void module_task(void*) {
                     gps_baud_idx = (uint8_t)((gps_baud_idx + 1) % (sizeof(gps_bauds) / sizeof(gps_bauds[0])));
                     current_baud = gps_bauds[gps_baud_idx];
                     SerialGPS.updateBaudRate(current_baud);
+                    gps_lock_reported = false;
                     Serial.printf("[P4-BRIDGE] GPS cap trying %lu baud (%lu chars/5s)\n",
                                   (unsigned long)current_baud, (unsigned long)delta);
+                } else if (!gps_lock_reported || (gps.location.isValid() != gps_fix_reported)) {
+                    // Once on lock, then again whenever the fix comes or goes.
+                    gps_lock_reported = true;
+                    gps_fix_reported = gps.location.isValid();
+                    Serial.printf("[P4-BRIDGE] GPS cap locked at %lu baud (%lu chars/5s, fix=%s sats=%lu)\n",
+                                  (unsigned long)current_baud, (unsigned long)delta,
+                                  gps_fix_reported ? "YES" : "NO",
+                                  (unsigned long)gps.satellites.value());
                 }
                 last_baud_check = now;
             }
@@ -1201,8 +1251,10 @@ static void module_task(void*) {
             last_uart_hello = millis();
         }
 
-        if (!s_lora_ready && millis() > 9000) {
-            lora_bridge_begin();
+        if (s_lora_ready && pm_lora_lease_should_yield(PM_LORA_TETHER)) {
+            lora_bridge_end();
+        } else if (!s_lora_ready && millis() > 9000) {
+            lora_bridge_begin();   // cheap no-op while another owner holds it
         }
         lora_bridge_send_pending();
         lora_bridge_poll_rx();

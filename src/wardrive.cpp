@@ -10,7 +10,18 @@
 // fluidfortune.com
 
 /**
- * PISCES MOON OS — WARDRIVE v2.12
+ * PISCES MOON OS — WARDRIVE v2.14
+ *
+ * v2.14 — Cardputer ADV: BLE heap gate, LoRa status row
+ *   NimBLE is brought up only when free heap covers its init cost PLUS
+ *   a scan window's minimum (CP_BLE_SCAN_MIN_FREE_HEAP), with the init
+ *   cost learned from each real init. The old 55 KB gate let init run
+ *   with ~36 KB left, so every window was skipped and the 3rd skip
+ *   deinit'd NimBLE: an init/deinit churn every few seconds with BLE
+ *   stuck at 0. Below the gate a window costs two heap reads, BLE
+ *   starts by itself once memory allows, and the screen shows "--"
+ *   instead of a misleading 0. All devices: LoRa receiver state and
+ *   nodes heard in the last 5 minutes on the live screen.
  *
  * v2.13 — Cardputer ADV: heavy-load BLE hardening
  *   Dense BLE environments can still stress NimBLE's advertise-report
@@ -143,6 +154,7 @@
 #include <RadioLib.h>
 #include "pm_lora_pins.h"
 #include "pm_lora_locator.h"
+#include "pm_lora_lease.h"
 #endif
 #ifdef DEVICE_CARDPUTER_ADV
 #include <esp_err.h>
@@ -172,6 +184,10 @@ volatile int  bt_found        = 0;
 // scan task only after a window finishes, so the UI never reads the
 // mid-window reset of bt_found. A genuine 0 still shows as 0.
 static volatile int bt_last_window = 0;
+// True while BLE windows are actually running. False while BLE is held
+// off for memory (Cardputer) or before the first window; the UI then
+// shows "--" rather than a 0 that looks like "nothing nearby".
+static volatile bool bt_ble_live = false;
 int  esp_found       = 0;
 int      networks_total = 0;
 int      ble_total = 0;
@@ -185,6 +201,19 @@ volatile uint32_t pm_probe_req_count = 0;
 volatile uint32_t pm_deauth_count = 0;
 volatile uint32_t pm_other_count = 0;
 HardwareSerial SerialGPS(1);
+
+// Who reads the GPS UART. On the Cardputer the P4 tether task
+// (cardputer_i2c_module.cpp) reads the Cap GPS from boot, so the Map and
+// Mesh Map apps have a fix without Wardrive running. The wardrive task
+// must not open, read, re-baud or close that UART as well: two readers
+// split the NMEA stream between them and fight over auto-baud, and the
+// SerialGPS.end() at Wardrive teardown killed GPS for every app until
+// reboot. Elsewhere the wardrive task is the only GPS reader.
+#ifdef DEVICE_CARDPUTER_ADV
+  #define WD_OWNS_GPS_UART 0
+#else
+  #define WD_OWNS_GPS_UART 1
+#endif
 
 static char _current_log_file[32] = "";
 
@@ -379,6 +408,13 @@ static constexpr uint32_t CP_BLE_SCAN_MIN_LARGEST_BLOCK = 20000;
 static constexpr uint32_t CP_BLE_RECOVER_FREE_HEAP = 52000;
 static constexpr uint32_t CP_BLE_RECOVER_LARGEST_BLOCK = 14000;
 static constexpr uint32_t CP_BLE_SCAN_SECONDS = 1;
+// NimBLE init cost estimate (host task, controller, pools). Replaced by
+// the measured cost after each real init, never below this floor.
+static constexpr uint32_t CP_BLE_INIT_COST_FLOOR = 48000;
+static constexpr uint32_t CP_BLE_INIT_COST_CEIL  = 90000;
+// Init needs a contiguous block for the host task stack + pools.
+static constexpr uint32_t CP_BLE_INIT_MIN_LARGEST_BLOCK = 24000;
+static uint32_t s_ble_init_cost = CP_BLE_INIT_COST_FLOOR;
 
 // ─────────────────────────────────────────────────────────────────
 //  DIAGNOSTIC LOG (Cardputer ADV) — untethered RF/heap telemetry
@@ -978,6 +1014,10 @@ static bool wdLoraShouldLog(uint32_t nodeId) {
 static bool wdLoraInit() {
     if (lora_ready) return true;
     if (lora_init_tried) return false;
+    // Radio lease: if Mesh Messenger (or, on Cardputer, the P4 bridge)
+    // has the chip, don't touch it. Not counted as a try, so the loop
+    // asks again and takes the radio once it is free.
+    if (!pm_lora_lease_request(PM_LORA_WARDRIVE)) return false;
     lora_init_tried = true;
 
 #ifdef DEVICE_CARDPUTER_ADV
@@ -993,17 +1033,20 @@ static bool wdLoraInit() {
         Serial.println("[WARDRIVE/LORA] Radio init: SPI mutex timeout");
         delete lora_radio;  lora_radio  = nullptr;
         delete lora_module; lora_module = nullptr;
+        pm_lora_lease_release(PM_LORA_WARDRIVE);
         return false;
     }
     int st = lora_radio->begin(WARDRIVE_LORA_FREQ_MHZ, WARDRIVE_LORA_BW_KHZ,
                                WARDRIVE_LORA_SF, WARDRIVE_LORA_CR,
                                WARDRIVE_LORA_SYNC, WARDRIVE_LORA_TX_UNUSED,
-                               WARDRIVE_LORA_PREAMBLE);
+                               WARDRIVE_LORA_PREAMBLE,
+                               PM_LORA_TCXO_V, PM_LORA_USE_LDO);
     if (st != RADIOLIB_ERR_NONE) {
         xSemaphoreGiveRecursive(spi_mutex);
         Serial.printf("[WARDRIVE/LORA] Radio init failed: %d (no LoRa hardware?)\n", st);
         delete lora_radio;  lora_radio  = nullptr;
         delete lora_module; lora_module = nullptr;
+        pm_lora_lease_release(PM_LORA_WARDRIVE);
         return false;
     }
     lora_radio->setDio2AsRfSwitch(true);
@@ -1012,11 +1055,17 @@ static bool wdLoraInit() {
     lora_radio->setPacketReceivedAction(wdLoraRxISR);
     lora_rx_flag = false;
     int rxs = lora_radio->startReceive();
-    xSemaphoreGiveRecursive(spi_mutex);
     if (rxs != RADIOLIB_ERR_NONE) {
+        lora_radio->clearPacketReceivedAction();
+        lora_radio->standby();
+        xSemaphoreGiveRecursive(spi_mutex);
         Serial.printf("[WARDRIVE/LORA] startReceive failed: %d\n", rxs);
+        delete lora_radio;  lora_radio  = nullptr;
+        delete lora_module; lora_module = nullptr;
+        pm_lora_lease_release(PM_LORA_WARDRIVE);
         return false;
     }
+    xSemaphoreGiveRecursive(spi_mutex);
     lora_my_node_id = wdLoraSelfNodeId();
     pm_lora_locator_reset();
     lora_ready = true;
@@ -1130,8 +1179,15 @@ void wardrive_task(void *pvParameters) {
     // T-LoraPager has no equivalent — all peripheral power is on the
     // XL9555 expander and handled by main.cpp's xl9555_boot_sequence().
 
-    vTaskDelay(pdMS_TO_TICKS(500));
-    vTaskDelay(pdMS_TO_TICKS(15000));   // Boot settling — radios + UI
+    // Boot settling — radios + UI. Wait until 15.5 s after BOOT, not
+    // 15.5 s after spawn: the Cardputer spawns this task only when the
+    // user opens Wardrive (often minutes after boot), and a fixed 15 s
+    // delay there just meant 15 s of "waiting..." on every open.
+    {
+        const uint32_t settle_until_ms = 15500;
+        uint32_t now = millis();
+        vTaskDelay(pdMS_TO_TICKS(now < settle_until_ms ? settle_until_ms - now : 50));
+    }
 
     // ─────────────────────────────────────────────────────────
     //  GPS UART per device — pins AND baud differ by hardware
@@ -1146,11 +1202,8 @@ void wardrive_task(void *pvParameters) {
     //  TinyGPSPlus checksum, look "silent." Starting at the
     //  right value avoids dead time at boot.
     // ─────────────────────────────────────────────────────────
-#ifdef DEVICE_CARDPUTER_ADV
-    uint32_t current_baud = 115200;
-#else
+#if WD_OWNS_GPS_UART
     uint32_t current_baud = 38400;
-#endif
     SerialGPS.setRxBufferSize(512);
 
 #ifdef DEVICE_TLORAPAGER
@@ -1159,21 +1212,19 @@ void wardrive_task(void *pvParameters) {
     //   GPS_RX  <- ESP32 TX  = GPIO 12
     // SerialGPS.begin(baud, config, RX, TX)
     SerialGPS.begin(current_baud, SERIAL_8N1, 4, 12);
-#elif defined(DEVICE_CARDPUTER_ADV)
-    // Cardputer ADV with Cap LoRa-1262/868:
-    //   GPS_TX  -> ESP32 RX  = GPIO 15  (per M5Stack docs)
-    //   GPS_RX  <- ESP32 TX  = GPIO 13
-    // Matches PIN_GPS_RX=15, PIN_GPS_TX=13 in platformio.ini.
-    SerialGPS.begin(current_baud, SERIAL_8N1, 15, 13);
 #else
     // T-Deck Plus UART pins (RX=44, TX=43).
     SerialGPS.begin(current_baud, SERIAL_8N1, 44, 43);
 #endif
-
     unsigned long last_baud_switch = millis();
+    uint32_t      last_chars_delta = 0;
+#else
+    // Cardputer ADV (Cap LoRa-1262/868, GPS RX=15 TX=13 @ 115200): the
+    // tether task already owns this UART. See WD_OWNS_GPS_UART.
+#endif
+
     unsigned long last_switch_time = 0;
     unsigned long last_ble_flush   = 0;
-    uint32_t      last_chars_delta = 0;
     bool          scanningWiFi     = false;  // first timed toggle enters WiFi
 #ifdef DEVICE_CARDPUTER_ADV
     wifi_ap_record_t* cpRecords =
@@ -1281,8 +1332,11 @@ void wardrive_task(void *pvParameters) {
             // Take LoRa down before WiFi/BLE teardown so its SPI ISR
             // cannot fire during the rest of the shutdown.
             wdLoraDeinit();
+            pm_lora_lease_release(PM_LORA_WARDRIVE);
 #endif
             // Full NimBLE shutdown — frees host task + ~48KB
+            bt_ble_live = false;
+            bt_last_window = 0;
             if (nimbleInit) {
                 NimBLEDevice::deinit(true);
                 nimbleInit = false;
@@ -1290,8 +1344,10 @@ void wardrive_task(void *pvParameters) {
                 Serial.printf("[WARDRIVE] NimBLE deinit complete, heap: %u\n",
                               (unsigned)ESP.getFreeHeap());
             }
+#if WD_OWNS_GPS_UART
             // Stop GPS UART (frees rx buffer)
             SerialGPS.end();
+#endif
             // Disconnect WiFi cleanly (releases scanner-mode driver state)
 #ifdef DEVICE_CARDPUTER_ADV
             cp_deinit_scan_wifi();
@@ -1314,6 +1370,7 @@ void wardrive_task(void *pvParameters) {
             return;
         }
 
+#if WD_OWNS_GPS_UART
         while (SerialGPS.available() > 0) gps.encode(SerialGPS.read());
 
         // GPS auto-baud
@@ -1322,14 +1379,7 @@ void wardrive_task(void *pvParameters) {
             uint32_t delta = current_chars - last_chars_delta;
             last_chars_delta = current_chars;
             if (delta < 10 || gps.passedChecksum() == 0) {
-#ifdef DEVICE_CARDPUTER_ADV
-                // Cardputer / Cap LoRa rotates 115200 → 38400 → 9600
-                if      (current_baud == 115200) current_baud = 38400;
-                else if (current_baud == 38400)  current_baud = 9600;
-                else                              current_baud = 115200;
-#else
                 current_baud = (current_baud == 38400) ? 9600 : 38400;
-#endif
                 SerialGPS.updateBaudRate(current_baud);
                 Serial.printf("[GPS] Silent (%lu chars/5s). Trying %lu baud.\n",
                               (unsigned long)delta, (unsigned long)current_baud);
@@ -1340,6 +1390,22 @@ void wardrive_task(void *pvParameters) {
             }
             last_baud_switch = millis();
         }
+#endif
+
+#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_TLORAPAGER) || defined(DEVICE_CARDPUTER_ADV)
+        // Radio lease (pm_lora_lease.h). Checked even while paused so
+        // Mesh Messenger never waits on a paused Wardrive. Yield from
+        // this task, so our SX1262 object is never deleted under us;
+        // take the radio back once it is free again.
+        if (pm_lora_lease_should_yield(PM_LORA_WARDRIVE)) {
+            wdLoraDeinit();
+            pm_lora_lease_release(PM_LORA_WARDRIVE);
+            Serial.println("[WARDRIVE/LORA] Radio released to a higher-priority app; "
+                           "will take it back when free");
+        } else if (!lora_ready && !lora_init_tried) {
+            wdLoraInit();
+        }
+#endif
 
         if (!wardrive_active) {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -1393,7 +1459,9 @@ void wardrive_task(void *pvParameters) {
                 WiFi.mode(WIFI_STA);
 #endif
                 vTaskDelay(pdMS_TO_TICKS(50));
+#if WD_OWNS_GPS_UART
                 while (SerialGPS.available() > 0) gps.encode(SerialGPS.read());
+#endif
 
 #ifdef DEVICE_CARDPUTER_ADV
                 uint16_t cpTotalSeen = 0;
@@ -1406,7 +1474,9 @@ void wardrive_task(void *pvParameters) {
 #else
                 int n = WiFi.scanNetworks(false, true);
 #endif
+#if WD_OWNS_GPS_UART
                 while (SerialGPS.available() > 0) gps.encode(SerialGPS.read());
+#endif
 
 #ifdef DEVICE_CARDPUTER_ADV
                 wifi_mode_t raw_mode = WIFI_MODE_NULL;
@@ -1535,43 +1605,63 @@ void wardrive_task(void *pvParameters) {
                 //     post-NimBLE: ~50-80KB free (48KB cost)
                 //     runtime headroom: 50KB+ for ad allocations
                 //
-                //   Defensive thresholds below catch any unexpected memory
-                //   pressure (e.g. if a future feature consumes more heap
-                //   at boot than budgeted). If triggered, BLE is cleanly
-                //   torn down for the session — NimBLEDevice::deinit(true)
-                //   stops the host task entirely so no GAP events can
-                //   arrive and crash on an exhausted heap.
-                static bool bleDisabledForSession = false;
-                if (bleDisabledForSession) {
-                    bt_last_window = 0;
-                    scanningWiFi = true;
-                    continue;
-                }
+                //   Gate (v2.14): NimBLE comes up only when the heap can
+                //   hold its init cost AND a scan window's minimum
+                //   (CP_BLE_SCAN_MIN_FREE_HEAP) afterwards. Below the gate
+                //   the window is skipped for two heap reads: no init, no
+                //   deinit, no churn. BLE starts by itself as soon as
+                //   memory allows. The init cost is measured on every real
+                //   init, so the gate follows this build's NimBLE footprint.
+                //   If memory runs short after init, NimBLEDevice::deinit
+                //   (true) stops the host task entirely so no GAP events
+                //   can arrive and crash on an exhausted heap.
+                static uint32_t bleGateSkips = 0;
                 if (!nimbleInit) {
-                    uint32_t heap_before = ESP.getFreeHeap();
-                    Serial.printf("[WARDRIVE/CP] Lazy BLE init, free heap: %u\n",
-                                  (unsigned)heap_before);
-                    // Need 55KB minimum to safely init untuned NimBLE
-                    // (48KB cost + 7KB safety margin against fragmentation).
-                    if (heap_before < 55000) {
-                        Serial.printf("[WARDRIVE/CP] Heap too low for BLE init "
-                                      "(%u<55000) — BLE DISABLED for this session "
-                                      "to prevent host-task allocation crash.\n",
-                                      (unsigned)heap_before);
-                        bleDisabledForSession = true;
-                        scanningWiFi = true;  // flip back, try WiFi again
+                    uint32_t heap_before    = ESP.getFreeHeap();
+                    uint32_t largest_before = cp_largest_internal_block();
+                    uint32_t gate = s_ble_init_cost + CP_BLE_SCAN_MIN_FREE_HEAP;
+                    if (heap_before < gate ||
+                        largest_before < CP_BLE_INIT_MIN_LARGEST_BLOCK) {
+                        bt_ble_live = false;
+                        bt_last_window = 0;
+                        // First skip, then about once a minute (a window
+                        // comes every ~2 s): enough to tune the numbers
+                        // from serial or the diag log without flooding.
+                        if (bleGateSkips++ % 30 == 0) {
+                            Serial.printf("[WARDRIVE/CP] BLE held off: heap=%u need=%u "
+                                          "(init~%u + scan %u) largest=%u need=%u\n",
+                                          (unsigned)heap_before, (unsigned)gate,
+                                          (unsigned)s_ble_init_cost,
+                                          (unsigned)CP_BLE_SCAN_MIN_FREE_HEAP,
+                                          (unsigned)largest_before,
+                                          (unsigned)CP_BLE_INIT_MIN_LARGEST_BLOCK);
+                            cp_diag_log("ble_gate", networks_found,
+                                        heap_before, largest_before);
+                        }
+                        scanningWiFi = true;
                         continue;
                     }
+                    bleGateSkips = 0;
+                    Serial.printf("[WARDRIVE/CP] Lazy BLE init, free heap: %u largest: %u\n",
+                                  (unsigned)heap_before, (unsigned)largest_before);
                     initWardriveBLE();
                     uint32_t heap_after = ESP.getFreeHeap();
-                    Serial.printf("[WARDRIVE/CP] Lazy BLE init done, free heap: %u\n",
-                                  (unsigned)heap_after);
-                    // Post-init sanity: need >=10KB runtime headroom for
-                    // incoming-ad allocations (each NimBLEAdvertisedDevice
-                    // is ~150-300 bytes including its std::vector for ad
-                    // data). If below that, tear NimBLE all the way down
-                    // (deinit(true) stops the host task) before any GAP
-                    // event can arrive.
+                    int32_t  init_cost  = (int32_t)(heap_before - heap_after);
+                    if (init_cost > 0) {
+                        uint32_t c = (uint32_t)init_cost;
+                        if (c < CP_BLE_INIT_COST_FLOOR) c = CP_BLE_INIT_COST_FLOOR;
+                        if (c > CP_BLE_INIT_COST_CEIL)  c = CP_BLE_INIT_COST_CEIL;
+                        s_ble_init_cost = c;
+                    }
+                    Serial.printf("[WARDRIVE/CP] Lazy BLE init done, free heap: %u (init cost %d)\n",
+                                  (unsigned)heap_after, (int)init_cost);
+                    cp_diag_log("ble_init", networks_found,
+                                heap_after, cp_largest_internal_block());
+                    // Emergency floor: each NimBLEAdvertisedDevice is
+                    // ~150-300 bytes. With less than 10 KB left, tear
+                    // NimBLE down before any GAP event can arrive. The
+                    // learned init cost raises the gate, so it will not
+                    // come straight back up into the same hole.
                     if (heap_after < 10000) {
                         Serial.printf("[WARDRIVE/CP] WARNING: Insufficient heap "
                                       "after BLE init (%u<10000). Tearing down "
@@ -1581,7 +1671,8 @@ void wardrive_task(void *pvParameters) {
                         NimBLEDevice::deinit(true);
                         nimbleInit = false;
                         wdScan = nullptr;
-                        bleDisabledForSession = true;
+                        bt_ble_live = false;
+                        bt_last_window = 0;
                         scanningWiFi = true;
                         continue;
                     }
@@ -1597,6 +1688,8 @@ void wardrive_task(void *pvParameters) {
                 if (pre_ble_heap < CP_BLE_SCAN_MIN_FREE_HEAP ||
                     pre_ble_largest < CP_BLE_SCAN_MIN_LARGEST_BLOCK) {
                     pressureSkips++;
+                    bt_ble_live = false;
+                    bt_last_window = 0;
                     Serial.printf("[WARDRIVE/CP] BLE window skipped under memory pressure "
                                   "(heap=%u largest=%u skip=%u)\n",
                                   (unsigned)pre_ble_heap,
@@ -1625,16 +1718,32 @@ void wardrive_task(void *pvParameters) {
 #ifdef DEVICE_CARDPUTER_ADV
                 uint32_t post_ble_heap = ESP.getFreeHeap();
                 uint32_t post_ble_largest = cp_largest_internal_block();
+                // Lifetime low-water mark of internal heap since boot.
+                // The per-window numbers above are snapshots; this one
+                // shows how close anything (a GAP burst, a WiFi scan)
+                // ever came to the edge, which is what the thresholds
+                // above should be tuned against.
+                uint32_t heap_low = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                static uint32_t s_logged_heap_low = UINT32_MAX;
                 Serial.printf("[WARDRIVE/CP] BLE window: seen=%u kept=%d drops=%u "
-                              "heap=%u largest=%u\n",
+                              "heap=%u largest=%u low=%u\n",
                               (unsigned)s_ble_window_events, bt_found,
                               (unsigned)s_ble_window_drops,
                               (unsigned)post_ble_heap,
-                              (unsigned)post_ble_largest);
+                              (unsigned)post_ble_largest,
+                              (unsigned)heap_low);
                 cp_diag_log("ble_window", bt_found, post_ble_heap, post_ble_largest);
+                // New low by at least 1 KB: record it in the diag log so
+                // an untethered drive shows when and where it happened.
+                if (heap_low + 1024 < s_logged_heap_low) {
+                    s_logged_heap_low = heap_low;
+                    cp_diag_log("heap_low", bt_found, heap_low, post_ble_largest);
+                }
                 if (post_ble_heap < CP_BLE_RECOVER_FREE_HEAP ||
                     post_ble_largest < CP_BLE_RECOVER_LARGEST_BLOCK) {
                     Serial.println("[WARDRIVE/CP] BLE heap floor breached; deinit NimBLE before next window");
+                    bt_ble_live = false;
+                    bt_last_window = 0;
                     cp_diag_log("ble_deinit_floor", networks_found,
                                 post_ble_heap, post_ble_largest);
                     if (wdScan) wdScan->stop();
@@ -1647,6 +1756,7 @@ void wardrive_task(void *pvParameters) {
 #endif
                 ble_total += bt_found;
                 bt_last_window = bt_found;
+                bt_ble_live = true;
 #ifdef DEVICE_CARDPUTER_ADV
                 // Drain now instead of waiting for the 5 s periodic
                 // flush, so the queue is empty before the next window.
@@ -1763,6 +1873,27 @@ uint32_t wardrive_lora_packet_count() {
 #endif
 }
 
+int wardrive_lora_nodes_recent(uint32_t window_ms) {
+#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_TLORAPAGER) || defined(DEVICE_CARDPUTER_ADV)
+    // Read-only walk of the per-node throttle table (written by the scan
+    // task). lastLogMs trails the true last-heard time by at most
+    // WARDRIVE_LORA_PER_NODE_MS, which is noise against a minutes-long
+    // window. A torn read can miscount by one for one refresh; no lock
+    // is taken so the UI never waits on the radio task.
+    int n = lora_throttle_count;
+    if (n > WARDRIVE_LORA_MAX_NODES) n = WARDRIVE_LORA_MAX_NODES;
+    uint32_t now = millis();
+    int count = 0;
+    for (int i = 0; i < n; i++) {
+        if (now - lora_throttle[i].lastLogMs < window_ms) count++;
+    }
+    return count;
+#else
+    (void)window_ms;
+    return 0;
+#endif
+}
+
 // ─────────────────────────────────────────────────────────────────────
 //  run_wardrive() — Live wardrive UI
 //
@@ -1815,7 +1946,8 @@ static void run_wardrive_cardputer() {
     //     WIFI  ###                  SATS  ##
     //     BLE   ###                  ALT   #ft
     //     LAT   ##.####              LNG   ##.####
-    const int rowY[3] = { 28, 44, 60 };
+    //     LORA  RX                   NODE  # (5m)
+    const int rowY[4] = { 28, 44, 60, 76 };
 
     // Static labels (drawn once)
     gfx->setTextColor(0xFFFF); gfx->setTextSize(1);
@@ -1825,6 +1957,8 @@ static void run_wardrive_cardputer() {
     gfx->setCursor(124, rowY[0]); gfx->print("SATS");
     gfx->setCursor(124, rowY[1]); gfx->print("ALT ");
     gfx->setCursor(124, rowY[2]); gfx->print("LNG ");
+    gfx->setCursor(  4, rowY[3]); gfx->print("LORA");
+    gfx->setCursor(124, rowY[3]); gfx->print("NODE");
 
     // Bottom action bar
     const int btnH = 16;
@@ -1849,8 +1983,8 @@ static void run_wardrive_cardputer() {
             gfx->print(_current_log_file[0] ? _current_log_file : "waiting...");
         }
 
-        // Clear the six value cells
-        for (int i = 0; i < 3; i++) {
+        // Clear the eight value cells
+        for (int i = 0; i < 4; i++) {
             gfx->fillRect(colAValueX, rowY[i], colAValueW, 9, 0x0000);
             gfx->fillRect(colBValueX, rowY[i], colBValueW, 9, 0x0000);
         }
@@ -1861,12 +1995,35 @@ static void run_wardrive_cardputer() {
         gfx->setTextColor(networks_found > 0 ? 0x07E0 : 0xFD20);
         gfx->setCursor(colAValueX, rowY[0]); gfx->print(networks_found);
         // Current BLE count: devices kept in the last completed window.
-        int bt_shown = bt_last_window;
-        gfx->setTextColor(bt_shown > 0 ? 0x07FF : 0xFD20);
-        gfx->setCursor(colAValueX, rowY[1]); gfx->print(bt_shown);
+        // "--" while BLE is held off for memory or not started yet.
+        gfx->setCursor(colAValueX, rowY[1]);
+        if (bt_ble_live) {
+            int bt_shown = bt_last_window;
+            gfx->setTextColor(bt_shown > 0 ? 0x07FF : 0xFD20);
+            gfx->print(bt_shown);
+        } else {
+            gfx->setTextColor(0x8410);
+            gfx->print("--");
+        }
         gfx->setTextColor(0xFFFF);
         gfx->setCursor(colAValueX, rowY[2]);
         gfx->printf("%.4f", gps.location.isValid() ? gps.location.lat() : 0.0);
+        // LoRa receiver state and distinct nodes heard in the last 5 min.
+        {
+            bool lora_on = wardrive_lora_is_ready();
+            gfx->setCursor(colAValueX, rowY[3]);
+            gfx->setTextColor(lora_on ? 0x07E0 : 0x8410);
+            gfx->print(lora_on ? "RX" : "--");
+            gfx->setCursor(colBValueX, rowY[3]);
+            if (lora_on) {
+                int nodes = wardrive_lora_nodes_recent(300000UL);
+                gfx->setTextColor(nodes > 0 ? 0x07FF : 0xFD20);
+                gfx->printf("%d (5m)", nodes);
+            } else {
+                gfx->setTextColor(0x8410);
+                gfx->print("-");
+            }
+        }
 
         // Column B values
         gfx->setTextColor(0xFFFF);
@@ -1991,9 +2148,16 @@ void run_wardrive() {
         gfx->setTextColor(networks_found > 0 ? 0x07E0 : 0xFD20);
         gfx->setCursor(dataX, 38);  gfx->println(networks_found);
         // Current BLE count: devices kept in the last completed window.
-        int bt_shown = bt_last_window;
-        gfx->setTextColor(bt_shown > 0 ? 0x07FF : 0xFD20);
-        gfx->setCursor(dataX, 63);  gfx->println(bt_shown);
+        // "--" until the first window completes.
+        gfx->setCursor(dataX, 63);
+        if (bt_ble_live) {
+            int bt_shown = bt_last_window;
+            gfx->setTextColor(bt_shown > 0 ? 0x07FF : 0xFD20);
+            gfx->println(bt_shown);
+        } else {
+            gfx->setTextColor(0x8410);
+            gfx->println("--");
+        }
         gfx->setTextColor(0xFFFF);
         gfx->setCursor(dataX, 88);  gfx->println(gps.satellites.value());
         gfx->setTextColor(0xC618);
@@ -2004,6 +2168,25 @@ void run_wardrive() {
         gfx->printf("%.5f", gps.location.isValid() ? gps.location.lat() : 0.0);
         gfx->setCursor(dataX, 163);
         gfx->printf("%.5f", gps.location.isValid() ? gps.location.lng() : 0.0);
+
+        // LoRa block, right side of the WIFI/BLE/SATS rows (short values
+        // there, so it never collides): receiver state, then distinct
+        // nodes heard in the last 5 min. Inside the cleared value rect,
+        // so the label is redrawn with the values.
+        {
+            const int loraX = W - 120;
+            bool lora_on = wardrive_lora_is_ready();
+            gfx->setTextColor(0xFFFF);
+            gfx->setCursor(loraX, 38);  gfx->print("LORA");
+            gfx->setTextColor(lora_on ? 0x07E0 : 0x8410);
+            gfx->setCursor(loraX, 63);  gfx->print(lora_on ? "RX" : "--");
+            if (lora_on) {
+                int nodes = wardrive_lora_nodes_recent(300000UL);
+                gfx->setTextColor(nodes > 0 ? 0x07FF : 0xFD20);
+                gfx->setCursor(loraX, 88);
+                gfx->printf("%d (5m)", nodes);
+            }
+        }
 
         // ESP32 counter — right-aligned just below data column
         if (esp_found > 0) {

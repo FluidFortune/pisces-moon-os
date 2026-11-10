@@ -27,4 +27,18 @@
   #error "No LoRa pin map for this device"
 #endif
 
+// SX1262 TCXO supply (DIO3) and regulator, passed as the last two
+// arguments of SX1262::begin(). M5Stack's Cap LoRa868 / Cap LoRa-1262
+// reference code uses radio.begin(..., 3.0, true): a 3.0 V TCXO and the
+// LDO regulator. RadioLib's defaults (1.6 V, DC-DC) under-drive that
+// TCXO, which can fail begin() or leave the receiver deaf / off
+// frequency. Other boards keep RadioLib's defaults, unchanged.
+#if defined(DEVICE_CARDPUTER_ADV)
+  #define PM_LORA_TCXO_V   3.0f
+  #define PM_LORA_USE_LDO  true
+#else
+  #define PM_LORA_TCXO_V   1.6f
+  #define PM_LORA_USE_LDO  false
+#endif
+
 #endif // PM_LORA_PINS_H

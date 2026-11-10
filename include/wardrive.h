@@ -102,6 +102,9 @@ bool wardrive_log_observation(const char* mac, const char* ssid,
 // do not claim the SPI bus.
 bool wardrive_lora_is_ready();
 uint32_t wardrive_lora_packet_count();
+// Distinct LoRa nodes heard within the last window_ms (e.g. 300000 for
+// "last 5 minutes"). 0 when the receiver is not running.
+int wardrive_lora_nodes_recent(uint32_t window_ms);
 
 // ─── v1.1 — Bridge streaming ───────────────────────────────────────
 extern volatile bool wardrive_bridge_streaming;

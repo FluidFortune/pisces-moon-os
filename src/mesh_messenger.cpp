@@ -98,6 +98,7 @@
 #include "theme.h"
 #include "mesh_messenger.h"
 #include "pm_lora_pins.h"
+#include "pm_lora_lease.h"
 
 // Forward declaration: cardputerSdSPI lives in main.cpp and is the
 // HSPI instance on Cardputer's peripheral SPI bus (pins 14/39/40),
@@ -642,6 +643,16 @@ static bool appendMeshTranscript(int ch, int headerCh, const char* sender,
 //  RADIO INIT
 // ─────────────────────────────────────────────
 static bool initRadio() {
+    // Radio lease (pm_lora_lease.h): Wardrive's background receiver (and
+    // on Cardputer the P4 bridge) gives the SX1262 up from its own loop.
+    // Its loop can be inside a ~2-3 s WiFi scan or BLE window, so allow
+    // a few seconds. Without this, both drivers drove the same chip and
+    // Wardrive's LoRa stayed dead after Mesh Messenger closed.
+    if (!pm_lora_lease_take(PM_LORA_MESH, 6000)) {
+        Serial.printf("[MESH] Radio busy (held by %s)\n",
+                      pm_lora_owner_name(pm_lora_lease_holder()));
+        return false;
+    }
     // SPI bus selection per device:
     //   Cardputer: SX1262 lives on HSPI (peripheral bus 14/39/40)
     //   T-Deck / Pager: SX1262 shares the same FSPI bus as TFT/SD
@@ -664,6 +675,7 @@ static bool initRadio() {
         Serial.println("[MESH] initRadio: SPI mutex timeout");
         delete radio; radio = nullptr;
         delete loraModule; loraModule = nullptr;
+        pm_lora_lease_release(PM_LORA_MESH);
         return false;
     }
 
@@ -674,7 +686,9 @@ static bool initRadio() {
         LORA_CR,
         LORA_SYNC,
         LORA_POWER,
-        LORA_PREAMBLE
+        LORA_PREAMBLE,
+        PM_LORA_TCXO_V,
+        PM_LORA_USE_LDO
     );
 
     if (state != RADIOLIB_ERR_NONE) {
@@ -691,6 +705,7 @@ static bool initRadio() {
         // skip its work cleanly.
         delete radio;       radio = nullptr;
         delete loraModule;  loraModule = nullptr;
+        pm_lora_lease_release(PM_LORA_MESH);
         return false;
     }
 
@@ -714,7 +729,11 @@ static void deinitRadio() {
     if (radio) {
         radio->clearPacketReceivedAction();
         rxFlag = false;
-        radio->standby();
+        // Bus Treaty: standby is an SPI transaction like any other.
+        if (spi_mutex && xSemaphoreTakeRecursive(spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            radio->standby();
+            xSemaphoreGiveRecursive(spi_mutex);
+        }
         delete radio;
         radio = nullptr;
     }
@@ -723,6 +742,8 @@ static void deinitRadio() {
         loraModule = nullptr;
     }
     // Do NOT call SPI.end() — the shared bus is still needed by TFT and SD
+    // Hand the radio back; Wardrive's receiver re-arms on its next loop.
+    pm_lora_lease_release(PM_LORA_MESH);
 }
 
 // ─────────────────────────────────────────────
@@ -1155,7 +1176,15 @@ void run_mesh_messenger() {
         gfx->setCursor(8, 80);
         gfx->print("Radio init FAILED.");
         gfx->setCursor(8, 96);
-        gfx->print("Check LoRa module (CS:9 RST:17 DIO1:45 BUSY:13)");
+        {
+            PmLoraOwner holder = pm_lora_lease_holder();
+            if (holder != PM_LORA_NONE && holder != PM_LORA_MESH) {
+                gfx->printf("Radio in use by %s", pm_lora_owner_name(holder));
+            } else {
+                gfx->printf("Check LoRa (CS:%d RST:%d DIO1:%d BUSY:%d)",
+                            PM_LORA_CS, PM_LORA_RST, PM_LORA_IRQ, PM_LORA_BUSY);
+            }
+        }
         gfx->setTextColor(COL_DIM);
         gfx->setCursor(8, 120);
         gfx->print("Tap header to exit.");

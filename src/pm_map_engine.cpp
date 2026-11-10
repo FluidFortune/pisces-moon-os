@@ -41,6 +41,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include "pm_storage.h"
+#include <new>
+#include <esp_heap_caps.h>
 
 #if defined(DEVICE_TLORAPAGER)
 #include "pm_disp_tlorapager.h"
@@ -91,14 +93,32 @@ static bool   s_follow    = true;
 // Content rectangle (where the map draws; apps reserve header/footer).
 static int s_cx = 0, s_cy = 0, s_cw = 0, s_ch = 0;
 
-// Breadcrumb ring buffer.
+// Breadcrumb ring buffer. Only the Map app draws a trail, so the ring is
+// allocated on the first pm_map_trail_push() and freed in pm_map_end()
+// instead of sitting in internal RAM from boot (2 KB on the Cardputer,
+// 16 KB elsewhere). PSRAM is used when the device has it.
 struct TrailPt { float lat; float lon; };
-static TrailPt  s_trail[PM_MAP_TRAIL_CAP];
+static TrailPt* s_trail      = nullptr;
 static int      s_trailHead  = 0;        // next write index
 static int      s_trailCount = 0;
 
+static bool trailAlloc() {
+    if (s_trail) return true;
+    const size_t sz = sizeof(TrailPt) * PM_MAP_TRAIL_CAP;
+#ifndef DEVICE_NO_PSRAM
+    s_trail = (TrailPt*)heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#endif
+    if (!s_trail) s_trail = (TrailPt*)malloc(sz);
+    return s_trail != nullptr;
+}
+
 #if PM_MAP_HAVE_PNGDEC
-static PNG s_png;                        // decoder instance (reused)
+// The PNG decoder holds a 32 KB zlib window plus line/file buffers inside
+// the object (~44.5 KB). As a static it sat in internal RAM from boot on
+// every device, which starved BLE on the no-PSRAM Cardputer even when no
+// map was open. It is now allocated only while a map with tiles is open
+// (pm_map_begin) and freed in pm_map_end().
+static PNG* s_png = nullptr;
 // Per-tile blit context handed to the PNGdec line callback.
 struct TileBlitCtx {
     int destX;        // top-left of this tile on screen
@@ -172,6 +192,22 @@ bool pm_map_begin(const char* tileSet) {
     }
     s_haveTiles = (s_tileSet[0] != '\0') && pm_storage::ready();
 
+#if PM_MAP_HAVE_PNGDEC
+    if (s_haveTiles && !s_png) {
+        // Internal RAM first (inflate walks the 32 KB window randomly, so
+        // it decodes faster there); PSRAM devices fall back to PSRAM.
+        void* mem = heap_caps_malloc(sizeof(PNG), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!mem) mem = malloc(sizeof(PNG));
+        if (mem) s_png = new (mem) PNG();
+        if (!s_png) {
+            // Not enough contiguous RAM (e.g. Cardputer with Wardrive's
+            // WiFi + BLE running). Draw markers/trail without base tiles.
+            Serial.printf("[MAP] No RAM for tile decoder (free %u) - drawing without tiles\n",
+                          (unsigned)ESP.getFreeHeap());
+            s_haveTiles = false;
+        }
+    }
+#endif
     return true;
 }
 
@@ -179,6 +215,15 @@ void pm_map_end() {
     s_active = false;
     s_haveTiles = false;
     s_trailHead = s_trailCount = 0;
+    free(s_trail);
+    s_trail = nullptr;
+#if PM_MAP_HAVE_PNGDEC
+    if (s_png) {
+        s_png->~PNG();
+        free(s_png);
+        s_png = nullptr;
+    }
+#endif
 }
 
 // ─────────────────────────────────────────────
@@ -319,7 +364,7 @@ static int tilePngDraw(PNGDRAW *pDraw) {
 
     int w = pDraw->iWidth;
     if (w > PM_MAP_TILE_BUFW) w = PM_MAP_TILE_BUFW;
-    s_png.getLineAsRGB565(pDraw, s_lineBuf, PNG_RGB565_BIG_ENDIAN, 0xFFFFFFFF);
+    s_png->getLineAsRGB565(pDraw, s_lineBuf, PNG_RGB565_BIG_ENDIAN, 0xFFFFFFFF);
 
     // Compute the visible x-span for this row.
     int x0 = s_blit.destX;
@@ -342,6 +387,7 @@ static int tilePngDraw(PNGDRAW *pDraw) {
 // graticule fallback). Reads the whole PNG into a heap buffer first
 // because PNGdec wants a contiguous source; tiles are small (~5-40 KB).
 static bool drawTileFromSD(int z, int tx, int ty, int dx, int dy) {
+    if (!s_png) return false;           // decoder not allocated (no RAM)
     char path[80];
     snprintf(path, sizeof(path), "/maps/%s/%d/%d/%d.png", s_tileSet, z, tx, ty);
 
@@ -392,15 +438,15 @@ static bool drawTileFromSD(int z, int tx, int ty, int dx, int dy) {
 #endif
     if (got != sz) { free(buf); return false; }
 
-    int rc = s_png.openRAM(buf, sz, tilePngDraw);
+    int rc = s_png->openRAM(buf, sz, tilePngDraw);
     if (rc != PNG_SUCCESS) { free(buf); return false; }
 
     s_blit.destX = dx;
     s_blit.destY = dy;
     s_blit.clipX0 = s_cx;            s_blit.clipY0 = s_cy;
     s_blit.clipX1 = s_cx + s_cw;     s_blit.clipY1 = s_cy + s_ch;
-    rc = s_png.decode(nullptr, 0);
-    s_png.close();
+    rc = s_png->decode(nullptr, 0);
+    s_png->close();
     free(buf);
     return rc == PNG_SUCCESS;
 }
@@ -514,6 +560,7 @@ void pm_map_label(double lat, double lon, int dxPx, int dyPx,
 //  BREADCRUMB TRAIL
 // ─────────────────────────────────────────────
 void pm_map_trail_push(double lat, double lon) {
+    if (!trailAlloc()) return;          // no RAM: skip this point
     s_trail[s_trailHead].lat = (float)lat;
     s_trail[s_trailHead].lon = (float)lon;
     s_trailHead = (s_trailHead + 1) % PM_MAP_TRAIL_CAP;
@@ -521,7 +568,7 @@ void pm_map_trail_push(double lat, double lon) {
 }
 
 void pm_map_trail_draw(uint16_t color) {
-    if (s_trailCount < 2) return;
+    if (!s_trail || s_trailCount < 2) return;
     // Oldest index.
     int idx = (s_trailHead - s_trailCount + PM_MAP_TRAIL_CAP) % PM_MAP_TRAIL_CAP;
     double prevLat = s_trail[idx].lat, prevLon = s_trail[idx].lon;
