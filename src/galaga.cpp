@@ -70,6 +70,14 @@ extern SdFat sd;
 // PLAY_W spans the full screen width for a roomy formation.
 #define SCREEN_W        480
 #define SCREEN_H        520
+#elif defined(DEVICE_TEMBED_CC1101)
+// T-Embed CC1101: 320x170 landscape. Formation rows land at y=45..99,
+// ship at y=140. hal_pins.h also names SCREEN_W/H for this board, so
+// clear any earlier definition first.
+#undef  SCREEN_W
+#undef  SCREEN_H
+#define SCREEN_W        320
+#define SCREEN_H        170
 #else
 #define SCREEN_W        320
 #define SCREEN_H        240
@@ -273,7 +281,8 @@ static int     lastHudStage = -1;
 //  40 enemies: row0=4 Bosses, row1=8 Butterflies,
 //              rows 2-3=14 Bees each
 // ─────────────────────────────────────────────
-static void buildFormation() {
+// Returns how many enemy slots it filled (32: 4 + 8 + 10 + 10).
+static int buildFormation() {
     int idx = 0;
     // Row positions relative to formation anchor
     // Formation anchor: top-left at approximately (60, 40)
@@ -311,6 +320,7 @@ static void buildFormation() {
         enemies[idx].type  = ET_BEE;
         enemies[idx].hp    = 1;
     }
+    return idx;
 }
 
 // ─────────────────────────────────────────────
@@ -575,7 +585,11 @@ static bool waitForGalagaResume() {
     gfx->print("PAUSED");
     gfx->setTextColor(0xFFE0);
     gfx->setCursor(boxX + 20, boxY + 32);
+#ifdef DEVICE_TEMBED_CC1101
+    gfx->print("SIDE=GO  HOLD=QUIT");
+#else
     gfx->print("B START / Q QUIT");
+#endif
 
     while (true) {
         PMNesInput input = pm_read_nes_input(true);
@@ -783,9 +797,23 @@ static void initStage() {
     memset(bullets, 0, sizeof(bullets));
     memset(explosions, 0, sizeof(explosions));
 
-    buildFormation();
+    // Only the slots the formation filled take part. MAX_ENEMIES is 40 but
+    // the formation builds 32; the 8 spare slots used to be sent through
+    // initEntry() too, with formX/formY never set (0,0). They parked at the
+    // top-left corner — inside the HUD band where player shots are retired
+    // and left of where the ship can reach — so they could never be shot,
+    // countAlive() never hit 0, and stage 1 could never be cleared. Games
+    // only ended by losing every life, at whatever the 32 real enemies
+    // were worth (the recurring ~1840 score). Spare slots now start dead.
+    int built = buildFormation();
     for (int i = 0; i < MAX_ENEMIES; i++) {
-        initEntry(i);
+        if (i < built) {
+            initEntry(i);
+        } else {
+            enemies[i].state = ES_DEAD;
+            enemies[i].hp    = 0;
+            enemies[i].hasCaptured = false;
+        }
     }
 
     formationX  = 0;
@@ -793,7 +821,7 @@ static void initStage() {
     frameCount  = 0;
     bossBeaming = false;
     beamTimer   = 0;
-    enemyCount  = MAX_ENEMIES;
+    enemyCount  = built;
     // Force HUD redraw at start of each stage
     lastHudScore = -1; lastHudLives = -1; lastHudStage = -1;
 
@@ -851,8 +879,15 @@ static bool runStage() {
         // a persistent direction that keeps moving until the player rolls
         // the opposite way or hits a wall.
         eraseShip();
+#ifdef DEVICE_TEMBED_CC1101
+        // Encoder: each wheel detent queues a few frames of movement in
+        // game_input.cpp, so the ship moves a step per click and stops —
+        // a persistent direction (the trackball model) would drift away.
+        shipMoveDir = input.left ? -1 : (input.right ? 1 : 0);
+#else
         if (input.left)  shipMoveDir = -1;
         if (input.right) shipMoveDir =  1;
+#endif
 
         if (shipMoveDir == -1 && ship.x > PLAY_X + 8)          ship.x -= SHIP_SPEED;
         if (shipMoveDir ==  1 && ship.x < PLAY_X + PLAY_W - 8) ship.x += SHIP_SPEED;

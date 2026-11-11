@@ -283,8 +283,43 @@ static const PMDeviceCapabilities pm_device_caps = {
     .ghost_partition_default = false,  // Desk fixture: same posture as C28P
 };
 
+#elif defined(DEVICE_TEMBED_CC1101)
+
+static const PMDeviceCapabilities pm_device_caps = {
+    .device_id              = "tembed_cc1101",
+    .device_label           = "T-Embed CC1101",
+    .device_short           = "T-Embed",
+    .form_factor            = PM_FORM_HANDHELD,
+    .battery_powered        = true,
+    .display_w              = 320,
+    .display_h              = 170,
+    .display_touch          = false,
+    .display_color          = true,
+    .input_keyboard         = false,
+    .input_trackball        = false,
+    .input_rotary           = true,    // rotary encoder (scroll only)
+    .input_dpad             = false,
+    .input_touch            = false,
+    .radio_wifi             = true,
+    .radio_ble              = true,
+    .radio_lora             = false,   // CC1101 is OOK sub-GHz, not LoRa
+    .radio_nfc              = true,    // PN532
+    .radio_ir               = true,
+    .io_microphone          = true,
+    .io_speaker             = true,
+    .io_sd_spi              = true,    // shared SPI bus with LCD + CC1101 + nRF24
+    .io_sd_sdio             = false,
+    .io_gps                 = false,   // no GPS: stationary scans only
+    .io_imu                 = false,
+    .io_haptic              = false,
+    .psram_mb               = 8,
+    .sram_kb                = 320,
+    .flash_mb               = 16,
+    .ghost_partition_default = false,
+};
+
 #else
-#error "Pisces Moon: no DEVICE_* flag defined. Set one of DEVICE_TDECK_PLUS, DEVICE_TLORAPAGER, DEVICE_CARDPUTER_ADV, DEVICE_C28P, DEVICE_MAXINE, or DEVICE_C5 in platformio.ini."
+#error "Pisces Moon: no DEVICE_* flag defined. Set one of DEVICE_TDECK_PLUS, DEVICE_TLORAPAGER, DEVICE_CARDPUTER_ADV, DEVICE_C28P, DEVICE_MAXINE, DEVICE_C5, or DEVICE_TEMBED_CC1101 in platformio.ini."
 #endif
 
 // ─────────────────────────────────────────────
@@ -362,7 +397,7 @@ static inline bool pm_caps_supports(const PMAppRequirements* req) {
     #define PM_HAS_SPEAKER 1
 #endif
 
-#if defined(DEVICE_TLORAPAGER)
+#if defined(DEVICE_TLORAPAGER) || defined(DEVICE_TEMBED_CC1101)
     #define PM_HAS_NFC 1
     #define PM_HAS_ROTARY 1
     #define PM_HAS_IMU 1
@@ -385,6 +420,13 @@ static inline bool pm_caps_supports(const PMAppRequirements* req) {
 
 #if defined(DEVICE_C28P)
     #define PM_SD_SDIO 1
+#endif
+
+
+#if defined(DEVICE_TEMBED_CC1101)
+    #define PM_HAS_CC1101 1
+    #define PM_HAS_ENCODER 1
+    #define PM_HAS_IR 1
 #endif
 
 #endif // PM_CAPABILITIES_H

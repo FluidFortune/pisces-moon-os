@@ -267,13 +267,22 @@ static int wrapTx(int tx, int ty) {
 // ─────────────────────────────────────────────
 //  HELPER: can move to tile?
 // ─────────────────────────────────────────────
+// The ghost-house door is one-way traffic: only an EATEN ghost (eyes going
+// home) may pass it. Ghosts leave the house by being placed on the exit
+// tile when their house timer runs out (see moveGhost). Previously the door
+// was open to every ghost in every state, so a ghost released at (13,11)
+// whose target lay below the house — Inky's and Clyde's scatter corners,
+// or Pac-Man himself — took the door straight back in and, unable to
+// reverse, circled inside forever. moveGhost() sets this per ghost.
+static bool s_ghostDoorOK = false;
+
 static bool canEnter(int tx, int ty, bool isGhost = false) {
     if (ty < 0 || ty >= MAZE_H) return false;
     tx = wrapTx(tx, ty);
     if (tx < 0 || tx >= MAZE_W) return false;
     uint8_t t = maze[ty][tx];
     if (t == T_WALL) return false;
-    if (t == T_DOOR && !isGhost) return false;
+    if (t == T_DOOR && !(isGhost && s_ghostDoorOK)) return false;
     return true;
 }
 
@@ -816,14 +825,31 @@ static void chooseGhostDir(int g) {
     }
 }
 
+// An eaten ghost that reaches home waits briefly, then is released again.
+static void ghostReachedHome(Ghost& gh) {
+    gh.state      = GS_HOUSE;
+    gh.houseTimer = 30;
+    gh.e.speed    = 0.12f;
+    setEntityTile(gh.e, 13, 14);
+    gh.e.dir = DIR_LEFT;
+    gh.e.nextDir = DIR_LEFT;
+}
+
 static void moveGhost(int g) {
     Ghost& gh = ghosts[g];
+    s_ghostDoorOK = (gh.state == GS_EATEN);
 
     if (gh.state == GS_HOUSE) {
         gh.houseTimer--;
         if (gh.houseTimer <= 0) {
-            gh.state = GS_SCATTER;
-            setEntityTile(gh.e, 13, 11); // Exit position
+            // Don't materialize on top of Pac-Man at the exit tile.
+            if (abs(pac.tx - 13) <= 1 && abs(pac.ty - 11) <= 1) {
+                gh.houseTimer = 5;
+                return;
+            }
+            // Join whatever mode the others are in.
+            gh.state = (modePhase % 2 == 0) ? GS_SCATTER : GS_CHASE;
+            setEntityTile(gh.e, 13, 11); // Exit position, just above the door
             gh.e.dir = DIR_LEFT;
             gh.e.nextDir = DIR_LEFT;
         }
@@ -840,8 +866,8 @@ static void moveGhost(int g) {
         gh.e.speed = 0.25f;
         // Bee-line to ghost house
         if (gh.e.tx == 13 && gh.e.ty == 14) {
-            gh.state = GS_SCATTER;
-            gh.e.speed = 0.12f;
+            ghostReachedHome(gh);
+            return;
         }
     } else {
         gh.e.speed = 0.12f + (stage - 1) * 0.005f;
@@ -860,10 +886,7 @@ static void moveGhost(int g) {
 
     bool reached = advanceEntity(gh.e, true);
     if (reached && gh.state == GS_EATEN && gh.e.tx == 13 && gh.e.ty == 14) {
-        gh.state = GS_SCATTER;
-        gh.e.speed = 0.12f;
-        gh.e.dir = DIR_LEFT;
-        gh.e.nextDir = DIR_LEFT;
+        ghostReachedHome(gh);
     }
 }
 
@@ -1004,9 +1027,14 @@ void run_pacman() {
     // — it's SFX-driven, same as Mario Bros.
     pm_game_audio_begin();
 
+    // The maze (eaten dots) persists across deaths, like the arcade; it is
+    // rebuilt only when a new stage starts. Rebuilding it on every death
+    // refilled all 244 dots each time you lost a life, so a stage could
+    // only be cleared on a single life and games ended early.
+    bool newStage = true;
     while (lives > 0) {
         // Stage setup
-        initMaze();
+        if (newStage) { initMaze(); newStage = false; }
         initEntities();
 #ifdef DEVICE_C28P
         // C28P: only clear the top 200px game area, preserve D-pad chrome
@@ -1119,6 +1147,7 @@ void run_pacman() {
                 // Speed up pac and ghosts per stage
                 pac.speed = min(0.20f, 0.15f + (stage - 1) * 0.003f);
                 stageDone = true;
+                newStage  = true;
             }
 
             delay(33); // ~30fps cap

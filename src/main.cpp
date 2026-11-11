@@ -26,7 +26,7 @@
 #include <SD_MMC.h>           // SDIO 4-bit driver — C28P SD card lives on its own SDMMC peripheral, not SPI
 #endif
 #include <TinyGPSPlus.h>     
-#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE) || defined(DEVICE_C5)
+#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE) || defined(DEVICE_C5) || defined(DEVICE_TEMBED_CC1101)
 #include <Arduino_GFX_Library.h>
 #endif
 #ifdef DEVICE_TLORAPAGER
@@ -45,6 +45,14 @@
 // pin macros (PIN_LCD_*, PIN_TOUCH_*, PIN_SD_*, PIN_I2C_*) consumed
 // by the BOARD_* aliases in this file.
 #include "hal_c5.h"
+#endif
+
+#ifdef DEVICE_TEMBED_CC1101
+// The T-Embed's pin macros (BOARD_TFT_*, CC1101_*, NRF24_CS, BOARD_PWR_EN,
+// LCD_COL_OFFSET, ...) live in the DEVICE_TEMBED_CC1101 block of hal_pins.h.
+// main.cpp doesn't pull hal_pins.h in for the other devices (they use
+// hal.h / hal_c5.h), so include it here for this build.
+#include "hal_pins.h"
 #endif
 #include <XPowersLib.h>
 #include <esp_task_wdt.h>    // WDT feed — prevents Guru Meditation during long setup()
@@ -230,9 +238,36 @@ const unsigned long WIFI_TIMEOUT_MS = 5000;  // 5 seconds max for autoconnect
 #endif // DEVICE_C5
 
 // --- DRIVER INSTANTIATION ---
+
+// ── ST7789 IN SPI MODE 0 (shared-bus boards) ────────────────────────────
+// Arduino_GFX forces every ST7789 into SPI mode 3 on ESP32 (SCK idles
+// HIGH) — only needed for panels with no CS line. On a bus shared with
+// mode-0 devices (SX1262 / CC1101 / nRF24 / SD / XPT2046 touch, SCK idles
+// LOW) that is a trap: after a screen update the ESP32 leaves SCK high
+// until the next transfer starts, i.e. after the next device's CS is
+// already low, so that device sees a stray clock edge and every byte of
+// its first transaction slips one bit. Found on the T-Embed, where the
+// nRF24 read STATUS 0x0E as 0x1C and SETUP_AW as 0x7E (0x3F, the register
+// below, shifted) and RadioLib's single-read presence check always failed;
+// retrying drivers mask it, but any first read after a redraw can be wrong
+// (radio status/RSSI, SD command responses, touch samples). These panels
+// all have a real CS line, so run them in mode 0 — what LilyGO's TFT_eSPI
+// examples use — and the whole bus agrees on the clock's idle level.
+// Verified against GFX Library 1.4.7 (T-Deck, T-Embed) and 1.6.5 (C5):
+// both keep _override_datamode protected and route it to SPISettings.
+#if defined(DEVICE_TDECK_PLUS) || defined(DEVICE_C5) || defined(DEVICE_TEMBED_CC1101)
+class Arduino_ST7789_Mode0 : public Arduino_ST7789 {
+public:
+    using Arduino_ST7789::Arduino_ST7789;
+    bool begin(int32_t speed = GFX_NOT_DEFINED) override {
+        _override_datamode = SPI_MODE0;
+        return Arduino_TFT::begin(speed);
+    }
+};
+#endif
 #ifdef DEVICE_TDECK_PLUS
 Arduino_DataBus *bus = new Arduino_HWSPI(BOARD_TFT_DC, BOARD_TFT_CS, BOARD_TFT_SCK, BOARD_TFT_MOSI, BOARD_TFT_MISO, &SPI, true);
-Arduino_GFX *gfx = new Arduino_ST7789(bus, BOARD_TFT_RST, 1 /* Landscape */, true /* IPS */);
+Arduino_GFX *gfx = new Arduino_ST7789_Mode0(bus, BOARD_TFT_RST, 1 /* Landscape */, true /* IPS */);  // mode 0: shared with SX1262 + SD
 #endif
 
 #ifdef DEVICE_CARDPUTER_ADV
@@ -297,9 +332,26 @@ Arduino_GFX *gfx = new Arduino_ILI9341(bus, BOARD_TFT_RST,
 Arduino_DataBus *bus = new Arduino_HWSPI(BOARD_TFT_DC, BOARD_TFT_CS,
                                           BOARD_TFT_SCK, BOARD_TFT_MOSI,
                                           BOARD_TFT_MISO, &SPI, true);
-Arduino_GFX *gfx = new Arduino_ST7789(bus, BOARD_TFT_RST,
+Arduino_GFX *gfx = new Arduino_ST7789_Mode0(bus, BOARD_TFT_RST,   // mode 0: shared with touch + SD
                                        0 /* native portrait, no rotation */,
                                        false /* TN panel, not IPS */);
+#endif
+
+#ifdef DEVICE_TEMBED_CC1101
+// LilyGO T-Embed CC1101: ST7789V 170x320 native panel, landscape
+// 320x170 on the shared SPI bus (SCK=11 MOSI=9 MISO=10). Column
+// offset 35 centers the 170-wide panel; tweak LCD_COL_OFFSET in
+// hal_pins.h if the image is shifted at first boot.
+Arduino_DataBus *bus = new Arduino_HWSPI(BOARD_TFT_DC, BOARD_TFT_CS,
+                                          BOARD_TFT_SCK, BOARD_TFT_MOSI,
+                                          BOARD_TFT_MISO, &SPI, true);
+
+// Panel runs in SPI mode 0 — see Arduino_ST7789_Mode0 above.
+Arduino_GFX *gfx = new Arduino_ST7789_Mode0(bus, BOARD_TFT_RST,
+                                       3 /* landscape, flipped 180 (antennas up, wheel right) */, true /* IPS */,
+                                       170, 320,
+                                       LCD_COL_OFFSET, LCD_ROW_OFFSET,
+                                       LCD_COL_OFFSET, LCD_ROW_OFFSET);
 #endif
 
 #ifdef DEVICE_MAXINE
@@ -627,6 +679,12 @@ static bool cp_boot_needs_scroll(int needed_h) {
 
 static void drawBootHeader() {
     int16_t W = bootW();
+    // The BIOS boot screen owns a clean framebuffer. On most devices the
+    // panel is already black by now, but T-Embed runs tembed_splash()
+    // immediately before this, and its big "PISCES MOON" title sits below
+    // the 14px header bar — without a full clear it bleeds through the boot
+    // log. Clear to the boot background first so the handoff is clean.
+    gfx->fillScreen(BOOT_BG);
 #ifdef DEVICE_MAXINE
     // Maxine: scaled header for 480-wide panel. Size 3 text, taller
     // header bar with breathing room above so the title doesn't get
@@ -1767,6 +1825,35 @@ void setup() {
     Serial.flush();
 #endif // DEVICE_C5
 
+#ifdef DEVICE_TEMBED_CC1101
+    // ── T-Embed CC1101 bring-up ──────────────────────────────────────
+    // Enable the board power rail (GPIO15) FIRST: the LCD, radios and SD
+    // are all unpowered until this goes HIGH.
+    pinMode(BOARD_PWR_EN, OUTPUT);
+    digitalWrite(BOARD_PWR_EN, HIGH);
+    delay(50);
+
+    // Shared SPI bus: pull every CS HIGH before SPI.begin() so nothing
+    // contests the bus while the pads configure.
+    pinMode(BOARD_TFT_CS, OUTPUT); digitalWrite(BOARD_TFT_CS, HIGH);
+    pinMode(CC1101_CS,    OUTPUT); digitalWrite(CC1101_CS,    HIGH);
+    pinMode(NRF24_CS,     OUTPUT); digitalWrite(NRF24_CS,     HIGH);
+    pinMode(BOARD_SD_CS,  OUTPUT); digitalWrite(BOARD_SD_CS,  HIGH);
+
+    SPI.begin(BOARD_TFT_SCK, BOARD_TFT_MISO, BOARD_TFT_MOSI);
+    pinMode(BOARD_TFT_BL, OUTPUT);
+    digitalWrite(BOARD_TFT_BL, LOW);     // off during flush (no white flash)
+    gfx->begin();
+    gfx->fillScreen(0x0000);
+    delay(50);
+    digitalWrite(BOARD_TFT_BL, HIGH);    // backlight on after init
+    Serial.println("[HAL] T-Embed CC1101 display init complete");
+
+    // Hand off to tembed_boot.cpp (encoder init + splash).
+    extern void tembed_setup();
+    tembed_setup();
+#endif // DEVICE_TEMBED_CC1101
+
 #ifdef DEVICE_MAXINE
     // ── Maxine display init (ST7262 RGB parallel panel) ──────────────
     // RGB panels have no SPI CS / backlight-flush dance like the SPI
@@ -2357,6 +2444,36 @@ void setup() {
         drawBootLine("00:07", "VAULT INIT", nullptr, dbOk ? 0 : 3, dbOk ? "OK" : "FAIL");
         delay(80);
     }
+#elif defined(DEVICE_TEMBED_CC1101)
+    // ── T-Embed CC1101: SD on the shared SPI bus (CS=13) ─────────────────
+    // The card shares SCK 11 / MOSI 9 / MISO 10 with the LCD, CC1101 and
+    // the nRF24 expansion module. Before this branch existed the T-Embed
+    // fell through to the T-LoRa Pager "deferred" path below, but the late
+    // mount task is only spawned on the Pager, so the card was never
+    // mounted: WiFi credentials, game high scores and survey logs all
+    // failed silently. Mount here, same pattern as the C5: every CS HIGH
+    // first, then up to 3 attempts.
+    bool sdMounted = false;
+    for (int attempt = 1; attempt <= 3 && !sdMounted; attempt++) {
+        digitalWrite(BOARD_TFT_CS, HIGH);
+        digitalWrite(CC1101_CS,    HIGH);
+        digitalWrite(NRF24_CS,     HIGH);
+        digitalWrite(BOARD_SD_CS,  HIGH);
+        SdSpiConfig cfg(BOARD_SD_CS, SHARED_SPI, SD_SCK_MHZ(10), &SPI);
+        sdMounted = sd.begin(cfg);
+        if (!sdMounted && attempt < 3) {
+            Serial.printf("[SD] T-Embed mount attempt %d/3 failed — retrying\n", attempt);
+            delay(300);
+        }
+    }
+    g_sd_ready = sdMounted;
+    drawBootLine("00:06", "SD_CARD0 GPIO:13", nullptr, sdMounted ? 0 : 3, sdMounted ? "OK" : "NO CARD");
+    delay(80);
+    if (sdMounted) {
+        bool dbOk = init_database();
+        drawBootLine("00:07", "VAULT INIT", nullptr, dbOk ? 0 : 3, dbOk ? "OK" : "FAIL");
+        delay(80);
+    }
 #else
     // ── T-LoraPager: defer SD mount entirely ──────────────────────────────────────
     // T-LoraPager has four peripherals on one shared SPI bus and the
@@ -2376,7 +2493,7 @@ void setup() {
 
     drawBootSection("PROCESS SPAWN");
 
-#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE) || defined(DEVICE_C5)
+#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE) || defined(DEVICE_C5) || defined(DEVICE_TEMBED_CC1101)
     // Cardputer ADV (no PSRAM): defer wardrive task spawn until user
     // explicitly launches the wardrive app. The task's NimBLE init
     // claims ~48KB of internal SRAM which the device cannot afford
@@ -2406,7 +2523,7 @@ void setup() {
     // wardrive owns BLE startup/order.
     drawBootLine("00:09", "GAMEPAD_BLE",           nullptr, 2, "SKIPPED");
 
-#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE) || defined(DEVICE_C5)
+#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE) || defined(DEVICE_C5) || defined(DEVICE_TEMBED_CC1101)
     // ── Cardputer ADV: SKIP Gemini boot-time init ────────────────────
     // The Gemini client allocates HTTPS context, JSON history buffer,
     // and NoSQL "gemini" category at init — ~15KB total. On the no-
@@ -2429,7 +2546,7 @@ void setup() {
 
     // CRITICAL: render line FIRST, then call auto_connect_wifi() wrapper
     // WiFi SDK calls corrupt GFX cursor if text follows on same line
-#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE) || defined(DEVICE_C5)
+#if defined(DEVICE_CARDPUTER_ADV) || defined(DEVICE_C28P) || defined(DEVICE_MAXINE) || defined(DEVICE_C5) || defined(DEVICE_TEMBED_CC1101)
     // ── Cardputer ADV / C28P: SKIP autoconnect ───────────────────────
     // On the no-PSRAM Cardputer, WiFi STA mode consumes ~52KB and
     // bringing it up at boot leaves insufficient memory for the
@@ -2465,7 +2582,7 @@ void setup() {
     esp_task_wdt_reset();
 
     delay(200);
-#if !defined(DEVICE_C28P) && !defined(DEVICE_MAXINE) && !defined(DEVICE_C5)
+#if !defined(DEVICE_C28P) && !defined(DEVICE_MAXINE) && !defined(DEVICE_C5) && !defined(DEVICE_TEMBED_CC1101)
     // Ghost Engine (Core 0 background task) — spawned on devices that
     // run wardrive. On C28P / Maxine / C5 (no GPS, no field intelligence
     // focus, OR single-core), the Engine is not spawned at boot. The C5
@@ -2507,7 +2624,7 @@ void setup() {
     // C28P: Ghost Partition is not part of the kiosk threat model
     // (no field-intelligence use case on a desk fixture). The
     // ghost_partition.cpp file is excluded from the C28P src_filter.
-#if !defined(DEVICE_C28P) && !defined(DEVICE_MAXINE) && !defined(DEVICE_C5)
+#if !defined(DEVICE_C28P) && !defined(DEVICE_MAXINE) && !defined(DEVICE_C5) && !defined(DEVICE_TEMBED_CC1101)
     ghost_partition_run_pin_screen();
 #endif
     esp_task_wdt_reset();
@@ -2531,6 +2648,10 @@ void loop() {
     // thread and the wardrive task time-slices around it.
     extern void c5_launcher();
     c5_launcher();
+#elif defined(DEVICE_TEMBED_CC1101)
+    // T-Embed CC1101: encoder-driven scroll launcher (tembed_boot.cpp).
+    extern void tembed_launcher();
+    tembed_launcher();
 #else
     run_launcher();
 #endif

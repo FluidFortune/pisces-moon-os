@@ -464,6 +464,102 @@
 
 #endif // DEVICE_C5
 
+// ── T-EMBED CC1101 PLUS (ESP32-S3, 8MB PSRAM) ────────────
+// Pins from LilyGO utilities.h (T-Embed-CC1101 v1.0-240729).
+// 320x170 landscape ST7789, rotary encoder only (no touch/keyboard).
+// One shared SPI bus carries LCD + CC1101 + nRF24 + SD: Bus Treaty
+// is mandatory.
+#ifdef DEVICE_TEMBED_CC1101
+
+  #define SCREEN_W          320
+  #define SCREEN_H          170
+  #define SCREEN_DRIVER     ST7789
+
+  // Board power rail enable — MUST go HIGH early or the LCD, radios
+  // and SD stay unpowered.
+  #define BOARD_PWR_EN      15
+
+  // Shared SPI bus
+  #define SPI_SCK           11
+  #define SPI_MOSI          9
+  #define SPI_MISO          10
+
+  // Display ST7789V (170x320 native panel; landscape 320x170).
+  // BOARD_TFT_* names match what main.cpp's gfx decl + init expect.
+  #define BOARD_TFT_SCK     11
+  #define BOARD_TFT_MOSI    9
+  #define BOARD_TFT_MISO    10
+  #define BOARD_TFT_CS      41
+  #define BOARD_TFT_DC      16
+  #define BOARD_TFT_RST     -1      // tied to board reset / power rail
+  #define BOARD_TFT_BL      21
+  // ST7789 offsets for the 170-wide panel: col=(240-170)/2=35, row=0.
+  // If the image is shifted at first boot, this pair is the knob.
+  #define LCD_COL_OFFSET    35
+  #define LCD_ROW_OFFSET    0
+
+  // CC1101 sub-GHz (RadioLib). LilyGO labels these "LORA".
+  #define CC1101_CS         12
+  #define CC1101_GDO0       3       // IO0 (RadioLib packet IRQ pin)
+  #define CC1101_GDO2       38      // IO2 (async serial data for sniff)
+  #define BOARD_LORA_CS     12      // legacy alias
+  // Antenna band switch (RF path select):
+  //   315: SW1=HIGH SW0=LOW   433/390: SW1=HIGH SW0=HIGH   868: SW1=LOW SW0=HIGH
+  #define CC1101_SW0        48
+  #define CC1101_SW1        47
+
+  // nRF24L01 (shares main SPI bus)
+  #define NRF24_CS          44
+  #define NRF24_CE          43
+  #define NRF24_IRQ         -1
+
+  // SD card (shares main SPI bus)
+  #define SD_CS             13
+  #define BOARD_SD_CS       13
+
+  // Rotary encoder + side key (no touch, no keyboard)
+  #define ENCODER_A         4
+  #define ENCODER_B         5
+  #define ENCODER_BTN       0       // encoder push (also GPIO0 strap)
+  #define BOARD_USER_KEY    6       // side button (BACK)
+
+  // I2C bus (PN532 NFC + PMU/gauge). LilyGO's header also carries a
+  // swapped "legacy" pair; these are the primary definitions.
+  #define I2C_SDA           8
+  #define I2C_SCL           18
+  #define I2C_ADDR_NFC      0x24    // PN532
+  #define I2C_ADDR_GAUGE    0x55    // BQ27220
+  #define I2C_ADDR_PMU      0x6B    // BQ25896
+  #define NFC_IRQ           17
+  #define NFC_RST           45
+
+  // IR
+  #define IR_TX             2
+  #define IR_RX             1
+
+  // WS2812 RGB (8 LEDs)
+  #define WS2812_PIN        14
+  #define WS2812_COUNT      8
+
+  // Capabilities
+  #define HAS_TRACKBALL     0
+  #define HAS_LORA          0       // CC1101 is OOK sub-GHz, not LoRa
+  #define HAS_CC1101        1
+  #define HAS_GPS           0
+  #define HAS_AUDIO         1
+  #define HAS_NFC           1
+  #define HAS_IMU           0
+  #define HAS_HAPTIC        0
+  #define HAS_ENCODER       1
+  #define HAS_RTC           0
+  #define HAS_NRF24         1
+  #define HAS_IOEXP         0
+  #define HAS_TOUCH         0
+  #define HAS_KEYBOARD      0
+  #define HAS_BATTERY       1
+
+#endif // DEVICE_TEMBED_CC1101
+
 
 // Default HAS_AUDIO_IN for boards that predate the split (they all
 // have mics where they have audio). Maxine overrides to 0 above.

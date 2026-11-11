@@ -209,7 +209,14 @@ HardwareSerial SerialGPS(1);
 // split the NMEA stream between them and fight over auto-baud, and the
 // SerialGPS.end() at Wardrive teardown killed GPS for every app until
 // reboot. Elsewhere the wardrive task is the only GPS reader.
-#ifdef DEVICE_CARDPUTER_ADV
+#if defined(DEVICE_CARDPUTER_ADV)
+  #define WD_OWNS_GPS_UART 0
+#elif defined(DEVICE_TEMBED_CC1101)
+  // T-Embed CC1101 has no GPS. The T-Deck default below opens the GPS
+  // UART on GPIO 44/43 — on this board those are the nRF24's CS and CE,
+  // so starting it would silently take the 2.4 GHz radio off the bus.
+  // Wardrive isn't launched on the T-Embed today; this keeps it that way
+  // even if it ever is.
   #define WD_OWNS_GPS_UART 0
 #else
   #define WD_OWNS_GPS_UART 1

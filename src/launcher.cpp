@@ -35,7 +35,7 @@
  * lora_voice.h, ssh_client.h, micropython_app.h
  */
 
-#if !defined(DEVICE_TLORAPAGER) && !defined(DEVICE_CARDPUTER_ADV)
+#if !defined(DEVICE_TLORAPAGER) && !defined(DEVICE_CARDPUTER_ADV) && !defined(DEVICE_TEMBED_CC1101)
 
 #include <Arduino.h>
 extern bool wardrive_active;  // Ghost Engine state — Core 0

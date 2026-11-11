@@ -15,6 +15,9 @@
 #ifdef DEVICE_C5
 #include "c5_dpad.h"
 #endif
+#ifdef DEVICE_TEMBED_CC1101
+#include "tembed_input.h"
+#endif
 
 static bool keyIs(char key, char lower) {
     return key == lower || key == (char)(lower - 'a' + 'A');
@@ -37,7 +40,49 @@ bool pm_is_nes_quit_key(char key) {
 PMNesInput pm_read_nes_input(bool includeTrackball) {
     PMNesInput input = {};
 
-#if !defined(DEVICE_MAXINE) && !defined(DEVICE_C5)
+#if defined(DEVICE_TEMBED_CC1101)
+    // ────────────────────────────────────────────────────────
+    //  T-EMBED: encoder + two buttons, nothing else.
+    //
+    //  Kept apart from the keyboard/trackball/gamepad path below on
+    //  purpose: the T-Deck trackball pins (1/2/3/15) are IR RX, IR TX,
+    //  CC1101 GDO0 and the board power-enable on this device.
+    //
+    //  Wheel:  each detent queues kFramesPerDetent frames of left/right,
+    //          so one click is a short step and a steady turn steers.
+    //          Turning the other way cancels the queue at once.
+    //  Push:   A (held = autofire, games rate-limit shots themselves).
+    //  Side:   tap = START (pause / resume), hold 0.8 s = quit.
+    // ────────────────────────────────────────────────────────
+    (void)includeTrackball;
+    constexpr int kFramesPerDetent = 6;
+    constexpr int kMaxQueued       = 18;
+    static int      s_move     = 0;
+    static bool     s_backWas  = false;
+    static bool     s_backLong = false;
+    static uint32_t s_backAt   = 0;
+
+    int d = tembed_encoder_delta();
+    if (d != 0) {
+        if ((d > 0 && s_move < 0) || (d < 0 && s_move > 0)) s_move = 0;
+        s_move += d * kFramesPerDetent;
+        if (s_move >  kMaxQueued) s_move =  kMaxQueued;
+        if (s_move < -kMaxQueued) s_move = -kMaxQueued;
+    }
+    if (s_move > 0)      { input.right = true; s_move--; }
+    else if (s_move < 0) { input.left  = true; s_move++; }
+
+    input.a = tembed_btn_select_down();
+
+    bool back = tembed_btn_back_down();
+    uint32_t now = millis();
+    if (back && !s_backWas) { s_backAt = now; s_backLong = false; }
+    if (back && !s_backLong && now - s_backAt > 800) { s_backLong = true; input.quit = true; }
+    if (!back && s_backWas && !s_backLong && now - s_backAt > 25) input.start = true;
+    s_backWas = back;
+    if (input.quit) s_move = 0;
+
+#elif !defined(DEVICE_MAXINE) && !defined(DEVICE_C5)
     // T-Deck Plus / T-LoRa Pager / Cardputer / C28P input path — reads
     // the physical keyboard, trackball, and BLE gamepad. Maxine and C5
     // are pure-touch kiosks (no keyboard/trackball/gamepad hardware on

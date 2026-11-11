@@ -244,7 +244,8 @@ static inline void xl9555_boot_sequence() {
     !defined(DEVICE_CARDPUTER_ADV) && \
     !defined(DEVICE_C28P) && \
     !defined(DEVICE_MAXINE) && \
-    !defined(DEVICE_C5)
+    !defined(DEVICE_C5) && \
+    !defined(DEVICE_TEMBED_CC1101)
   #error "No device target defined. Set DEVICE_TDECK_PLUS, \
 DEVICE_TLORAPAGER, DEVICE_CARDPUTER_ADV, DEVICE_C28P, DEVICE_MAXINE, \
 or DEVICE_C5 in platformio.ini."

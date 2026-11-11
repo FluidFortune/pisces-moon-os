@@ -23,6 +23,16 @@
   #define PM_LORA_RST   17
   #define PM_LORA_IRQ   45
   #define PM_LORA_BUSY  13
+#elif defined(DEVICE_TEMBED_CC1101)
+  // The T-Embed's sub-GHz radio is a CC1101 (OOK), not an SX1262. These
+  // SX1262-style macros exist only so the shared LoRa files (mesh_messenger,
+  // lora_voice) still compile here; those code paths are never entered on
+  // this device -- no Mesh/LoRa apps in the T-Embed launcher. The real
+  // CC1101 pins live in hal_pins.h (CC1101_CS / CC1101_GDO0 / ...).
+  #define PM_LORA_CS    -1
+  #define PM_LORA_RST   -1
+  #define PM_LORA_IRQ   -1
+  #define PM_LORA_BUSY  -1
 #else
   #error "No LoRa pin map for this device"
 #endif
